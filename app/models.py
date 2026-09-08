@@ -1,0 +1,81 @@
+from datetime import datetime, timezone
+
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from app.db import Base
+
+# Schema per design.md B.6. Migrations are versioned scripts tracked in
+# `schema_migrations`, applied transactionally with automatic pre-migration
+# backup — see REQ-SET-6 / tasks.md 3.2 (not implemented yet, Phase 3).
+
+
+class Strategy(Base):
+    __tablename__ = "strategies"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc)
+    )
+    data_source: Mapped[str] = mapped_column(String, nullable=False)
+    asset: Mapped[str] = mapped_column(String, nullable=False)
+    timeframe: Mapped[str] = mapped_column(String, nullable=False)
+    trades: Mapped[int | None] = mapped_column(Integer)
+    return_pct: Mapped[float | None]
+    cagr_pct: Mapped[float | None]
+    max_dd_pct: Mapped[float | None]
+    archetype: Mapped[str | None] = mapped_column(String)
+    robust_pct: Mapped[float | None]
+    icir: Mapped[float | None]
+    avg_hold_hours: Mapped[float | None]
+    score: Mapped[int | None] = mapped_column(Integer)
+    grade: Mapped[str | None] = mapped_column(String)
+    genome_json: Mapped[str] = mapped_column(Text, nullable=False)
+    equity_is: Mapped[str | None] = mapped_column(Text)
+    equity_oos: Mapped[str | None] = mapped_column(Text)
+    deployed: Mapped[bool] = mapped_column(Boolean, default=False)
+    active_mt5: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Portfolio(Base):
+    __tablename__ = "portfolios"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc)
+    )
+    description: Mapped[str | None] = mapped_column(Text)
+
+
+class PortfolioStrategy(Base):
+    __tablename__ = "portfolio_strategies"
+
+    portfolio_id: Mapped[str] = mapped_column(ForeignKey("portfolios.id"), primary_key=True)
+    strategy_id: Mapped[str] = mapped_column(ForeignKey("strategies.id"), primary_key=True)
+
+
+class Campaign(Base):
+    __tablename__ = "campaigns"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
+    asset: Mapped[str | None] = mapped_column(String)
+    timeframe: Mapped[str | None] = mapped_column(String)
+    phase: Mapped[int | None] = mapped_column(Integer)
+    status: Mapped[str | None] = mapped_column(String)  # running/completed/cancelled/crashed
+    survivors_per_phase: Mapped[str | None] = mapped_column(Text)  # JSON
+    checkpoint_generation: Mapped[int | None] = mapped_column(Integer)
+    checkpoint_population: Mapped[str | None] = mapped_column(Text)  # JSON
+    last_checkpoint_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class SchemaMigration(Base):
+    __tablename__ = "schema_migrations"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    applied_at: Mapped[datetime] = mapped_column(
+        DateTime, default=lambda: datetime.now(timezone.utc)
+    )
+    description: Mapped[str | None] = mapped_column(Text)
