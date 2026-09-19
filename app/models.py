@@ -35,6 +35,10 @@ class Strategy(Base):
     equity_oos: Mapped[str | None] = mapped_column(Text)
     deployed: Mapped[bool] = mapped_column(Boolean, default=False)
     active_mt5: Mapped[bool] = mapped_column(Boolean, default=False)
+    # REQ-SET-4.3 — purged strategies go to a Recycle Bin recoverable for 30
+    # days, so a purge is never an irreversible delete.
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime)
+    delete_reason: Mapped[str | None] = mapped_column(Text)
 
 
 class Portfolio(Base):

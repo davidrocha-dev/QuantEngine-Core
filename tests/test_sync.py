@@ -53,12 +53,24 @@ async def test_sync_symbol_fetches_only_missing_hours(tmp_path):
     assert cache.get_last_synced_hour("EURUSD") is not None
 
 
-def test_sync_start_uses_dukascopy_epoch_when_never_synced(tmp_path):
+def test_sync_start_is_bounded_by_configured_history_depth(tmp_path):
+    # A first sync must not walk back to the 2003 epoch — that is ~190,000
+    # hourly files per symbol. It starts `history_years` back instead.
     cache = make_cache(tmp_path)
-    runner = DeltaSyncRunner(cache=cache, client=FakeClient())
+    runner = DeltaSyncRunner(cache=cache, client=FakeClient(), history_years=3)
 
     start = runner._sync_start("EURUSD")
-    assert start == datetime(2003, 5, 1, tzinfo=timezone.utc)
+
+    expected = datetime.now(timezone.utc) - timedelta(days=365 * 3)
+    assert abs((start - expected).total_seconds()) < 60
+    assert start > datetime(2003, 5, 1, tzinfo=timezone.utc)
+
+
+def test_sync_start_never_precedes_the_dukascopy_epoch(tmp_path):
+    cache = make_cache(tmp_path)
+    runner = DeltaSyncRunner(cache=cache, client=FakeClient(), history_years=100)
+
+    assert runner._sync_start("EURUSD") == datetime(2003, 5, 1, tzinfo=timezone.utc)
 
 
 @pytest.mark.asyncio

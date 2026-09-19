@@ -24,7 +24,12 @@ def fitness_f1_stability(stats: TradeStats) -> float:
     """REQ-ENGINE-3.3 (Phase 1, Tribe A): F1 = (Net Profit / Max DD%) × Win Rate × Sharpe Ratio."""
     if stats.max_dd_pct <= 0:
         return 0.0
-    return (stats.net_profit_pct / stats.max_dd_pct) * stats.win_rate * stats.sharpe_ratio
+    value = (stats.net_profit_pct / stats.max_dd_pct) * stats.win_rate * stats.sharpe_ratio
+    if stats.net_profit_pct <= 0 or stats.sharpe_ratio <= 0:
+        # A losing strategy has both a negative Net Profit and a negative
+        # Sharpe — their product is positive and would outrank winners.
+        return -abs(value)
+    return value
 
 
 def fitness_f2_expansion(stats: TradeStats) -> float:

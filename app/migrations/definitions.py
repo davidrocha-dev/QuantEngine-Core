@@ -61,6 +61,14 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        version=2,
+        description="Recycle Bin: soft-delete column for purged strategies (REQ-SET-4.3)",
+        statements=(
+            "ALTER TABLE strategies ADD COLUMN deleted_at DATETIME",
+            "ALTER TABLE strategies ADD COLUMN delete_reason TEXT",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = max(m.version for m in MIGRATIONS)

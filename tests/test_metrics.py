@@ -17,7 +17,7 @@ from tests.helpers import make_synthetic_ohlc
 def make_trade(entry_idx, exit_idx, pnl, r_multiple=None):
     return Trade(
         entry_idx=entry_idx, exit_idx=exit_idx, direction=1, entry_price=1.0, exit_price=1.0 + pnl / 1000,
-        stop_price=0.99, r_multiple=r_multiple if r_multiple is not None else pnl / 100, pnl=pnl, exit_reason="target",
+        stop_price=0.99, target_price=1.02, r_multiple=r_multiple if r_multiple is not None else pnl / 100, pnl=pnl, exit_reason="target",
     )
 
 

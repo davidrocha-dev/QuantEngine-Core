@@ -53,13 +53,14 @@ def test_run_migrations_backs_up_existing_database_before_upgrading(tmp_path, mo
     # Simulate a future migration being added.
     from app.migrations import definitions
 
-    fake_migration = definitions.Migration(version=2, description="test migration", statements=("CREATE TABLE IF NOT EXISTS t2 (id INTEGER)",))
+    next_version = CURRENT_SCHEMA_VERSION + 1
+    fake_migration = definitions.Migration(version=next_version, description="test migration", statements=("CREATE TABLE IF NOT EXISTS t2 (id INTEGER)",))
     monkeypatch.setattr(definitions, "MIGRATIONS", MIGRATIONS + (fake_migration,))
     monkeypatch.setattr("app.migrations.runner.MIGRATIONS", MIGRATIONS + (fake_migration,))
 
     applied = run_migrations(db_path, auto_backup=True)
 
-    assert applied == [2]
+    assert applied == [next_version]
     backups = list(tmp_path.glob("vault.backup-*.db"))
     assert len(backups) == 1
 
@@ -72,7 +73,7 @@ def test_run_migrations_rolls_back_and_restores_on_failure(tmp_path, monkeypatch
 
     from app.migrations import definitions
 
-    broken_migration = definitions.Migration(version=2, description="broken", statements=("THIS IS NOT VALID SQL",))
+    broken_migration = definitions.Migration(version=CURRENT_SCHEMA_VERSION + 1, description="broken", statements=("THIS IS NOT VALID SQL",))
     monkeypatch.setattr("app.migrations.runner.MIGRATIONS", MIGRATIONS + (broken_migration,))
 
     with pytest.raises(MigrationError):
@@ -80,7 +81,7 @@ def test_run_migrations_rolls_back_and_restores_on_failure(tmp_path, monkeypatch
 
     # The database file must be back to its exact pre-migration state.
     assert db_path.read_bytes() == original_bytes
-    assert get_schema_version(db_path) == 1
+    assert get_schema_version(db_path) == CURRENT_SCHEMA_VERSION
     # No stray backup files left behind masquerading as the live db.
     assert db_path.exists()
 
@@ -92,7 +93,7 @@ def test_run_migrations_without_auto_backup_still_rolls_back_transaction(tmp_pat
     from app.migrations import definitions
     import app.migrations.runner as runner_module
 
-    broken_migration = definitions.Migration(version=2, description="broken", statements=("THIS IS NOT VALID SQL",))
+    broken_migration = definitions.Migration(version=CURRENT_SCHEMA_VERSION + 1, description="broken", statements=("THIS IS NOT VALID SQL",))
     original = runner_module.MIGRATIONS
     runner_module.MIGRATIONS = MIGRATIONS + (broken_migration,)
     try:
@@ -103,7 +104,7 @@ def test_run_migrations_without_auto_backup_still_rolls_back_transaction(tmp_pat
 
     # Without a backup, the transaction rollback alone must still leave
     # schema_migrations at the last successfully committed version.
-    assert get_schema_version(db_path) == 1
+    assert get_schema_version(db_path) == CURRENT_SCHEMA_VERSION
 
 
 def test_backup_database_returns_none_for_nonexistent_file(tmp_path):

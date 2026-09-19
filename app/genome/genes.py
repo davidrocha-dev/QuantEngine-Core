@@ -18,6 +18,8 @@ disabled — REQ-BREED-2 — in which case they degenerate to neutral/no-op).
 
 from __future__ import annotations
 
+import copy
+import random
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -35,6 +37,49 @@ class GeneSpec:
     layer: Layer
     default_params: dict = field(default_factory=dict)
     compute: Callable | None = None  # None for execution/management genes
+    # Search space for this gene's parameters — REQ-ENGINE-1.5 leaves the
+    # exact values to the implementer, and a genetic engine that only ever
+    # evaluates the defaults is not searching at all: it can only recombine
+    # ~180k fixed gene tuples. Each entry is ("int"|"float", low, high) or
+    # ("choice", [options]); `default_params` stays the documented centre of
+    # each range, so a genome built from defaults still behaves as described.
+    param_space: dict[str, tuple] = field(default_factory=dict)
+
+
+def sample_params(spec: GeneSpec, rng: random.Random | None = None) -> dict:
+    """Draws one random parameter set from the gene's search space."""
+    rng = rng or random
+    params = copy.deepcopy(spec.default_params)
+    for key, space in spec.param_space.items():
+        kind = space[0]
+        if kind == "int":
+            params[key] = rng.randint(space[1], space[2])
+        elif kind == "float":
+            params[key] = round(rng.uniform(space[1], space[2]), 4)
+        elif kind == "choice":
+            params[key] = rng.choice(space[1])
+    return params
+
+
+def jitter_params(spec: GeneSpec, params: dict, rate: float, rng: random.Random | None = None) -> dict:
+    """Perturbs each parameter with probability `rate`, staying inside its
+    range: local search around a working genome, as opposed to `sample_params`
+    which restarts from scratch."""
+    rng = rng or random
+    mutated = copy.deepcopy(params)
+    for key, space in spec.param_space.items():
+        if rng.random() >= rate:
+            continue
+        kind = space[0]
+        if kind == "choice":
+            mutated[key] = rng.choice(space[1])
+            continue
+        low, high = space[1], space[2]
+        current = mutated.get(key, low)
+        step = (high - low) * 0.25
+        value = min(max(current + rng.uniform(-step, step), low), high)
+        mutated[key] = int(round(value)) if kind == "int" else round(value, 4)
+    return mutated
 
 
 # ---------------------------------------------------------------------------
@@ -203,22 +248,22 @@ def _signal_williams(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict
 
 
 SIGNAL_GENES: dict[str, GeneSpec] = {
-    "ATR RUN": GeneSpec("ATR RUN", "signal", {"lookback": 10, "atr_mult": 1.5}, _signal_atr_run),
-    "BREAKOUT": GeneSpec("BREAKOUT", "signal", {"period": 20}, _signal_breakout),
-    "CCI": GeneSpec("CCI", "signal", {"period": 20}, _signal_cci),
+    "ATR RUN": GeneSpec("ATR RUN", "signal", {"lookback": 10, "atr_mult": 1.5}, _signal_atr_run, {"lookback": ("int", 5, 30), "atr_mult": ("float", 0.5, 3.0)}),
+    "BREAKOUT": GeneSpec("BREAKOUT", "signal", {"period": 20}, _signal_breakout, {"period": ("int", 10, 60)}),
+    "CCI": GeneSpec("CCI", "signal", {"period": 20}, _signal_cci, {"period": ("int", 10, 40)}),
     "ENGULFING": GeneSpec("ENGULFING", "signal", {}, _signal_engulfing),
-    "FADE": GeneSpec("FADE", "signal", {"period": 14, "oversold": 30, "overbought": 70}, _signal_fade),
-    "FIB": GeneSpec("FIB", "signal", {"lookback": 50, "tolerance": 0.1}, _signal_fib),
+    "FADE": GeneSpec("FADE", "signal", {"period": 14, "oversold": 30, "overbought": 70}, _signal_fade, {"period": ("int", 7, 28), "oversold": ("int", 15, 35), "overbought": ("int", 65, 85)}),
+    "FIB": GeneSpec("FIB", "signal", {"lookback": 50, "tolerance": 0.1}, _signal_fib, {"lookback": ("int", 20, 100), "tolerance": ("float", 0.05, 0.25)}),
     "INSIDE BREAKOUT": GeneSpec("INSIDE BREAKOUT", "signal", {}, _signal_inside_breakout),
-    "LIQSWEEP": GeneSpec("LIQSWEEP", "signal", {"period": 20}, _signal_liqsweep),
-    "MACD": GeneSpec("MACD", "signal", {"fast": 12, "slow": 26, "signal": 9}, _signal_macd),
-    "MOM BREAK": GeneSpec("MOM BREAK", "signal", {"period": 10, "threshold": 0.003}, _signal_mom_break),
-    "ORB": GeneSpec("ORB", "signal", {"range_bars": 4}, _signal_orb),
-    "STOCH": GeneSpec("STOCH", "signal", {"k_period": 14, "d_period": 3}, _signal_stoch),
+    "LIQSWEEP": GeneSpec("LIQSWEEP", "signal", {"period": 20}, _signal_liqsweep, {"period": ("int", 10, 40)}),
+    "MACD": GeneSpec("MACD", "signal", {"fast": 12, "slow": 26, "signal": 9}, _signal_macd, {"fast": ("int", 6, 18), "slow": ("int", 20, 40), "signal": ("int", 5, 14)}),
+    "MOM BREAK": GeneSpec("MOM BREAK", "signal", {"period": 10, "threshold": 0.003}, _signal_mom_break, {"period": ("int", 5, 30), "threshold": ("float", 0.0005, 0.01)}),
+    "ORB": GeneSpec("ORB", "signal", {"range_bars": 4}, _signal_orb, {"range_bars": ("int", 2, 12)}),
+    "STOCH": GeneSpec("STOCH", "signal", {"k_period": 14, "d_period": 3}, _signal_stoch, {"k_period": ("int", 7, 28), "d_period": ("int", 2, 7)}),
     "THREE SOLDIERS": GeneSpec("THREE SOLDIERS", "signal", {}, _signal_three_soldiers),
     "VWAP": GeneSpec("VWAP", "signal", {}, _signal_vwap),
-    "WICK REJECTION": GeneSpec("WICK REJECTION", "signal", {"wick_ratio": 2.0}, _signal_wick_rejection),
-    "WILLIAMS": GeneSpec("WILLIAMS", "signal", {"period": 14}, _signal_williams),
+    "WICK REJECTION": GeneSpec("WICK REJECTION", "signal", {"wick_ratio": 2.0}, _signal_wick_rejection, {"wick_ratio": ("float", 1.2, 4.0)}),
+    "WILLIAMS": GeneSpec("WILLIAMS", "signal", {"period": 14}, _signal_williams, {"period": ("int", 7, 28)}),
 }
 
 # ---------------------------------------------------------------------------
@@ -243,7 +288,8 @@ def _bias_chandelier(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict
 
 def _bias_daily_mid(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict) -> pd.Series:
     """DAILY MID — bullish above yesterday's (high+low)/2 midpoint, bearish below."""
-    daily = df.set_index(pd.DatetimeIndex(df["timestamp"])).resample("1D").agg({"high": "max", "low": "min"})
+    # dropna: weekend days have no bars — without it, Monday's "yesterday" is an empty Saturday.
+    daily = df.set_index(pd.DatetimeIndex(df["timestamp"])).resample("1D").agg({"high": "max", "low": "min"}).dropna()
     daily_mid = ((daily["high"] + daily["low"]) / 2).shift(1)
     mid_series = daily_mid.reindex(pd.DatetimeIndex(df["timestamp"]), method="ffill").set_axis(df.index)
     return pd.Series(np.select([df["close"] > mid_series, df["close"] < mid_series], [1, -1], default=0), index=df.index)
@@ -263,6 +309,9 @@ def _bias_htf(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict) -> pd
         return pd.Series(0, index=df.index)
     htf_sma = ta.sma(htf_df["close"], params.get("period", 20))
     htf_bias = pd.Series(np.select([htf_df["close"] > htf_sma, htf_df["close"] < htf_sma], [1, -1], default=0), index=htf_df.index)
+    # HTF timestamps are bar *open* times; a bar's close is only known once
+    # it completes, so each trading bar sees the last *completed* HTF bar.
+    htf_bias = htf_bias.shift(1)
     htf_bias.index = pd.DatetimeIndex(htf_df["timestamp"])
     aligned = htf_bias.reindex(pd.DatetimeIndex(df["timestamp"]), method="ffill")
     return aligned.set_axis(df.index).fillna(0)
@@ -312,17 +361,17 @@ def _bias_trailing(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict) 
 
 
 BIAS_GENES: dict[str, GeneSpec] = {
-    "ADX": GeneSpec("ADX", "bias", {"period": 14, "threshold": 20}, _bias_adx),
-    "CHANDELIER": GeneSpec("CHANDELIER", "bias", {"period": 22, "atr_mult": 3.0}, _bias_chandelier),
+    "ADX": GeneSpec("ADX", "bias", {"period": 14, "threshold": 20}, _bias_adx, {"period": ("int", 7, 28), "threshold": ("int", 12, 35)}),
+    "CHANDELIER": GeneSpec("CHANDELIER", "bias", {"period": 22, "atr_mult": 3.0}, _bias_chandelier, {"period": ("int", 10, 40), "atr_mult": ("float", 1.5, 4.5)}),
     "DAILY MID": GeneSpec("DAILY MID", "bias", {}, _bias_daily_mid),
-    "DONCHIAN MID": GeneSpec("DONCHIAN MID", "bias", {"period": 20}, _bias_donchian_mid),
-    "HTF": GeneSpec("HTF", "bias", {"period": 20}, _bias_htf),
-    "MARKET STRUCTURE": GeneSpec("MARKET STRUCTURE", "bias", {"lookback": 10}, _bias_market_structure),
-    "MOMENTUM": GeneSpec("MOMENTUM", "bias", {"period": 20}, _bias_momentum),
-    "PSAR": GeneSpec("PSAR", "bias", {"step": 0.02, "max_step": 0.2}, _bias_psar),
-    "RSI": GeneSpec("RSI", "bias", {"period": 14}, _bias_rsi),
-    "SMA": GeneSpec("SMA", "bias", {"period": 50}, _bias_sma),
-    "TRAILING": GeneSpec("TRAILING", "bias", {"period": 14}, _bias_trailing),
+    "DONCHIAN MID": GeneSpec("DONCHIAN MID", "bias", {"period": 20}, _bias_donchian_mid, {"period": ("int", 10, 50)}),
+    "HTF": GeneSpec("HTF", "bias", {"period": 20}, _bias_htf, {"period": ("int", 10, 50)}),
+    "MARKET STRUCTURE": GeneSpec("MARKET STRUCTURE", "bias", {"lookback": 10}, _bias_market_structure, {"lookback": ("int", 4, 25)}),
+    "MOMENTUM": GeneSpec("MOMENTUM", "bias", {"period": 20}, _bias_momentum, {"period": ("int", 8, 60)}),
+    "PSAR": GeneSpec("PSAR", "bias", {"step": 0.02, "max_step": 0.2}, _bias_psar, {"step": ("float", 0.008, 0.05), "max_step": ("float", 0.1, 0.4)}),
+    "RSI": GeneSpec("RSI", "bias", {"period": 14}, _bias_rsi, {"period": ("int", 7, 28)}),
+    "SMA": GeneSpec("SMA", "bias", {"period": 50}, _bias_sma, {"period": ("int", 15, 200)}),
+    "TRAILING": GeneSpec("TRAILING", "bias", {"period": 14}, _bias_trailing, {"period": ("int", 6, 40)}),
 }
 
 # ---------------------------------------------------------------------------
@@ -433,18 +482,18 @@ def _filter_volatility(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: di
 
 
 FILTER_GENES: dict[str, GeneSpec] = {
-    "ADR EXHAUST": GeneSpec("ADR EXHAUST", "filter", {"period": 14, "exhaust_pct": 0.8}, _filter_adr_exhaust),
-    "CCI": GeneSpec("CCI", "filter", {"period": 20, "extreme": 200}, _filter_cci),
-    "CONSEC": GeneSpec("CONSEC", "filter", {"max_losses": 3}, _filter_consec),
-    "DOJI": GeneSpec("DOJI", "filter", {"body_ratio": 0.1}, _filter_doji),
+    "ADR EXHAUST": GeneSpec("ADR EXHAUST", "filter", {"period": 14, "exhaust_pct": 0.8}, _filter_adr_exhaust, {"period": ("int", 7, 28), "exhaust_pct": ("float", 0.5, 1.3)}),
+    "CCI": GeneSpec("CCI", "filter", {"period": 20, "extreme": 200}, _filter_cci, {"period": ("int", 10, 40), "extreme": ("float", 120, 320)}),
+    "CONSEC": GeneSpec("CONSEC", "filter", {"max_losses": 3}, _filter_consec, {"max_losses": ("int", 2, 6)}),
+    "DOJI": GeneSpec("DOJI", "filter", {"body_ratio": 0.1}, _filter_doji, {"body_ratio": ("float", 0.04, 0.25)}),
     "EVENT": GeneSpec("EVENT", "filter", {"mode": "FTMO"}, _filter_event),
-    "KELTNER": GeneSpec("KELTNER", "filter", {"period": 20, "atr_mult": 2.0}, _filter_keltner),
-    "NO FRI OPEN": GeneSpec("NO FRI OPEN", "filter", {"cutoff_hour": 18}, _filter_no_fri_open),
-    "RECEDING": GeneSpec("RECEDING", "filter", {"lookback": 5}, _filter_receding),
-    "REGIME": GeneSpec("REGIME", "filter", {"period": 14, "threshold": 20, "require": "trend"}, _filter_regime),
-    "RSI": GeneSpec("RSI", "filter", {"period": 14}, _filter_rsi),
-    "SMA": GeneSpec("SMA", "filter", {"period": 50, "atr_mult": 3.0}, _filter_sma),
-    "VOLATILITY": GeneSpec("VOLATILITY", "filter", {"period": 14, "min_mult": 0.5, "max_mult": 2.0}, _filter_volatility),
+    "KELTNER": GeneSpec("KELTNER", "filter", {"period": 20, "atr_mult": 2.0}, _filter_keltner, {"period": ("int", 10, 40), "atr_mult": ("float", 1.0, 3.5)}),
+    "NO FRI OPEN": GeneSpec("NO FRI OPEN", "filter", {"cutoff_hour": 18}, _filter_no_fri_open, {"cutoff_hour": ("int", 12, 22)}),
+    "RECEDING": GeneSpec("RECEDING", "filter", {"lookback": 5}, _filter_receding, {"lookback": ("int", 3, 12)}),
+    "REGIME": GeneSpec("REGIME", "filter", {"period": 14, "threshold": 20, "require": "trend"}, _filter_regime, {"period": ("int", 7, 28), "threshold": ("int", 12, 35), "require": ("choice", ["trend", "range"])}),
+    "RSI": GeneSpec("RSI", "filter", {"period": 14}, _filter_rsi, {"period": ("int", 7, 28)}),
+    "SMA": GeneSpec("SMA", "filter", {"period": 50, "atr_mult": 3.0}, _filter_sma, {"period": ("int", 15, 200), "atr_mult": ("float", 1.5, 5.0)}),
+    "VOLATILITY": GeneSpec("VOLATILITY", "filter", {"period": 14, "min_mult": 0.5, "max_mult": 2.0}, _filter_volatility, {"period": ("int", 7, 28), "min_mult": ("float", 0.2, 0.8), "max_mult": ("float", 1.4, 3.0)}),
 }
 
 # ---------------------------------------------------------------------------
@@ -454,15 +503,15 @@ FILTER_GENES: dict[str, GeneSpec] = {
 EXECUTION_GENES: dict[str, GeneSpec] = {
     # LIMIT — enter on a pullback: place a limit order `offset_atr` ATRs
     # behind the signal price, filled only if price retraces to it.
-    "LIMIT": GeneSpec("LIMIT", "execution", {"offset_atr": 0.5}),
+    "LIMIT": GeneSpec("LIMIT", "execution", {"offset_atr": 0.5}, None, {"offset_atr": ("float", 0.1, 1.2)}),
     # LIMIT2 — two-tier scaled limit entry at 0.5x and 1.0x ATR pullback,
     # position split evenly between the two fills.
-    "LIMIT2": GeneSpec("LIMIT2", "execution", {"offset_atr_1": 0.5, "offset_atr_2": 1.0, "split": 0.5}),
+    "LIMIT2": GeneSpec("LIMIT2", "execution", {"offset_atr_1": 0.5, "offset_atr_2": 1.0, "split": 0.5}, None, {"offset_atr_1": ("float", 0.1, 1.0), "offset_atr_2": ("float", 0.6, 2.0)}),
     # MARKET2 — market entry, but only if the signal is still active
     # `confirm_bars` bars later (avoids single-bar noise).
-    "MARKET2": GeneSpec("MARKET2", "execution", {"confirm_bars": 2}),
+    "MARKET2": GeneSpec("MARKET2", "execution", {"confirm_bars": 2}, None, {"confirm_bars": ("int", 1, 5)}),
     # STOP — breakout-style stop entry `offset_atr` ATRs beyond the signal price.
-    "STOP": GeneSpec("STOP", "execution", {"offset_atr": 0.3}),
+    "STOP": GeneSpec("STOP", "execution", {"offset_atr": 0.3}, None, {"offset_atr": ("float", 0.05, 1.0)}),
 }
 
 # ---------------------------------------------------------------------------
@@ -471,13 +520,13 @@ EXECUTION_GENES: dict[str, GeneSpec] = {
 
 MANAGEMENT_GENES: dict[str, GeneSpec] = {
     # EOD CLOSE — force-close any open position at `close_hour` UTC.
-    "EOD CLOSE": GeneSpec("EOD CLOSE", "management", {"close_hour": 21}),
+    "EOD CLOSE": GeneSpec("EOD CLOSE", "management", {"close_hour": 21}, None, {"close_hour": ("int", 15, 23)}),
     # FRIDAY PROFIT — if a position is in profit after `lock_hour` UTC on
     # Friday, close it to avoid weekend gap risk.
-    "FRIDAY PROFIT": GeneSpec("FRIDAY PROFIT", "management", {"lock_hour": 18}),
+    "FRIDAY PROFIT": GeneSpec("FRIDAY PROFIT", "management", {"lock_hour": 18}, None, {"lock_hour": ("int", 12, 21)}),
     # PARTIAL TP — close `close_fraction` of the position at `r_multiple` R
     # and move the stop to breakeven for the remainder.
-    "PARTIAL TP": GeneSpec("PARTIAL TP", "management", {"r_multiple": 1.0, "close_fraction": 0.5}),
+    "PARTIAL TP": GeneSpec("PARTIAL TP", "management", {"r_multiple": 1.0, "close_fraction": 0.5}, None, {"r_multiple": ("float", 0.5, 2.5), "close_fraction": ("float", 0.2, 0.8)}),
 }
 
 # Keyed by (layer, name): CCI/RSI/SMA each appear in more than one layer

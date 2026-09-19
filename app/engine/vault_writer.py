@@ -6,12 +6,15 @@ import json
 
 from sqlalchemy.orm import Session
 
+from app.engine.hash_id import assign_hash_id
 from app.engine.phases import VaultCandidate
 from app.engine.scoring import classify_archetype, compute_grade, compute_score
 from app.models import Strategy
 
 
 def vault_candidate_to_row(candidate: VaultCandidate, asset: str, timeframe: str, data_source: str = "dukascopy") -> Strategy:
+    """`data_source` records which data the strategy was bred on — the
+    Vault's BUILT-IN DATA BRED purge criterion (REQ-SET-4.1) depends on it."""
     score = compute_score(candidate.stats_oos, candidate.robustness)
     return Strategy(
         id=candidate.hash_id,
@@ -29,15 +32,31 @@ def vault_candidate_to_row(candidate: VaultCandidate, asset: str, timeframe: str
         score=score,
         grade=compute_grade(score),
         genome_json=json.dumps(candidate.genome.to_dict()),
-        equity_is=None,
-        equity_oos=None,
+        equity_is=json.dumps(candidate.equity_is) if candidate.equity_is else None,
+        equity_oos=json.dumps(candidate.equity_oos) if candidate.equity_oos else None,
         deployed=False,
         active_mt5=False,
     )
 
 
-def write_vault_candidates(session: Session, candidates: list[VaultCandidate], asset: str, timeframe: str) -> list[Strategy]:
-    rows = [vault_candidate_to_row(c, asset, timeframe) for c in candidates]
+def _unique_hash_id(session: Session, candidate: VaultCandidate, taken: set[str]) -> str:
+    # 6 hex chars is only ~16.7M IDs — by the birthday bound a Vault of a
+    # few thousand strategies is likely to see a collision, and a duplicate
+    # primary key would fail the whole campaign's Vault write.
+    hash_id = candidate.hash_id
+    while hash_id in taken or session.get(Strategy, hash_id) is not None:
+        hash_id = assign_hash_id(candidate.genome)
+    taken.add(hash_id)
+    return hash_id
+
+
+def write_vault_candidates(
+    session: Session, candidates: list[VaultCandidate], asset: str, timeframe: str, data_source: str = "dukascopy"
+) -> list[Strategy]:
+    taken: set[str] = set()
+    for candidate in candidates:
+        candidate.hash_id = _unique_hash_id(session, candidate, taken)
+    rows = [vault_candidate_to_row(c, asset, timeframe, data_source) for c in candidates]
     session.add_all(rows)
     session.commit()
     return rows

@@ -6,9 +6,19 @@
 block_cipher = None
 
 a = Analysis(
-    ["app/main.py"],
+    # run_engine.py, not app/main.py: the ASGI module has no entry point,
+    # and the frozen worker processes re-run this script (freeze_support).
+    ["run_engine.py"],
     pathex=["."],
-    hiddenimports=["uvicorn.logging", "uvicorn.loops", "uvicorn.loops.auto", "uvicorn.protocols", "uvicorn.protocols.http", "uvicorn.protocols.http.auto", "uvicorn.lifespan", "uvicorn.lifespan.on"],
+    # "app.main" is imported by uvicorn from a string ("app.main:app"), so
+    # static analysis cannot see it; the websockets protocol backs WS /events.
+    hiddenimports=[
+        "app.main",
+        "uvicorn.logging", "uvicorn.loops", "uvicorn.loops.auto",
+        "uvicorn.protocols", "uvicorn.protocols.http", "uvicorn.protocols.http.auto",
+        "uvicorn.protocols.websockets", "uvicorn.protocols.websockets.auto",
+        "uvicorn.lifespan", "uvicorn.lifespan.on",
+    ],
     hookspath=[],
     noarchive=False,
 )

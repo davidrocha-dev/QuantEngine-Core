@@ -6,7 +6,7 @@ supporting crash-resume (REQ-ENGINE-4.2-4.4).
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -14,8 +14,11 @@ import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.engine.fitness import PHASE_0_MIN_TRADES
 from app.engine.metrics import TradeStats
 from app.engine.phases import (
+    DEFAULT_MAX_BREEDING_POPULATION,
+    IS_FRACTION,
     CandidateResult,
     PhaseOutcome,
     run_phase_0_screening,
@@ -29,6 +32,22 @@ from app.engine.vault_writer import write_vault_candidates
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genome import Genome, random_population
 from app.models import Campaign
+
+# A campaign on a few days of data produces metrics (CAGR especially) that
+# are arithmetically valid and practically meaningless — refuse instead.
+MIN_HISTORY_DAYS = 90
+
+# Phase 0 requires 100 trades per candidate (REQ-ENGINE-3.2). Measured on
+# real EURUSD data, a random genome trades roughly once every 30 bars, so
+# below ~3,000 in-sample bars almost nothing can clear that gate however
+# good it is — the campaign would "run" for its full length and approve
+# nothing. Re-measure this if the gene defaults change.
+MIN_IS_BARS = 3_000
+
+# Phase 0 keeps drawing candidates until the tribes have at least this many
+# survivors to breed from, up to MAX_SCREENING_ROUNDS x the population size.
+MIN_BREEDING_POPULATION = 40
+MAX_SCREENING_ROUNDS = 5
 
 PHASE_SCREENING = 0
 PHASE_STABILITY = 1
@@ -48,6 +67,25 @@ class CampaignConfig:
     risk_pct: float = 0.01
     timeframe: str = "H1"
     point_size: float = 0.0001
+    max_workers: int | None = None  # None = all detected cores
+    max_breeding_population: int = DEFAULT_MAX_BREEDING_POPULATION
+    # Settings → Costs, charged on every trade in every phase (see backtest.py).
+    cost_points: float = 0.0
+    commission_per_lot: float = 0.0
+    contract_size: float = 100_000.0
+    data_source: str = "dukascopy"
+    # REQ-BREED-2 — higher-timeframe context bars, None when HIGHER TF is off.
+    htf_df: pd.DataFrame | None = None
+    # REQ-ENGINE-2 — economic calendar for the EVENT gene, empty when none is configured.
+    news_events: list = field(default_factory=list)
+    news_mode: str = "FTMO"
+
+
+def _history_span_days(df: pd.DataFrame) -> int:
+    if df.empty:
+        return 0
+    timestamps = pd.DatetimeIndex(df["timestamp"])
+    return int((timestamps.max() - timestamps.min()).total_seconds() // 86_400)
 
 
 def _serialize_population(population: list[CandidateResult]) -> list[dict]:
@@ -187,21 +225,79 @@ def run_campaign(
     session.commit()
 
     is_df, _ = split_is_oos(df)
-    eval_kwargs = {"initial_balance": config.initial_balance, "risk_pct": config.risk_pct, "timeframe": config.timeframe}
+    span_days = _history_span_days(df)
+    if span_days < MIN_HISTORY_DAYS:
+        campaign.status = "cancelled"
+        session.commit()
+        return PhaseOutcome(
+            passed=False,
+            fail_reason=(
+                f"Not Passed: only {span_days} days of {config.timeframe} history available — a campaign needs at "
+                f"least {MIN_HISTORY_DAYS} days for its metrics to mean anything. Let the data sync finish and "
+                "try again."
+            ),
+        )
+
+    if len(is_df) < MIN_IS_BARS:
+        campaign.status = "cancelled"
+        session.commit()
+        return PhaseOutcome(
+            passed=False,
+            fail_reason=(
+                f"Not Passed: {len(df)} {config.timeframe} bars is too few — Phase 0 needs {PHASE_0_MIN_TRADES} "
+                f"trades per candidate, which takes about {MIN_IS_BARS} in-sample bars "
+                f"({int(MIN_IS_BARS / IS_FRACTION)} total). Sync more history, or breed on a lower timeframe."
+            ),
+        )
+
+    eval_kwargs = {
+        "initial_balance": config.initial_balance,
+        "risk_pct": config.risk_pct,
+        "timeframe": config.timeframe,
+        "point_size": config.point_size,
+        "cost_points": config.cost_points,
+        "commission_per_lot": config.commission_per_lot,
+        "contract_size": config.contract_size,
+        "htf_df": config.htf_df,
+        "news_events": config.news_events or None,
+        "news_mode": config.news_mode,
+    }
+    phase_kwargs = {"max_workers": config.max_workers}
 
     loaded = load_checkpoint(campaign) if resume else None
 
     if loaded is not None:
         phase_0_survivors = loaded.phase_0_survivors
     else:
-        population = random_population(gene_pool, config.population_size)
-        phase_0 = run_phase_0_screening(population, is_df, gene_pool, **eval_kwargs)
-        _set_survivors_per_phase(session, campaign_id, PHASE_SCREENING, len(phase_0.survivors))
-        if not phase_0.survivors:
+        # Screening keeps drawing fresh candidates until the tribes have a
+        # pool worth evolving. With real costs charged, a single 4,000-draw
+        # can leave a handful of survivors, and two tribes seeded from ~9
+        # genomes inbreed immediately — every child descends from the same
+        # two elites. Extra rounds are still screened by the same Phase 0
+        # gate (REQ-ENGINE-3.2), so nothing unscreened reaches a tribe.
+        phase_0_survivors: list[CandidateResult] = []
+        drawn = 0
+        max_draws = config.population_size * MAX_SCREENING_ROUNDS
+        while drawn < max_draws:
+            population = random_population(gene_pool, config.population_size)
+            phase_0 = run_phase_0_screening(population, is_df, gene_pool, max_workers=config.max_workers, **eval_kwargs)
+            phase_0_survivors.extend(phase_0.survivors)
+            drawn += config.population_size
+            _set_survivors_per_phase(session, campaign_id, PHASE_SCREENING, len(phase_0_survivors))
+            if len(phase_0_survivors) >= MIN_BREEDING_POPULATION:
+                break
+
+        if not phase_0_survivors:
             campaign.status = "cancelled"
             session.commit()
-            return PhaseOutcome(passed=False, fail_reason="Not Passed: no candidates survived Phase 0 screening")
-        phase_0_survivors = phase_0.survivors
+            return PhaseOutcome(
+                passed=False,
+                fail_reason=(
+                    f"Not Passed: no candidate survived Phase 0 screening in {drawn} draws — with trading costs "
+                    "charged, profit factor 1.1 over 100+ trades is a real bar. Try a longer history, a different "
+                    "market/timeframe, or a wider Gene Pool."
+                ),
+            )
 
     def make_checkpoint_cb(phase: int):
         def _cb(generation: int, pop: list[CandidateResult]) -> None:
@@ -216,7 +312,8 @@ def run_campaign(
         tribe_a_seed, start_gen = phase_0_survivors, 0
     phase_1 = run_phase_1_stability(
         tribe_a_seed, gene_pool, is_df, config.generations_per_tribe, config.phase1_top_n,
-        on_generation_complete=make_checkpoint_cb(PHASE_STABILITY), start_generation=start_gen, **eval_kwargs,
+        on_generation_complete=make_checkpoint_cb(PHASE_STABILITY), start_generation=start_gen,
+        max_population=config.max_breeding_population, **phase_kwargs, **eval_kwargs,
     )
     _set_survivors_per_phase(session, campaign_id, PHASE_STABILITY, len(phase_1.survivors))
 
@@ -226,14 +323,15 @@ def run_campaign(
         tribe_b_seed, start_gen = phase_0_survivors, 0
     phase_2 = run_phase_2_expansion(
         tribe_b_seed, gene_pool, is_df, config.generations_per_tribe, config.phase2_top_n,
-        on_generation_complete=make_checkpoint_cb(PHASE_EXPANSION), start_generation=start_gen, **eval_kwargs,
+        on_generation_complete=make_checkpoint_cb(PHASE_EXPANSION), start_generation=start_gen,
+        max_population=config.max_breeding_population, **phase_kwargs, **eval_kwargs,
     )
     _set_survivors_per_phase(session, campaign_id, PHASE_EXPANSION, len(phase_2.survivors))
 
     campaign.phase = PHASE_HYBRIDIZATION
     session.commit()
     phase_3 = run_phase_3_hybridization(
-        phase_1.survivors, phase_2.survivors, gene_pool, is_df, config.phase3_children, **eval_kwargs,
+        phase_1.survivors, phase_2.survivors, gene_pool, is_df, config.phase3_children, **phase_kwargs, **eval_kwargs,
     )
     if not phase_3.passed:
         campaign.status = "cancelled"
@@ -244,11 +342,16 @@ def run_campaign(
     campaign.phase = PHASE_ROBUSTNESS
     session.commit()
     vault_candidates = run_phase_4_robustness(
-        phase_3.survivors, df, gene_pool, config.point_size, **eval_kwargs,
+        phase_3.survivors, df, gene_pool, **eval_kwargs,
     )
     _set_survivors_per_phase(session, campaign_id, PHASE_ROBUSTNESS, len(vault_candidates))
 
-    write_vault_candidates(session, vault_candidates, asset=campaign.asset or "UNKNOWN", timeframe=campaign.timeframe or config.timeframe)
+    write_vault_candidates(
+        session, vault_candidates,
+        asset=campaign.asset or "UNKNOWN",
+        timeframe=campaign.timeframe or config.timeframe,
+        data_source=config.data_source,
+    )
 
     campaign.status = "completed"
     campaign.finished_at = datetime.now(timezone.utc)

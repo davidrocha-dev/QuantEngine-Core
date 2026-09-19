@@ -8,14 +8,30 @@ only from genes enabled in the campaign's Gene Pool (REQ-ENGINE-1.3).
 from __future__ import annotations
 
 import copy
+import json
 import random
 import uuid
 from dataclasses import dataclass, field
 
 from app.genome.gene_pool import GenePoolConfig
-from app.genome.genes import BIAS_GENES, EXECUTION_GENES, FILTER_GENES, MANAGEMENT_GENES, SIGNAL_GENES
+from app.genome.genes import (
+    BIAS_GENES,
+    EXECUTION_GENES,
+    FILTER_GENES,
+    MANAGEMENT_GENES,
+    SIGNAL_GENES,
+    jitter_params,
+    sample_params,
+)
 
 MAX_FILTERS_PER_GENOME = 2
+
+# Stop/target distance in ATRs — the documented baseline (backtest.py) is
+# the centre of each range, which is what a genome built from defaults uses.
+DEFAULT_STOP_ATR_MULT = 1.5
+DEFAULT_TARGET_ATR_MULT = 3.0
+STOP_ATR_MULT_RANGE = (0.8, 3.0)
+TARGET_ATR_MULT_RANGE = (1.0, 6.0)
 
 
 @dataclass
@@ -35,6 +51,12 @@ class Genome:
     management: GeneChoice | None = None
     bias: GeneChoice | None = None
     filters: list[GeneChoice] = field(default_factory=list)
+    # Risk geometry is part of the strategy, not a constant: the same signal
+    # with a 1.0x ATR stop and a 4.0x ATR target is a different strategy than
+    # with 2.5x/3.0x. These were hardcoded in the backtester, which meant
+    # every candidate in every campaign traded the same reward:risk.
+    stop_atr_mult: float = DEFAULT_STOP_ATR_MULT
+    target_atr_mult: float = DEFAULT_TARGET_ATR_MULT
     genome_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
     def to_dict(self) -> dict:
@@ -45,7 +67,16 @@ class Genome:
             "filters": [{"name": f.name, "params": f.params} for f in self.filters],
             "execution": {"name": self.execution.name, "params": self.execution.params},
             "management": {"name": self.management.name, "params": self.management.params} if self.management else None,
+            "stop_atr_mult": self.stop_atr_mult,
+            "target_atr_mult": self.target_atr_mult,
         }
+
+    def fingerprint(self) -> str:
+        """Content identity (ignores `genome_id`): two genomes with the same
+        genes and params trade identically, so they are the same strategy."""
+        content = self.to_dict()
+        content.pop("genome_id")
+        return json.dumps(content, sort_keys=True)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Genome":
@@ -55,6 +86,8 @@ class Genome:
             filters=[GeneChoice(f["name"], f["params"]) for f in data.get("filters", [])],
             execution=GeneChoice(data["execution"]["name"], data["execution"]["params"]),
             management=GeneChoice(data["management"]["name"], data["management"]["params"]) if data.get("management") else None,
+            stop_atr_mult=data.get("stop_atr_mult", DEFAULT_STOP_ATR_MULT),
+            target_atr_mult=data.get("target_atr_mult", DEFAULT_TARGET_ATR_MULT),
             genome_id=data.get("genome_id", uuid.uuid4().hex[:12]),
         )
 
@@ -64,7 +97,9 @@ def _random_choice(pool: GenePoolConfig, layer: str, catalog: dict) -> GeneChoic
     if not enabled:
         return None
     name = random.choice(enabled)
-    return GeneChoice(name, copy.deepcopy(catalog[name].default_params))
+    # Parameters are drawn from the gene's search space, not pinned to the
+    # documented defaults — see genes.py `param_space`.
+    return GeneChoice(name, sample_params(catalog[name]))
 
 
 def random_genome(pool: GenePoolConfig) -> Genome:
@@ -86,9 +121,17 @@ def random_genome(pool: GenePoolConfig) -> Genome:
     filter_pool = pool.enabled_names("filter")
     num_filters = random.randint(0, min(MAX_FILTERS_PER_GENOME, len(filter_pool)))
     filter_names = random.sample(filter_pool, num_filters) if filter_pool else []
-    filters = [GeneChoice(name, copy.deepcopy(FILTER_GENES[name].default_params)) for name in filter_names]
+    filters = [GeneChoice(name, sample_params(FILTER_GENES[name])) for name in filter_names]
 
-    return Genome(signal=signal, execution=execution, management=management, bias=bias, filters=filters)
+    return Genome(
+        signal=signal,
+        execution=execution,
+        management=management,
+        bias=bias,
+        filters=filters,
+        stop_atr_mult=round(random.uniform(*STOP_ATR_MULT_RANGE), 2),
+        target_atr_mult=round(random.uniform(*TARGET_ATR_MULT_RANGE), 2),
+    )
 
 
 def random_population(pool: GenePoolConfig, size: int) -> list[Genome]:
@@ -108,13 +151,41 @@ def crossover(parent_a: Genome, parent_b: Genome) -> Genome:
         filters=child_filters,
         execution=pick(parent_a.execution, parent_b.execution),
         management=pick(parent_a.management, parent_b.management),
+        stop_atr_mult=pick(parent_a.stop_atr_mult, parent_b.stop_atr_mult),
+        target_atr_mult=pick(parent_a.target_atr_mult, parent_b.target_atr_mult),
     )
+
+
+def _jitter_choice(choice: GeneChoice | None, catalog: dict, rate: float) -> GeneChoice | None:
+    if choice is None or choice.name not in catalog:
+        return choice
+    return GeneChoice(choice.name, jitter_params(catalog[choice.name], choice.params, rate))
 
 
 def mutate(genome: Genome, pool: GenePoolConfig, mutation_rate: float = 0.1) -> Genome:
     """Randomly re-rolls each layer with probability `mutation_rate`,
-    respecting the Gene Pool's enabled genes."""
+    respecting the Gene Pool's enabled genes, and — at the same rate —
+    perturbs the surviving genes' parameters and the genome's risk geometry.
+    Re-rolling genes alone only ever searches which genes to combine; the
+    parameter jitter is what lets a promising combination be refined."""
     mutated = copy.deepcopy(genome)
+
+    # Parameter-level mutation first, so a layer that is re-rolled below
+    # simply overwrites it with a freshly sampled gene.
+    mutated.signal = _jitter_choice(mutated.signal, SIGNAL_GENES, mutation_rate)
+    mutated.bias = _jitter_choice(mutated.bias, BIAS_GENES, mutation_rate)
+    mutated.execution = _jitter_choice(mutated.execution, EXECUTION_GENES, mutation_rate)
+    mutated.management = _jitter_choice(mutated.management, MANAGEMENT_GENES, mutation_rate)
+    mutated.filters = [_jitter_choice(f, FILTER_GENES, mutation_rate) for f in mutated.filters]
+
+    if random.random() < mutation_rate:
+        mutated.stop_atr_mult = round(
+            min(max(mutated.stop_atr_mult + random.uniform(-0.5, 0.5), STOP_ATR_MULT_RANGE[0]), STOP_ATR_MULT_RANGE[1]), 2
+        )
+    if random.random() < mutation_rate:
+        mutated.target_atr_mult = round(
+            min(max(mutated.target_atr_mult + random.uniform(-1.0, 1.0), TARGET_ATR_MULT_RANGE[0]), TARGET_ATR_MULT_RANGE[1]), 2
+        )
     if random.random() < mutation_rate:
         choice = _random_choice(pool, "signal", SIGNAL_GENES)
         if choice:

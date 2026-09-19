@@ -17,19 +17,25 @@ def make_trade(entry_idx, exit_idx, pnl, direction=1, entry_price=100.0, stop_pr
     # price) don't produce nonsensical cross-scale R-multiples.
     stop_distance = abs(entry_price - stop_price)
     r_multiple = pnl / 100 / stop_distance if stop_distance else 0.0
-    return Trade(entry_idx, exit_idx, direction, entry_price, entry_price + pnl / 1000, stop_price, r_multiple, pnl, "target")
+    target_price = entry_price + (entry_price - stop_price) * 2
+    return Trade(entry_idx, exit_idx, direction, entry_price, entry_price + pnl / 1000, stop_price, target_price, r_multiple, pnl, "target")
 
 
-def test_monte_carlo_same_trades_different_order_same_final_return():
-    trades = [make_trade(i, i + 1, pnl) for i, pnl in enumerate([100, -50, 30, -20, 80])]
-    results = monte_carlo_trade_sequences(trades, 10_000, iterations=50, rng=np.random.default_rng(1))
-    # Reshuffling doesn't change the SUM of pnls, only the path — final
-    # return should be identical (no compounding) across all iterations.
-    assert all(abs(r - results[0]) < 1e-9 for r in results)
+def test_monte_carlo_bootstrap_produces_a_spread_of_outcomes():
+    # The point of the bootstrap: resampling WITH replacement changes which
+    # trades occur, so the returns must actually vary. A plain reshuffle of
+    # the same P&L cannot (addition is commutative) and so could never fail
+    # the REQ-ENGINE-3.10 degradation gate.
+    trades = [make_trade(i, i + 1, pnl) for i, pnl in enumerate([100, -50, 30, -20, 80] * 6)]
+    returns, drawdowns = monte_carlo_trade_sequences(trades, 10_000, iterations=50, rng=np.random.default_rng(1))
+
+    assert len(returns) == len(drawdowns) == 50
+    assert max(returns) - min(returns) > 1e-6
+    assert all(dd >= 0 for dd in drawdowns)
 
 
 def test_monte_carlo_empty_trades_returns_empty():
-    assert monte_carlo_trade_sequences([], 10_000) == []
+    assert monte_carlo_trade_sequences([], 10_000) == ([], [])
 
 
 def test_compute_degradation_pct_no_change():
@@ -50,15 +56,15 @@ def test_inject_noise_applies_adverse_cost_against_direction():
     # Build trades whose entry price matches the df's own price scale so
     # the displaced-open substitution inject_noise performs is meaningful.
     trades = [
-        Trade(idx, idx + 5, 1, float(df["open"].iloc[idx]), float(df["close"].iloc[idx + 5]), float(df["open"].iloc[idx]) - 1.0, 1.0, 50.0, "target")
+        Trade(idx, idx + 5, 1, float(df["open"].iloc[idx]), float(df["close"].iloc[idx + 5]), float(df["open"].iloc[idx]) - 1.0, float(df["open"].iloc[idx]) + 2.0, 1.0, 50.0, "target")
         for idx in (10, 20, 30)
     ]
     rng = np.random.default_rng(2)
     noisy = inject_noise(trades, df, point_size=0.0001, rng=rng)
     for original, perturbed in zip(trades, noisy):
         expected_open = float(df["open"].iloc[perturbed.entry_idx])
-        # Long trade: adverse cost is subtracted from the displaced open.
-        assert perturbed.entry_price <= expected_open
+        # Long trade: adverse cost raises the entry above the displaced open.
+        assert perturbed.entry_price > expected_open
         assert perturbed.entry_idx > original.entry_idx
 
 
@@ -73,7 +79,7 @@ def make_trade_from_df(df, entry_idx, exit_idx, pnl, stop_distance=0.5, risk_amo
     entry_price = float(df["open"].iloc[entry_idx])
     r_multiple = pnl / risk_amount
     exit_price = entry_price + r_multiple * stop_distance
-    return Trade(entry_idx, exit_idx, 1, entry_price, exit_price, entry_price - stop_distance, r_multiple, pnl, "target")
+    return Trade(entry_idx, exit_idx, 1, entry_price, exit_price, entry_price - stop_distance, entry_price + stop_distance * 2, r_multiple, pnl, "target")
 
 
 def test_evaluate_robustness_stable_trades_pass():

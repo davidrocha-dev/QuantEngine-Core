@@ -45,6 +45,10 @@ class Trade:
     entry_price: float
     exit_price: float
     stop_price: float
+    # Kept so a perturbation (Phase 4 noise injection) can replay the trade
+    # under its own rules instead of reusing an exit price that no longer
+    # corresponds to the perturbed entry.
+    target_price: float
     r_multiple: float
     pnl: float
     exit_reason: str
@@ -115,7 +119,7 @@ def _combine_filter_veto(df: pd.DataFrame, genome: Genome, htf_df: pd.DataFrame 
 
 
 def _apply_management_exit(
-    df: pd.DataFrame, genome: Genome, entry_idx: int, exit_idx: int, direction: int
+    df: pd.DataFrame, genome: Genome, entry_idx: int, exit_idx: int, direction: int, entry_price: float
 ) -> tuple[int, str] | None:
     """Checks Management-gene early-exit conditions (EOD CLOSE, FRIDAY
     PROFIT) between entry and the baseline SL/TP exit. Returns the earlier
@@ -134,8 +138,9 @@ def _apply_management_exit(
 
     if name == "EOD CLOSE":
         hit = timestamps.hour >= params.get("close_hour", 21)
-    else:  # FRIDAY PROFIT
-        hit = (timestamps.dayofweek == 4) & (timestamps.hour >= params.get("lock_hour", 18))
+    else:  # FRIDAY PROFIT — only locks in a position that is actually in profit
+        in_profit = ((window["close"].to_numpy() - entry_price) * direction) > 0
+        hit = (timestamps.dayofweek == 4) & (timestamps.hour >= params.get("lock_hour", 18)) & in_profit
 
     if hit.any():
         return int(window.index[np.argmax(hit)]), name
@@ -151,10 +156,22 @@ def simulate_trades(
     news_mode: NewsMode = "FTMO",
     initial_balance: float = 10_000.0,
     risk_pct: float = 0.01,
-    spread_points: float = 0.0,
+    point_size: float = 0.0001,
+    cost_points: float = 0.0,
+    commission_per_lot: float = 0.0,
+    contract_size: float = 100_000.0,
+    entry_delay_bars: int = 0,
     max_leverage_breach_balance: float = 0.0,
 ) -> BacktestResult:
-    """Runs one genome against one OHLC series end to end."""
+    """Runs one genome against one OHLC series end to end.
+
+    Trading costs (Settings → Costs) are charged on every trade, in every
+    phase — not only in Phase 4's noise injection. `cost_points` is the
+    round-trip spread + slippage in instrument points; `commission_per_lot`
+    is the round-turn commission, charged against the position size that
+    fixed-fractional sizing implies (risk / (stop distance x contract size)).
+    Without them the GA optimises towards high-frequency strategies whose
+    edge is smaller than their cost."""
     _validate_genome_against_pool(genome, gene_pool)
 
     signal_spec = ALL_GENES[("signal", genome.signal.name)]
@@ -196,37 +213,83 @@ def simulate_trades(
             i += 1
             continue
 
+        # Phase 4's entry-displacement perturbation (REQ-ENGINE-3.8): the
+        # fill lands `entry_delay_bars` later, at that bar's open, and the
+        # trade then plays out under its own rules from there. Perturbing
+        # the input and re-running is the only way to displace an entry
+        # honestly — patching an already-simulated trade cannot know what
+        # the stop and target would have done from the new entry.
+        if entry_delay_bars:
+            entry_idx = min(entry_idx + entry_delay_bars, n - 1)
+            entry_price = opens[entry_idx]
+
         atr_at_entry = atr_series[i]
-        stop_price = entry_price - direction * DEFAULT_STOP_ATR_MULT * atr_at_entry
-        target_price = entry_price + direction * DEFAULT_TARGET_ATR_MULT * atr_at_entry
+        # Risk geometry is part of the genome (app/genome/genome.py), not a
+        # constant: the GA searches stop/target distance like any other gene
+        # parameter. The module constants remain the documented default.
+        stop_price = entry_price - direction * genome.stop_atr_mult * atr_at_entry
+        target_price = entry_price + direction * genome.target_atr_mult * atr_at_entry
         risk_amount = balance * risk_pct
 
-        baseline_exit_idx, exit_price, exit_code = _scan_exit_numba(
-            highs, lows, entry_idx, int(direction), stop_price, target_price, MAX_HOLD_BARS
+        # Every execution gene fills intrabar (LIMIT/LIMIT2/STOP) or at the
+        # bar's open (MARKET2), so the rest of the fill bar is live exposure:
+        # a stop inside the fill bar's range counts as hit (conservative).
+        entry_bar_stopped = entry_idx != i and (
+            (direction == 1 and lows[entry_idx] <= stop_price) or (direction == -1 and highs[entry_idx] >= stop_price)
         )
+        if entry_bar_stopped:
+            baseline_exit_idx, exit_price, exit_code = entry_idx, stop_price, EXIT_STOP
+        else:
+            baseline_exit_idx, exit_price, exit_code = _scan_exit_numba(
+                highs, lows, entry_idx, int(direction), stop_price, target_price, MAX_HOLD_BARS
+            )
         if exit_code == EXIT_MAX_HOLD:
             exit_price = closes[baseline_exit_idx]
 
-        exit_idx, exit_reason, partial_closed = baseline_exit_idx, _EXIT_NAMES[exit_code], False
-        management_hit = _apply_management_exit(df, genome, entry_idx, baseline_exit_idx, int(direction))
+        partial_r = None
+        if not entry_bar_stopped and genome.management is not None and genome.management.name == "PARTIAL TP":
+            partial_r, baseline_exit_idx, exit_price, exit_code = _run_partial_tp(
+                genome, highs, lows, closes, entry_idx, int(direction), entry_price, stop_price, target_price,
+                baseline_exit_idx, exit_price, exit_code,
+            )
+
+        exit_idx, exit_reason, partial_closed = baseline_exit_idx, _EXIT_NAMES[exit_code], partial_r is not None
+        management_hit = _apply_management_exit(df, genome, entry_idx, baseline_exit_idx, int(direction), entry_price)
         if management_hit is not None and management_hit[0] <= baseline_exit_idx:
             exit_idx, exit_reason = management_hit
             exit_price = closes[exit_idx]
 
-        pnl_amount, r_multiple = _apply_partial_tp(
-            genome, direction, entry_price, stop_price, exit_price, risk_amount
+        gross_pnl, r_multiple = _blend_partial_tp(
+            genome, direction, entry_price, stop_price, exit_price, risk_amount, partial_r
         )
-        # `spread_points` is intentionally a no-op here — Phase 4's noise
-        # injection (app/engine/monte_carlo.py) is where spread/slippage
-        # perturbation is applied, per REQ-ENGINE-3.8. The baseline backtest
-        # (Phases 0-3) runs on clean prices so fitness ranking isn't noisy.
+        stop_distance = abs(entry_price - stop_price)
+        # Round-trip spread/slippage, charged as a price cost over the
+        # position the risk sizing implies. Phase 4's noise injection adds a
+        # further random perturbation on top of this baseline (REQ-ENGINE-3.8).
+        cost_r = (cost_points * point_size) / stop_distance if stop_distance > 0 else 0.0
+        lots = risk_amount / (stop_distance * contract_size) if stop_distance > 0 else 0.0
+        commission = commission_per_lot * lots
+        pnl_amount = gross_pnl - risk_amount * cost_r - commission
+        r_multiple -= cost_r
+
+        # Mark-to-market between entry and exit, so Max DD reflects the
+        # drawdown actually lived through, not only closed-trade equity.
+        if exit_idx > entry_idx and stop_distance > 0:
+            unrealized_r = (closes[entry_idx:exit_idx] - entry_price) * direction / stop_distance
+            equity_curve[entry_idx:exit_idx] = balance + risk_amount * unrealized_r
+            if max_leverage_breach_balance > 0 and float(equity_curve[entry_idx:exit_idx].min()) < max_leverage_breach_balance:
+                margin_breach = True
+
         balance += pnl_amount
         equity_curve[exit_idx:] = balance
         if max_leverage_breach_balance > 0 and balance < max_leverage_breach_balance:
             margin_breach = True
 
         trades.append(
-            Trade(entry_idx, exit_idx, int(direction), entry_price, exit_price, stop_price, r_multiple, pnl_amount, exit_reason, partial_closed)
+            Trade(
+                entry_idx, exit_idx, int(direction), entry_price, exit_price, stop_price, target_price,
+                r_multiple, pnl_amount, exit_reason, partial_closed,
+            )
         )
         i = exit_idx + 1
 
@@ -280,19 +343,43 @@ def _wait_for_fill(highs, lows, signal_idx, direction, order_price, is_limit: bo
     return None, None
 
 
-def _apply_partial_tp(genome: Genome, direction: int, entry_price: float, stop_price: float, exit_price: float, risk_amount: float) -> tuple[float, float]:
-    """PARTIAL TP splits the position: `close_fraction` exits at `r_multiple`
-    R (if reached before the final exit), the remainder rides to the actual
-    exit. Simplified to a weighted-average R multiple across both legs."""
+def _run_partial_tp(
+    genome, highs, lows, closes, entry_idx, direction, entry_price, stop_price, target_price,
+    exit_idx, exit_price, exit_code,
+):
+    """PARTIAL TP: if price reaches `r_multiple` R before the stop, that
+    leg is banked at `r_multiple` R and the remainder's stop moves to
+    breakeven, riding on to the original target. Returns the banked partial
+    R (None if never reached) and the remainder's (exit_idx, price, code)."""
+    r_target = genome.management.params.get("r_multiple", 1.0)
+    stop_distance = abs(entry_price - stop_price)
+    partial_price = entry_price + direction * r_target * stop_distance
+    partial_idx, _, partial_code = _scan_exit_numba(
+        highs, lows, entry_idx, direction, stop_price, partial_price, MAX_HOLD_BARS
+    )
+    if partial_code != EXIT_TARGET:
+        return None, exit_idx, exit_price, exit_code
+
+    remaining_hold = MAX_HOLD_BARS - (partial_idx - entry_idx)
+    exit_idx, exit_price, exit_code = _scan_exit_numba(
+        highs, lows, partial_idx, direction, entry_price, target_price, remaining_hold
+    )
+    if exit_code == EXIT_MAX_HOLD:
+        exit_price = closes[exit_idx]
+    return r_target, exit_idx, exit_price, exit_code
+
+
+def _blend_partial_tp(
+    genome: Genome, direction: int, entry_price: float, stop_price: float, exit_price: float,
+    risk_amount: float, partial_r: float | None,
+) -> tuple[float, float]:
+    """Weighted-average R across both PARTIAL TP legs: `close_fraction` at
+    the banked `partial_r`, the remainder at the final exit."""
     stop_distance = abs(entry_price - stop_price)
     full_r = (exit_price - entry_price) * direction / stop_distance if stop_distance > 0 else 0.0
-
-    has_partial = genome.management is not None and genome.management.name == "PARTIAL TP"
-    if not has_partial:
+    if partial_r is None:
         return risk_amount * full_r, full_r
 
-    r_target = genome.management.params.get("r_multiple", 1.0)
     fraction = genome.management.params.get("close_fraction", 0.5)
-    partial_r = min(full_r, r_target) if full_r > 0 else full_r
     blended_r = fraction * partial_r + (1 - fraction) * full_r
     return risk_amount * blended_r, blended_r

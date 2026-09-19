@@ -12,6 +12,7 @@ import pandas as pd
 from app.engine.backtest import BacktestResult, Trade
 
 TRADING_DAYS_PER_YEAR = 252
+MAX_REPORTED_CAGR_PCT = 1000.0
 BARS_PER_YEAR_BY_TIMEFRAME = {
     "M1": 252 * 24 * 60, "M5": 252 * 24 * 12, "M15": 252 * 24 * 4, "M30": 252 * 24 * 2,
     "H1": 252 * 24, "H2": 252 * 12, "H4": 252 * 6, "D1": 252,
@@ -79,7 +80,9 @@ def cagr_pct(equity_curve: np.ndarray, initial_balance: float, bar_count: int, t
     total_return = equity_curve[-1] / initial_balance
     if total_return <= 0:
         return -100.0
-    return float((total_return ** (1 / years) - 1) * 100)
+    # Annualising a short sample explodes (a few good weeks extrapolate to
+    # millions of percent); clamp so the number stays readable and sortable.
+    return float(min(max((total_return ** (1 / years) - 1) * 100, -100.0), MAX_REPORTED_CAGR_PCT))
 
 
 def sharpe_ratio(equity_curve: np.ndarray, bars_per_year: float) -> float:

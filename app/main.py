@@ -1,11 +1,13 @@
 import asyncio
 import json
 import os
+
+import pandas as pd
 import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
@@ -17,12 +19,27 @@ from sqlalchemy.orm import Session
 from app.broker.mt5_bridge import MT5Bridge
 from app.config import get_config, set_auto_backup_before_updates, set_built_in_data_only
 from app.data.provider import get_historical_bars
-from app.data.sync import DeltaSyncRunner
-from app.data.symbols import BUNDLED_SYMBOLS, INSTRUMENTS, TIMEFRAMES
+from app.data.sync import DeltaSyncRunner, SyncState
+from app.data.symbols import BUNDLED_SYMBOLS, INSTRUMENTS, TIMEFRAMES, get_instrument
 from app.db import make_engine
-from app.engine.campaign import CampaignConfig, mark_crashed_campaigns, run_campaign
+from app.engine.campaign import (
+    MIN_HISTORY_DAYS,
+    MIN_IS_BARS,
+    CampaignConfig,
+    discard_campaign,
+    mark_crashed_campaigns,
+    run_campaign,
+)
+from app.engine.news_filter import load_calendar
+from app.engine.purge import (
+    RECYCLE_BIN_RETENTION_DAYS,
+    empty_expired_recycle_bin,
+    restore_from_recycle_bin,
+    run_purge,
+)
 from app.engine.campaign_estimate import estimate_campaign_minutes
 from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
+from app.engine.phases import IS_FRACTION
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genes import ALL_GENES
 from app.migrations.runner import MigrationError, export_vault, restore_database, run_migrations
@@ -139,7 +156,85 @@ async def _poll_campaigns_loop() -> None:
             pass
 
 
-def _run_campaign_background(campaign_id: str, symbol: str, timeframe: str, gene_pool: GenePoolConfig, config: CampaignConfig) -> None:
+# REQ-BREED-2.1 — the higher-timeframe context each trading timeframe reads.
+HIGHER_TF_BY_TIMEFRAME = {"M15": "H1", "M30": "H1", "H1": "H4", "H2": "D1", "H4": "D1"}
+
+# Contract size per lot, used to price Settings → Costs commission against
+# the position that fixed-fractional sizing implies.
+CONTRACT_SIZE_BY_CATEGORY = {"fx": 100_000.0, "metal": 100.0, "index": 1.0}
+
+
+def _spread_points(costs: dict, symbol: str, instrument) -> float:
+    """AUTO SPREAD reads the live broker spread (the one thing the MT5
+    connection is for besides execution — REQ-DATA-1.3); MANUAL uses the
+    configured value. AUTO with no terminal connected falls back to MANUAL
+    rather than silently backtesting at zero spread."""
+    if costs["spread_mode"] != "AUTO":
+        return float(costs["manual_spread_points"])
+    quote = _mt5_bridge.get_live_quote(symbol) if _mt5_bridge.is_connected() else None
+    if quote is None:
+        return float(costs["manual_spread_points"])
+    return float(quote.spread_points * instrument.point_divisor)
+
+
+def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> CampaignConfig:
+    """Translates the Settings screen into engine parameters. Everything the
+    user configures — risk, costs, cores, POWER, HIGHER TF — has to reach the
+    engine here, or the Settings screen is decoration."""
+    campaign_settings = settings["campaign"]
+    costs = settings["costs"]
+    preset = POWER_PRESETS.get(campaign_settings["power"], POWER_PRESETS["MEDIUM"])
+    instrument = get_instrument(symbol)
+
+    htf_df = None
+    if campaign_settings["higher_tf_enabled"]:
+        htf_timeframe = (
+            campaign_settings["higher_tf_manual_timeframe"]
+            if campaign_settings["higher_tf_mode"] == "MANUAL" and campaign_settings["higher_tf_manual_timeframe"]
+            else HIGHER_TF_BY_TIMEFRAME.get(timeframe)
+        )
+        if htf_timeframe:
+            htf_df = _load_bars(symbol, htf_timeframe, campaign_settings["history_depth_years"])
+
+    # REQ-ENGINE-2 — the EVENT gene needs a calendar; without one it would
+    # silently veto nothing, so an absent calendar simply means no events.
+    news_events = load_calendar(
+        get_config().data_dir / "calendar.json", get_config().data_dir / "calendar.csv"
+    )
+
+    return CampaignConfig(
+        population_size=preset["population_size"],
+        generations_per_tribe=preset["generations_per_tribe"],
+        timeframe=timeframe,
+        # Settings → Risk (REQ-SET-1.2) is a percentage; the backtester takes a fraction.
+        risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
+        # Costs are in the instrument's own points (0.00001 on EURUSD,
+        # 0.001 on USDJPY/XAUUSD), not a fixed pip.
+        point_size=1 / instrument.point_divisor,
+        cost_points=_spread_points(costs, symbol, instrument) + float(costs["slippage_points"]),
+        commission_per_lot=float(costs["commission_per_lot"]),
+        contract_size=CONTRACT_SIZE_BY_CATEGORY.get(instrument.category, 100_000.0),
+        max_workers=campaign_settings["cores"] or None,  # 0 = auto
+        data_source="bundled" if get_config().built_in_data_only else "dukascopy",
+        htf_df=htf_df,
+        news_events=news_events,
+    )
+
+
+def _load_bars(symbol: str, timeframe: str, history_depth_years: int):
+    """Historical bars trimmed to the configured HISTORY DEPTH — breeding on
+    more history than the user asked for silently multiplies campaign time."""
+    bars = get_historical_bars(symbol, timeframe)
+    if bars.empty or not history_depth_years:
+        return bars
+    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=365 * history_depth_years)
+    trimmed = bars[pd.DatetimeIndex(bars["timestamp"]) >= cutoff]
+    return trimmed.reset_index(drop=True) if not trimmed.empty else bars
+
+
+def _run_campaign_background(
+    campaign_id: str, symbol: str, timeframe: str, gene_pool: GenePoolConfig, config: CampaignConfig, resume: bool = False
+) -> None:
     global _active_campaign_id
 
     def on_generation(phase: int, generation: int, population: list) -> None:
@@ -159,9 +254,16 @@ def _run_campaign_background(campaign_id: str, symbol: str, timeframe: str, gene
 
     engine = make_engine(get_config().vault_db_path)
     try:
-        df = get_historical_bars(symbol, timeframe)
+        settings = load_settings(get_config().settings_path)
+        df = _load_bars(symbol, timeframe, settings["campaign"]["history_depth_years"])
         with Session(engine) as session:
-            run_campaign(session, campaign_id, df, gene_pool, config, on_generation=on_generation)
+            outcome = run_campaign(session, campaign_id, df, gene_pool, config, resume=resume, on_generation=on_generation)
+        if outcome.fail_reason:
+            _emit_event_threadsafe(
+                {"type": "campaign_complete", "campaign_id": campaign_id, "status": "cancelled",
+                 "phase": None, "generation": None, "tribe": None, "fitness": None,
+                 "survivors_per_phase": {}, "detail": outcome.fail_reason}
+            )
     except Exception:
         import traceback
 
@@ -173,6 +275,26 @@ def _run_campaign_background(campaign_id: str, symbol: str, timeframe: str, gene
                 session.commit()
     finally:
         _active_campaign_id = None
+
+
+_sync_state = SyncState()
+
+
+async def _startup_delta_sync() -> None:
+    config = get_config()
+    if config.built_in_data_only:
+        return  # REQ-DATA-1.6 — the debug toggle pins the app to bundled data.
+    settings = load_settings(config.settings_path)
+    symbols = settings["target_markets"]["enabled_symbols"] or list(BUNDLED_SYMBOLS)
+    runner = DeltaSyncRunner(history_years=settings["campaign"]["history_depth_years"], state=_sync_state)
+    try:
+        await runner.sync_all(symbols)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        import traceback
+
+        traceback.print_exc()
 
 
 @asynccontextmanager
@@ -197,8 +319,12 @@ async def lifespan(_: FastAPI):
     with Session(engine) as session:
         mark_crashed_campaigns(session)
     poll_task = asyncio.create_task(_poll_campaigns_loop())
+    # REQ-DATA-1.5 — delta sync runs on startup. It is a background task:
+    # a first sync downloads years of history and must never block the API.
+    sync_task = asyncio.create_task(_startup_delta_sync())
     yield
     poll_task.cancel()
+    sync_task.cancel()
 
 
 # FastAPI engine — design.md B.2, B.7. Bound to 127.0.0.1:7831 only,
@@ -209,9 +335,13 @@ app = FastAPI(title="QuantEngine Engine", lifespan=lifespan)
 # different origin than 127.0.0.1:7831, so the browser's CORS policy blocks
 # fetch() here without this — loopback-only binding is the real security
 # boundary (design.md B.2), CORS is just satisfying the browser on top of it.
+# Restricted to the renderer's own origins: "null" is what a packaged
+# build's file:// page sends, 5173 is the Vite dev server. With "*" any
+# website open in any browser on this machine could call these endpoints —
+# including DELETE /vault/{id} and POST /vault/restore.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["null", "http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -276,10 +406,33 @@ def get_mt5_status() -> dict:
 
 @app.get("/campaign/estimate")
 def get_campaign_estimate() -> dict:
-    # REQ-DASH-1.5 — 15-60 min range based on detected CPU cores.
-    cpu_cores = os.cpu_count() or 1
-    min_minutes, max_minutes = estimate_campaign_minutes(cpu_cores)
-    return {"cpu_cores": cpu_cores, "min_minutes": min_minutes, "max_minutes": max_minutes}
+    """REQ-DASH-1.5 — duration estimate before launch, computed from the
+    campaign this machine is actually about to run: POWER preset, cores,
+    and how many bars of history the selected market has."""
+    settings = load_settings(get_config().settings_path)
+    campaign_settings = settings["campaign"]
+    preset = POWER_PRESETS.get(campaign_settings["power"], POWER_PRESETS["MEDIUM"])
+    cpu_cores = campaign_settings["cores"] or (os.cpu_count() or 1)
+
+    symbol = next(iter(settings["target_markets"]["enabled_symbols"]), "EURUSD")
+    timeframe = next(iter(settings["target_markets"]["enabled_timeframes"]), "H1")
+    bars = len(_load_bars(symbol, timeframe, campaign_settings["history_depth_years"]))
+
+    min_minutes, max_minutes = estimate_campaign_minutes(
+        cpu_cores,
+        population_size=preset["population_size"],
+        generations=preset["generations_per_tribe"],
+        bars=bars or 20_000,
+    )
+    return {
+        "cpu_cores": cpu_cores,
+        "min_minutes": min_minutes,
+        "max_minutes": max_minutes,
+        "power": campaign_settings["power"],
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "bars": bars,
+    }
 
 
 @app.post("/campaign/start")
@@ -292,16 +445,13 @@ def start_campaign() -> dict:
         raise HTTPException(status_code=409, detail="A campaign is already running")
 
     settings = load_settings(get_config().settings_path)
-    campaign_settings = settings["campaign"]
     target_markets = settings["target_markets"]
     symbol = next(iter(target_markets["enabled_symbols"]), "EURUSD")
     timeframe = next(iter(target_markets["enabled_timeframes"]), "H1")
-    preset = POWER_PRESETS.get(campaign_settings["power"], POWER_PRESETS["MEDIUM"])
-    config = CampaignConfig(
-        population_size=preset["population_size"],
-        generations_per_tribe=preset["generations_per_tribe"],
-        timeframe=timeframe,
-    )
+    try:
+        config = build_campaign_config(settings, symbol, timeframe)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     gene_pool = GenePoolConfig.load(get_config().gene_pool_path)
 
     campaign_id = uuid.uuid4().hex
@@ -326,6 +476,62 @@ def start_campaign() -> dict:
         daemon=True,
     ).start()
     return {"campaign_id": campaign_id, "status": "running"}
+
+
+@app.get("/campaign/crashed")
+def list_crashed_campaigns() -> list:
+    # REQ-ENGINE-4.2 — the resume/discard prompt's data source: campaigns
+    # the previous engine process left behind when it died mid-run.
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        rows = session.scalars(
+            select(Campaign).where(Campaign.status == "crashed").order_by(Campaign.started_at.desc())
+        ).all()
+        return [_serialize_campaign(row) for row in rows if row.checkpoint_population]
+
+
+@app.post("/campaign/{campaign_id}/resume")
+def resume_campaign(campaign_id: str) -> dict:
+    # REQ-ENGINE-4.3 — continue evolution from the last checkpoint.
+    global _active_campaign_id
+    if _active_campaign_id is not None:
+        raise HTTPException(status_code=409, detail="A campaign is already running")
+
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        campaign = session.get(Campaign, campaign_id)
+        if campaign is None:
+            raise HTTPException(status_code=404, detail=f"Unknown campaign: {campaign_id}")
+        if not campaign.checkpoint_population:
+            raise HTTPException(status_code=409, detail="This campaign has no checkpoint to resume from")
+        symbol = campaign.asset or "EURUSD"
+        timeframe = campaign.timeframe or "H1"
+
+    settings = load_settings(get_config().settings_path)
+    try:
+        config = build_campaign_config(settings, symbol, timeframe)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    _active_campaign_id = campaign_id
+    threading.Thread(
+        target=_run_campaign_background,
+        args=(campaign_id, symbol, timeframe, GenePoolConfig.load(get_config().gene_pool_path), config, True),
+        daemon=True,
+    ).start()
+    return {"campaign_id": campaign_id, "status": "running", "resumed": True}
+
+
+@app.post("/campaign/{campaign_id}/discard")
+def discard_crashed_campaign(campaign_id: str) -> dict:
+    # REQ-ENGINE-4.4 — mark cancelled and drop it from the queue.
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        try:
+            discard_campaign(session, campaign_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"campaign_id": campaign_id, "status": "cancelled"}
 
 
 @app.post("/campaign/pause")
@@ -400,7 +606,11 @@ def _serialize_strategy(row: Strategy, *, full: bool) -> dict:
 def list_vault() -> list:
     engine = make_engine(get_config().vault_db_path)
     with Session(engine) as session:
-        rows = session.scalars(select(Strategy).order_by(Strategy.created_at.desc())).all()
+        # Recycle Bin rows (REQ-SET-4.3) are still in the table but are not
+        # part of the Vault until they are restored.
+        rows = session.scalars(
+            select(Strategy).where(Strategy.deleted_at.is_(None)).order_by(Strategy.created_at.desc())
+        ).all()
         return [_serialize_strategy(row, full=True) for row in rows]
 
 
@@ -412,7 +622,7 @@ def get_neural_map() -> dict:
     # enough population yet (design.md Part A's Neural Map empty-state note).
     engine = make_engine(get_config().vault_db_path)
     with Session(engine) as session:
-        rows = list(session.scalars(select(Strategy)))
+        rows = list(session.scalars(select(Strategy).where(Strategy.deleted_at.is_(None))))
         result = compute_neural_map(rows)
         if result is None:
             return {"ready": False, "strategy_count": len(rows), "min_strategies": MIN_STRATEGIES_FOR_MAP, "nodes": [], "clusters": []}
@@ -530,11 +740,54 @@ def set_data_built_in_only(body: BuiltInDataOnlyRequest) -> dict:
 
 @app.post("/data/sync")
 async def sync_data(symbols: list[str] | None = None) -> dict:
-    # REQ-DATA-1.5 — incremental delta sync, called on app startup.
-    runner = DeltaSyncRunner()
-    target_symbols = symbols or list(BUNDLED_SYMBOLS)
-    results = await runner.sync_all(target_symbols)
-    return {"synced_hours": results}
+    """Manual re-sync (Settings → System). The startup sync is the normal
+    path — REQ-DATA-1.5 — and this returns immediately rather than holding
+    the request open for what can be an hours-long first download; poll
+    /data/sync/status for progress."""
+    if _sync_state.running:
+        raise HTTPException(status_code=409, detail="A data sync is already running")
+    settings = load_settings(get_config().settings_path)
+    target_symbols = symbols or settings["target_markets"]["enabled_symbols"] or list(BUNDLED_SYMBOLS)
+    runner = DeltaSyncRunner(history_years=settings["campaign"]["history_depth_years"], state=_sync_state)
+    asyncio.create_task(runner.sync_all(target_symbols))
+    return {"started": True, "symbols": target_symbols}
+
+
+@app.get("/data/sync/status")
+def get_sync_status() -> dict:
+    return _sync_state.snapshot()
+
+
+@app.get("/data/coverage")
+def get_data_coverage() -> dict:
+    """How much history is actually cached per enabled symbol/timeframe —
+    the Dashboard needs this to tell the user whether a campaign can run
+    (see MIN_HISTORY_DAYS in app/engine/campaign.py)."""
+    settings = load_settings(get_config().settings_path)
+    depth_years = settings["campaign"]["history_depth_years"]
+    min_bars = int(MIN_IS_BARS / IS_FRACTION)
+    coverage = []
+    for symbol in settings["target_markets"]["enabled_symbols"]:
+        for timeframe in settings["target_markets"]["enabled_timeframes"]:
+            bars = _load_bars(symbol, timeframe, depth_years)
+            if bars.empty:
+                coverage.append(
+                    {"symbol": symbol, "timeframe": timeframe, "bars": 0, "days": 0, "ready": False}
+                )
+                continue
+            timestamps = pd.DatetimeIndex(bars["timestamp"])
+            days = int((timestamps.max() - timestamps.min()).total_seconds() // 86_400)
+            coverage.append(
+                {
+                    "symbol": symbol, "timeframe": timeframe, "bars": len(bars), "days": days,
+                    "from": timestamps.min().isoformat(), "to": timestamps.max().isoformat(),
+                    # Both gates matter: enough calendar span for the metrics
+                    # to mean anything, and enough bars for Phase 0's trade
+                    # minimum to be reachable at all.
+                    "ready": days >= MIN_HISTORY_DAYS and len(bars) >= min_bars,
+                }
+            )
+    return {"min_days": MIN_HISTORY_DAYS, "min_bars": min_bars, "coverage": coverage}
 
 
 class AutoBackupRequest(BaseModel):
@@ -585,10 +838,50 @@ def post_vault_restore(body: RestoreVaultRequest) -> dict:
 
 @app.post("/vault/purge")
 def post_vault_purge() -> dict:
-    # REQ-SET-4 — evaluates configured purge criteria against Vault rows.
-    # The Vault table itself lands in Phase 8; until then there is nothing
-    # to purge, so this honestly reports zero rather than faking a count.
-    return {"purged": 0}
+    # REQ-SET-4 — evaluates the configured purge criteria against the Vault.
+    # Purged rows go to the Recycle Bin (recoverable for 30 days), portfolio
+    # members are protected, and a running campaign defers the whole run.
+    settings = load_settings(get_config().settings_path)
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        empty_expired_recycle_bin(session)
+        result = run_purge(session, settings)
+    return {
+        "purged": result.purged,
+        "protected": result.protected,
+        "reasons": result.reasons,
+        "skipped_reason": result.skipped_reason,
+    }
+
+
+@app.get("/vault/recycle-bin")
+def get_recycle_bin() -> list:
+    # REQ-SET-4.3 — what is recoverable, and why it was purged.
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        rows = session.scalars(
+            select(Strategy).where(Strategy.deleted_at.is_not(None)).order_by(Strategy.deleted_at.desc())
+        ).all()
+        return [
+            {
+                **_serialize_strategy(row, full=False),
+                "deleted_at": row.deleted_at.isoformat() if row.deleted_at else None,
+                "delete_reason": row.delete_reason,
+                "recoverable_until": (row.deleted_at + timedelta(days=RECYCLE_BIN_RETENTION_DAYS)).isoformat()
+                if row.deleted_at
+                else None,
+            }
+            for row in rows
+        ]
+
+
+@app.post("/vault/recycle-bin/{strategy_id}/restore")
+def post_recycle_bin_restore(strategy_id: str) -> dict:
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        if not restore_from_recycle_bin(session, strategy_id):
+            raise HTTPException(status_code=404, detail=f"Not in the Recycle Bin: {strategy_id}")
+    return {"restored": strategy_id}
 
 
 @app.get("/settings/app")

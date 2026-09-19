@@ -70,3 +70,23 @@ def test_uses_full_cache_when_available_and_not_built_in_only(tmp_path):
     result = get_historical_bars("EURUSD", "M1", config, cache)
 
     assert result.iloc[0]["close"] == pytest.approx(3.0)
+
+
+def test_higher_timeframe_is_resampled_from_m1(tmp_path):
+    # Bundled data and delta sync only store M1 — an H1 request must be
+    # derived from it rather than coming back empty.
+    config = make_config(tmp_path)
+    config.built_in_data_only = True
+    timestamps = pd.date_range("2024-01-01 10:00", periods=120, freq="1min", tz="UTC")
+    m1 = pd.DataFrame(
+        {"timestamp": timestamps, "open": range(120), "high": range(1, 121), "low": range(120), "close": range(120), "volume": [1.0] * 120}
+    ).astype({"open": float, "high": float, "low": float, "close": float})
+    config.bundled_data_dir.mkdir(parents=True, exist_ok=True)
+    m1.to_parquet(bundled_bar_path(config.bundled_data_dir, "EURUSD", "M1"), index=False)
+
+    h1 = get_historical_bars("EURUSD", "H1", config)
+
+    assert len(h1) == 2
+    first = h1.iloc[0]
+    assert first["timestamp"] == timestamps[0]
+    assert (first["open"], first["high"], first["low"], first["close"], first["volume"]) == (0.0, 60.0, 0.0, 59.0, 60.0)

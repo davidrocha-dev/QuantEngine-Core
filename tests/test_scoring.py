@@ -15,7 +15,16 @@ def make_stats(**overrides) -> TradeStats:
 
 
 def make_robustness(mc_degradation=5.0, noise_degradation=5.0) -> RobustnessResult:
-    return RobustnessResult(20.0, 19.0, mc_degradation, 19.0, noise_degradation, True)
+    return RobustnessResult(
+        baseline_return_pct=20.0,
+        monte_carlo_median_return_pct=19.0,
+        monte_carlo_worst_return_pct=12.0,
+        monte_carlo_degradation_pct=mc_degradation,
+        monte_carlo_worst_drawdown_pct=8.0,
+        noise_return_pct=19.0,
+        noise_degradation_pct=noise_degradation,
+        passed=True,
+    )
 
 
 def test_classify_archetype_mean_reverter():

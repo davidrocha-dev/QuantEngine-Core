@@ -9,7 +9,7 @@ from app.engine.phases import (
     split_is_oos,
 )
 from app.genome.gene_pool import GenePoolConfig
-from app.genome.genome import random_population
+from app.genome.genome import Genome, random_population
 from tests.helpers import make_synthetic_ohlc
 
 
@@ -106,3 +106,16 @@ def test_phase_4_returns_vault_candidates_with_hash_ids():
     for vault_candidate in approved:
         assert vault_candidate.hash_id.startswith("#")
         assert vault_candidate.robustness.passed
+
+
+def test_phase_4_never_approves_the_same_genome_twice():
+    df = make_synthetic_ohlc(3000, seed=8, drift=0.0008, volatility=0.0025)
+    pool = GenePoolConfig()
+    genome = random_population(pool, 1)[0]
+    clones = [evaluate_candidate(Genome.from_dict({**genome.to_dict(), "genome_id": f"g{i}"}), df, pool, timeframe="H1") for i in range(5)]
+
+    approved = run_phase_4_robustness(clones, df, pool, point_size=0.0001, timeframe="H1")
+
+    assert len(approved) <= 1
+    for vault_candidate in approved:
+        assert vault_candidate.stats_oos.net_profit_pct > 0

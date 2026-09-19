@@ -87,9 +87,27 @@ class DukascopyClient:
         self._client = httpx.AsyncClient(timeout=timeout_seconds)
         self._max_retries = max_retries
         self._request_delay_seconds = request_delay_seconds
+        # Shared cooldown: a 429 means the *feed* is throttling this client,
+        # not just this request, so every concurrent fetch backs off together.
+        # Retrying per-request in isolation just burns the retry budget of
+        # every in-flight hour at once (observed: a whole sync giving up).
+        self._cooldown_until = 0.0
+        self._cooldown_seconds = 0.0
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def _await_cooldown(self) -> None:
+        remaining = self._cooldown_until - asyncio.get_running_loop().time()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+    def _enter_cooldown(self, seconds: float) -> None:
+        self._cooldown_seconds = min(max(seconds, self._cooldown_seconds * 2, 5.0), 120.0)
+        self._cooldown_until = asyncio.get_running_loop().time() + self._cooldown_seconds
+
+    def _relax_cooldown(self) -> None:
+        self._cooldown_seconds = max(0.0, self._cooldown_seconds / 2)
 
     async def fetch_hour(self, symbol: str, hour_start: datetime) -> TickHour:
         """Fetch and parse one hour of ticks. Returns an empty frame for
@@ -99,6 +117,7 @@ class DukascopyClient:
         url = build_hour_url(instrument.dukascopy_code, hour_start)
 
         for attempt in range(self._max_retries):
+            await self._await_cooldown()
             try:
                 response = await self._client.get(url)
             except httpx.TransportError as exc:
@@ -117,11 +136,11 @@ class DukascopyClient:
                 return TickHour(symbol, hour_start, parse_ticks(b"", instrument, hour_start))
 
             if response.status_code == 429:
-                retry_after = float(response.headers.get("retry-after", min(2**attempt, 30)))
-                await asyncio.sleep(retry_after)
+                self._enter_cooldown(float(response.headers.get("retry-after", 0)))
                 continue
 
             response.raise_for_status()
+            self._relax_cooldown()
             if self._request_delay_seconds:
                 await asyncio.sleep(self._request_delay_seconds)
 

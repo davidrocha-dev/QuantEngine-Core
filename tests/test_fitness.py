@@ -55,6 +55,13 @@ def test_fitness_f1_formula():
     assert fitness_f1_stability(stats) == (30.0 / 10.0) * 0.5 * 2.0
 
 
+def test_fitness_f1_losing_strategy_ranks_below_winners():
+    # Negative Net Profit x negative Sharpe must not multiply out positive.
+    loser = make_stats(net_profit_pct=-30.0, max_dd_pct=10.0, win_rate=0.4, sharpe_ratio=-2.0)
+    winner = make_stats(net_profit_pct=1.0, max_dd_pct=10.0, win_rate=0.4, sharpe_ratio=0.1)
+    assert fitness_f1_stability(loser) < 0 < fitness_f1_stability(winner)
+
+
 def test_fitness_f1_zero_drawdown_is_zero_not_infinite():
     stats = make_stats(max_dd_pct=0.0)
     assert fitness_f1_stability(stats) == 0.0

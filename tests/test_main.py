@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 import app.main as main_module
 from app.main import app
+from app.migrations.runner import run_migrations
 
 client = TestClient(app)
 
@@ -59,12 +60,17 @@ def test_mt5_status_connected_flags_metaquotes_demo(monkeypatch):
     assert isinstance(body["latency_ms"], float)
 
 
-def test_campaign_estimate_within_req_dash_1_5_bounds():
+def test_campaign_estimate_reports_the_work_it_is_based_on():
+    # REQ-DASH-1.5 — the estimate is derived from the campaign actually
+    # configured (POWER preset, cores, bars available), so it reports those
+    # inputs rather than a fixed 15-60 band.
     response = client.get("/campaign/estimate")
     assert response.status_code == 200
     body = response.json()
-    assert 15 <= body["min_minutes"] <= body["max_minutes"] <= 60
+    assert 1 <= body["min_minutes"] < body["max_minutes"]
     assert body["cpu_cores"] >= 1
+    assert body["power"] in ("ECO", "MEDIUM", "HIGH", "EXTREME")
+    assert body["symbol"] and body["timeframe"]
 
 
 def test_data_instruments_lists_full_catalog():
@@ -76,10 +82,29 @@ def test_data_instruments_lists_full_catalog():
     assert "M15" in body["timeframes"]
 
 
-def test_vault_purge_reports_zero_on_empty_vault():
+def test_vault_purge_reports_zero_on_empty_vault(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    run_migrations(fake_config.vault_db_path)
+
     response = client.post("/vault/purge")
+
     assert response.status_code == 200
-    assert response.json() == {"purged": 0}
+    body = response.json()
+    assert body["purged"] == 0
+    assert body["protected"] == 0
+    assert body["skipped_reason"] is None
+
+
+def test_recycle_bin_is_empty_by_default(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    run_migrations(fake_config.vault_db_path)
+
+    response = client.get("/vault/recycle-bin")
+
+    assert response.status_code == 200
+    assert response.json() == []
 
 
 def test_system_info_reports_paths():
@@ -92,6 +117,10 @@ def test_system_info_reports_paths():
 
 class _FakeConfig:
     def __init__(self, tmp_path):
+        self.data_dir = tmp_path
+        self.bundled_data_dir = tmp_path / "bundled"
+        self.cache_dir = tmp_path / "cache"
+        self.built_in_data_only = False
         self.settings_path = tmp_path / "settings.json"
         self.gene_pool_path = tmp_path / "gene_pool.json"
         self.vault_db_path = tmp_path / "vault.db"

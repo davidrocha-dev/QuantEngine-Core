@@ -190,8 +190,10 @@ def chandelier_exit(df: pd.DataFrame, period: int = 22, atr_mult: float = 3.0) -
 
 def average_daily_range(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """Average Daily Range as a fraction of a resampled daily series, ffilled to bar granularity."""
-    daily = df.set_index(pd.DatetimeIndex(df["timestamp"])).resample("1D").agg({"high": "max", "low": "min"})
-    daily_range = (daily["high"] - daily["low"]).rolling(period).mean()
+    daily = df.set_index(pd.DatetimeIndex(df["timestamp"])).resample("1D").agg({"high": "max", "low": "min"}).dropna()
+    # shift(1): a bar only knows *completed* days — today's final range is
+    # not known until the day closes (using it would be look-ahead bias).
+    daily_range = (daily["high"] - daily["low"]).rolling(period).mean().shift(1)
     return daily_range.reindex(pd.DatetimeIndex(df["timestamp"]), method="ffill").set_axis(df.index)
 
 
