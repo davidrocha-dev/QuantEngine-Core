@@ -98,6 +98,10 @@ class LiveTrade(Base):
     volume: Mapped[float | None]
     profit: Mapped[float] = mapped_column(nullable=False)
     exit_price: Mapped[float | None]
+    # The account server the deal came from. REQ-AUTO-3 turns on this one
+    # field: the same strategy losing everywhere is alpha decay, losing on
+    # one broker is that broker's problem.
+    broker: Mapped[str | None] = mapped_column(String)
     imported_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 

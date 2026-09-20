@@ -153,6 +153,74 @@ def run_health_check(session: Session, strategy_ids: list[str] | None = None) ->
     return [check_strategy(session, strategy) for strategy in session.scalars(statement)]
 
 
+@dataclass
+class BrokerVerdict:
+    strategy_id: str
+    classification: str  # alpha_decay | broker_warning | healthy | inconclusive
+    per_broker: dict[str, dict]
+    detail: str
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in vars(self).items()}
+
+
+def check_across_brokers(session: Session, strategy: Strategy) -> BrokerVerdict:
+    """REQ-AUTO-3 — tells a dead edge apart from one broker's problem.
+
+    Returns are normalised to profit per trade before comparison, because
+    the same strategy will be sized differently on different accounts and
+    raw profit would make the biggest account look like the best broker.
+    """
+    trades = [trade for trade in _live_trades(session, strategy.id) if trade.broker]
+    by_broker: dict[str, list] = {}
+    for trade in trades:
+        by_broker.setdefault(trade.broker, []).append(trade)
+
+    per_broker = {
+        broker: {
+            "trades": len(rows),
+            "profit": round(sum(t.profit for t in rows), 2),
+            "profit_per_trade": round(sum(t.profit for t in rows) / len(rows), 2),
+        }
+        for broker, rows in by_broker.items()
+    }
+
+    measurable = {b: stats for b, stats in per_broker.items() if stats["trades"] >= MIN_TRADES_FOR_VERDICT}
+    if len(measurable) < 2:
+        return BrokerVerdict(
+            strategy_id=strategy.id, classification="inconclusive", per_broker=per_broker,
+            detail=(
+                "Needs the same strategy running on two or more brokers, each with "
+                f"{MIN_TRADES_FOR_VERDICT}+ live trades, before the two causes can be told apart."
+            ),
+        )
+
+    losing = [broker for broker, stats in measurable.items() if stats["profit_per_trade"] < 0]
+    if not losing:
+        return BrokerVerdict(
+            strategy_id=strategy.id, classification="healthy", per_broker=per_broker,
+            detail=f"Profitable on all {len(measurable)} brokers reporting.",
+        )
+    if len(losing) == len(measurable):
+        # REQ-AUTO-3.2 — every terminal declining together is the edge.
+        return BrokerVerdict(
+            strategy_id=strategy.id, classification="alpha_decay", per_broker=per_broker,
+            detail="ALPHA DECAY — losing on every broker reporting. Retire the bot.",
+        )
+    # REQ-AUTO-3.3 — one terminal out of step is an execution problem.
+    return BrokerVerdict(
+        strategy_id=strategy.id, classification="broker_warning", per_broker=per_broker,
+        detail=f"BROKER WARNING — losing only on {', '.join(losing)} while the others hold.",
+    )
+
+
+def check_all_brokers(session: Session) -> list[BrokerVerdict]:
+    deployed = session.scalars(
+        select(Strategy).where(Strategy.deleted_at.is_(None)).where(Strategy.deployed.is_(True))
+    )
+    return [check_across_brokers(session, strategy) for strategy in deployed]
+
+
 def ladder_entry(session: Session, strategy: Strategy, now: datetime | None = None) -> LadderEntry:
     """REQ-PORT-3 — where this bot stands, and what is holding it back."""
     now = now or datetime.now(timezone.utc)

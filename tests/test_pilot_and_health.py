@@ -179,3 +179,79 @@ def test_an_underwater_bot_is_not_promoted_however_many_trades_it_has(session):
 
     assert entry.can_promote is False
     assert "underwater" in entry.blocked_reason
+
+
+def add_broker_trades(session: Session, strategy_id: str, broker: str, profits: list[float]) -> None:
+    for index, profit in enumerate(profits):
+        session.add(
+            LiveTrade(
+                deal_ticket=f"{strategy_id}-{broker}-{index}", strategy_id=strategy_id,
+                magic=_magic_number(strategy_id), symbol="EURUSD",
+                closed_at=datetime.now(timezone.utc) - timedelta(hours=index), volume=0.1,
+                profit=profit, broker=broker,
+            )
+        )
+    session.commit()
+
+
+def test_one_broker_alone_cannot_tell_the_two_causes_apart(session):
+    from app.engine.health import check_across_brokers
+
+    strategy = make_strategy(session)
+    add_broker_trades(session, strategy.id, "BrokerA", [-2.0] * 15)
+
+    verdict = check_across_brokers(session, strategy)
+
+    assert verdict.classification == "inconclusive"
+    assert "two or more brokers" in verdict.detail
+
+
+def test_losing_on_every_broker_is_alpha_decay(session):
+    from app.engine.health import check_across_brokers
+
+    strategy = make_strategy(session)
+    add_broker_trades(session, strategy.id, "BrokerA", [-2.0] * 12)
+    add_broker_trades(session, strategy.id, "BrokerB", [-1.5] * 12)
+
+    verdict = check_across_brokers(session, strategy)
+
+    assert verdict.classification == "alpha_decay"
+    assert "ALPHA DECAY" in verdict.detail
+
+
+def test_losing_on_one_broker_while_others_hold_names_that_broker(session):
+    from app.engine.health import check_across_brokers
+
+    strategy = make_strategy(session)
+    add_broker_trades(session, strategy.id, "GoodBroker", [3.0] * 12)
+    add_broker_trades(session, strategy.id, "BadBroker", [-3.0] * 12)
+
+    verdict = check_across_brokers(session, strategy)
+
+    assert verdict.classification == "broker_warning"
+    assert "BadBroker" in verdict.detail
+
+
+def test_profitable_everywhere_is_healthy(session):
+    from app.engine.health import check_across_brokers
+
+    strategy = make_strategy(session)
+    add_broker_trades(session, strategy.id, "BrokerA", [2.0] * 12)
+    add_broker_trades(session, strategy.id, "BrokerB", [1.0] * 12)
+
+    assert check_across_brokers(session, strategy).classification == "healthy"
+
+
+def test_per_broker_comparison_normalises_by_trade_count(session):
+    # A bigger account should not look like a better broker.
+    from app.engine.health import check_across_brokers
+
+    strategy = make_strategy(session)
+    add_broker_trades(session, strategy.id, "Small", [1.0] * 12)
+    add_broker_trades(session, strategy.id, "Large", [10.0] * 12)
+
+    verdict = check_across_brokers(session, strategy)
+
+    assert verdict.per_broker["Small"]["profit_per_trade"] == 1.0
+    assert verdict.per_broker["Large"]["profit_per_trade"] == 10.0
+    assert verdict.classification == "healthy"

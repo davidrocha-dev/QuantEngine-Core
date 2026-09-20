@@ -44,7 +44,7 @@ from app.engine.purge import (
 from app.engine.campaign_estimate import estimate_campaign_minutes
 from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
 from app.engine.phases import IS_FRACTION
-from app.engine.health import ladder, run_health_check
+from app.engine.health import check_all_brokers, ladder, run_health_check
 from app.engine.portfolio import compute_health
 from app.engine import smart_mode
 from app.engine.reassess import reassess_strategy as reassess_strategy_engine
@@ -1377,6 +1377,7 @@ def post_health_check(strategy_ids: list[str] | None = None) -> dict:
     with Session(engine) as session:
         imported = pilot.import_live_trades(session)
         verdicts = run_health_check(session, strategy_ids)
+        broker_verdicts = [v for v in check_all_brokers(session) if v.classification != "inconclusive"]
 
     counts = {status: sum(1 for v in verdicts if v.status == status) for status in ("healthy", "degraded", "too_early", "no_data")}
     return {
@@ -1384,6 +1385,9 @@ def post_health_check(strategy_ids: list[str] | None = None) -> dict:
         "verdicts": [verdict.to_dict() for verdict in verdicts],
         # REQ-AUTO-5's "N holding / N decayed / N too early".
         "summary": counts,
+        # REQ-AUTO-3 — only says anything when a strategy runs on more than
+        # one broker; otherwise the two causes cannot be told apart.
+        "brokers": [verdict.to_dict() for verdict in broker_verdicts],
     }
 
 

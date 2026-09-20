@@ -45,7 +45,9 @@ void WriteHeaderIfMissing()
 
    int handle = FileOpen(OutputFile, FILE_WRITE | FILE_CSV | FILE_ANSI | FILE_COMMON, ',');
    if(handle == INVALID_HANDLE) return;
-   FileWrite(handle, "deal_ticket", "closed_at", "magic", "symbol", "volume", "profit", "entry_price", "exit_price");
+   // `broker` is what makes REQ-AUTO-3 possible: the same strategy losing
+   // on every broker is alpha decay, losing on one is a broker problem.
+   FileWrite(handle, "deal_ticket", "closed_at", "magic", "symbol", "volume", "profit", "entry_price", "exit_price", "broker");
    FileClose(handle);
 }
 
@@ -83,7 +85,8 @@ void ScanHistory()
          DoubleToString(HistoryDealGetDouble(ticket, DEAL_VOLUME), 2),
          DoubleToString(HistoryDealGetDouble(ticket, DEAL_PROFIT), 2),
          DoubleToString(0.0, 5),                                           // entry price: see note below
-         DoubleToString(HistoryDealGetDouble(ticket, DEAL_PRICE), 5)
+         DoubleToString(HistoryDealGetDouble(ticket, DEAL_PRICE), 5),
+         AccountInfoString(ACCOUNT_SERVER)
       );
 
       if((long)ticket > LastReportedDeal) LastReportedDeal = (long)ticket;

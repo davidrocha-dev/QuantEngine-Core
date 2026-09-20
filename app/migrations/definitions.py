@@ -97,6 +97,11 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX IF NOT EXISTS idx_live_trades_strategy ON live_trades (strategy_id, closed_at)",
         ),
     ),
+    Migration(
+        version=5,
+        description="Which broker a live trade came from, for multi-broker health checks (REQ-AUTO-3)",
+        statements=("ALTER TABLE live_trades ADD COLUMN broker TEXT",),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = max(m.version for m in MIGRATIONS)

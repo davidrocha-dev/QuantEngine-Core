@@ -139,6 +139,9 @@ def import_live_trades(session: Session, path: Path | None = None) -> ImportResu
                     volume=_float_or_none(row.get("volume")),
                     profit=profit,
                     exit_price=_float_or_none(row.get("exit_price")),
+                    # Older Pilot builds wrote no broker column; those rows
+                    # simply cannot take part in the multi-broker check.
+                    broker=(row.get("broker") or "").strip() or None,
                 )
             )
             existing.add(ticket)
