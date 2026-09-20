@@ -74,6 +74,9 @@ class CampaignConfig:
     commission_per_lot: float = 0.0
     contract_size: float = 100_000.0
     data_source: str = "dukascopy"
+    # Smart Mode sampling weights (app/engine/smart_mode.py). Empty means
+    # uniform sampling, which is what every campaign did before Smart Mode.
+    gene_weights: dict = field(default_factory=dict)
     # REQ-BREED-2 — higher-timeframe context bars, None when HIGHER TF is off.
     htf_df: pd.DataFrame | None = None
     # REQ-ENGINE-2 — economic calendar for the EVENT gene, empty when none is configured.
@@ -279,7 +282,7 @@ def run_campaign(
         drawn = 0
         max_draws = config.population_size * MAX_SCREENING_ROUNDS
         while drawn < max_draws:
-            population = random_population(gene_pool, config.population_size)
+            population = random_population(gene_pool, config.population_size, config.gene_weights or None)
             phase_0 = run_phase_0_screening(population, is_df, gene_pool, max_workers=config.max_workers, **eval_kwargs)
             phase_0_survivors.extend(phase_0.survivors)
             drawn += config.population_size

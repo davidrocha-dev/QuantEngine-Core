@@ -92,35 +92,48 @@ class Genome:
         )
 
 
-def _random_choice(pool: GenePoolConfig, layer: str, catalog: dict) -> GeneChoice | None:
+def _random_choice(
+    pool: GenePoolConfig, layer: str, catalog: dict, weights: dict[str, float] | None = None
+) -> GeneChoice | None:
     enabled = pool.enabled_names(layer)  # type: ignore[arg-type]
     if not enabled:
         return None
-    name = random.choice(enabled)
+    if weights:
+        # Smart Mode (app/engine/smart_mode.py) biases the draw towards
+        # genes that have produced Vault strategies. It never excludes an
+        # enabled gene — the Gene Pool decides what may be drawn, this only
+        # decides how often.
+        name = random.choices(enabled, weights=[max(weights.get(f"{layer}::{n}", 1.0), 0.01) for n in enabled])[0]
+    else:
+        name = random.choice(enabled)
     # Parameters are drawn from the gene's search space, not pinned to the
     # documented defaults — see genes.py `param_space`.
     return GeneChoice(name, sample_params(catalog[name]))
 
 
-def random_genome(pool: GenePoolConfig) -> Genome:
+def random_genome(pool: GenePoolConfig, weights: dict[str, float] | None = None) -> Genome:
     """Draws a random genome from the enabled subset of each layer. Signal
     and Execution are required layers and raise if nothing is enabled for
     them. Management is optional at the genome level — REQ-ENGINE-1.4's
     "all Management genes disabled" gate is a pool-wide Phase 3 check (see
     app/engine/phases.py), not a per-genome generation failure."""
-    signal = _random_choice(pool, "signal", SIGNAL_GENES)
-    execution = _random_choice(pool, "execution", EXECUTION_GENES)
+    signal = _random_choice(pool, "signal", SIGNAL_GENES, weights)
+    execution = _random_choice(pool, "execution", EXECUTION_GENES, weights)
     if signal is None:
         raise ValueError("No SIGNAL genes enabled — cannot generate a genome")
     if execution is None:
         raise ValueError("No EXECUTION genes enabled — cannot generate a genome")
 
-    management = _random_choice(pool, "management", MANAGEMENT_GENES) if pool.enabled_names("management") else None
-    bias = _random_choice(pool, "bias", BIAS_GENES) if pool.enabled_names("bias") and random.random() > 0.2 else None
+    management = _random_choice(pool, "management", MANAGEMENT_GENES, weights) if pool.enabled_names("management") else None
+    bias = (
+        _random_choice(pool, "bias", BIAS_GENES, weights)
+        if pool.enabled_names("bias") and random.random() > 0.2
+        else None
+    )
 
     filter_pool = pool.enabled_names("filter")
     num_filters = random.randint(0, min(MAX_FILTERS_PER_GENOME, len(filter_pool)))
-    filter_names = random.sample(filter_pool, num_filters) if filter_pool else []
+    filter_names = _sample_filters(filter_pool, num_filters, weights)
     filters = [GeneChoice(name, sample_params(FILTER_GENES[name])) for name in filter_names]
 
     return Genome(
@@ -134,8 +147,25 @@ def random_genome(pool: GenePoolConfig) -> Genome:
     )
 
 
-def random_population(pool: GenePoolConfig, size: int) -> list[Genome]:
-    return [random_genome(pool) for _ in range(size)]
+def _sample_filters(filter_pool: list[str], count: int, weights: dict[str, float] | None) -> list[str]:
+    """Distinct filters, drawn with Smart Mode's weights when it has any."""
+    if not filter_pool or count <= 0:
+        return []
+    if not weights:
+        return random.sample(filter_pool, count)
+
+    remaining, chosen = list(filter_pool), []
+    for _ in range(count):
+        picked = random.choices(
+            remaining, weights=[max(weights.get(f"filter::{n}", 1.0), 0.01) for n in remaining]
+        )[0]
+        chosen.append(picked)
+        remaining.remove(picked)
+    return chosen
+
+
+def random_population(pool: GenePoolConfig, size: int, weights: dict[str, float] | None = None) -> list[Genome]:
+    return [random_genome(pool, weights) for _ in range(size)]
 
 
 def crossover(parent_a: Genome, parent_b: Genome) -> Genome:

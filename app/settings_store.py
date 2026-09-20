@@ -83,6 +83,14 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
     "smart_mode": {
         "smart_insights_enabled": True,
     },
+    # AUTOMATION (Elite) — tasks.md 12.2/12.6. The scheduler in
+    # app/main.py reads these; `last_*_at` are written by it, not by the UI.
+    "automation": {
+        "recurring_campaigns_enabled": False,
+        "recurring_interval_hours": 24,
+        "last_campaign_started_at": None,
+        "last_purge_at": None,
+    },
 }
 
 

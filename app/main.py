@@ -43,6 +43,7 @@ from app.engine.campaign_estimate import estimate_campaign_minutes
 from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
 from app.engine.phases import IS_FRACTION
 from app.engine.portfolio import compute_health
+from app.engine import smart_mode
 from app.engine.reassess import reassess_strategy as reassess_strategy_engine
 from app.engine.true_sim import run_true_sim
 from app.engine.reassess import refresh_strategy as refresh_strategy_engine
@@ -222,6 +223,9 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
         contract_size=CONTRACT_SIZE_BY_CATEGORY.get(instrument.category, 100_000.0),
         max_workers=campaign_settings["cores"] or None,  # 0 = auto
         data_source="bundled" if get_config().built_in_data_only else "dukascopy",
+        # SMART MODE (Settings → Campaign) biases which genes get drawn,
+        # using what the Vault has already shown to work.
+        gene_weights=smart_mode.load(get_config().data_dir).weights if campaign_settings["smart_mode"] else {},
         htf_df=htf_df,
         news_events=news_events,
     )
@@ -303,6 +307,67 @@ async def _startup_delta_sync() -> None:
         traceback.print_exc()
 
 
+SCHEDULER_TICK_SECONDS = 60
+
+
+def _due(last_at: str | None, interval: timedelta, now: datetime) -> bool:
+    if last_at is None:
+        return True
+    try:
+        previous = datetime.fromisoformat(last_at)
+    except ValueError:
+        return True
+    if previous.tzinfo is None:
+        previous = previous.replace(tzinfo=timezone.utc)
+    return now - previous >= interval
+
+
+async def _scheduler_loop() -> None:
+    """Recurring campaigns and automatic purge — tasks.md 12.2, REQ-SET-4.5.
+
+    Both are deliberately conservative: a campaign only starts when none is
+    running, and a purge is skipped entirely while one is (REQ-SET-4.4).
+    Timestamps live in settings, so a restart never re-fires something that
+    already ran.
+    """
+    while True:
+        await asyncio.sleep(SCHEDULER_TICK_SECONDS)
+        try:
+            config = get_config()
+            settings = load_settings(config.settings_path)
+            automation = settings["automation"]
+            now = datetime.now(timezone.utc)
+
+            if (
+                automation["recurring_campaigns_enabled"]
+                and _active_campaign_id is None
+                and _due(automation["last_campaign_started_at"], timedelta(hours=automation["recurring_interval_hours"]), now)
+            ):
+                try:
+                    start_campaign()
+                    update_section(config.settings_path, "automation", {"last_campaign_started_at": now.isoformat()})
+                except HTTPException:
+                    pass  # A campaign is already running; try again next tick.
+
+            maintenance = settings["vault_maintenance"]
+            if maintenance["automatic_purge_enabled"] and _due(
+                automation["last_purge_at"], timedelta(days=maintenance["automatic_purge_interval_days"]), now
+            ):
+                engine = make_engine(config.vault_db_path)
+                with Session(engine) as session:
+                    empty_expired_recycle_bin(session, now)
+                    result = run_purge(session, settings, now)
+                if result.skipped_reason is None:
+                    update_section(config.settings_path, "automation", {"last_purge_at": now.isoformat()})
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A scheduling hiccup must never take the engine down.
+            import traceback
+
+            traceback.print_exc()
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global _main_loop
@@ -328,9 +393,12 @@ async def lifespan(_: FastAPI):
     # REQ-DATA-1.5 — delta sync runs on startup. It is a background task:
     # a first sync downloads years of history and must never block the API.
     sync_task = asyncio.create_task(_startup_delta_sync())
+    # tasks.md 12.2 / REQ-SET-4.5 — recurring campaigns and automatic purge.
+    scheduler_task = asyncio.create_task(_scheduler_loop())
     yield
     poll_task.cancel()
     sync_task.cancel()
+    scheduler_task.cancel()
 
 
 # FastAPI engine — design.md B.2, B.7. Bound to 127.0.0.1:7831 only,
@@ -1220,6 +1288,42 @@ def set_gene_pool(body: GenePoolUpdateRequest) -> dict:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     config.save(get_config().gene_pool_path)
     return _gene_pool_response(config)
+
+
+@app.get("/smart-mode")
+def get_smart_mode() -> dict:
+    """tasks.md 12.3 — what Smart Mode has learned, and from how much."""
+    fitness = smart_mode.load(get_config().data_dir)
+    weights = fitness.weights
+    ranked = sorted(weights.items(), key=lambda item: item[1], reverse=True)
+    return {
+        "learned": bool(weights),
+        "strategies_learned_from": fitness.strategies_learned_from,
+        "computed_at": fitness.computed_at,
+        "reason": fitness.reason,
+        "min_strategies": smart_mode.MIN_STRATEGIES_TO_LEARN,
+        "favoured": [{"gene": gene, "weight": weight} for gene, weight in ranked[:10]],
+        "avoided": [{"gene": gene, "weight": weight} for gene, weight in ranked[-10:]],
+    }
+
+
+@app.post("/smart-mode/rebuild")
+def post_smart_mode_rebuild() -> dict:
+    """Re-learns from the Vault as it stands now."""
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        rows = list(session.scalars(select(Strategy).where(Strategy.deleted_at.is_(None))))
+    fitness = smart_mode.compute_gene_fitness(rows)
+    smart_mode.save(fitness, get_config().data_dir)
+    return get_smart_mode()
+
+
+@app.post("/smart-mode/reset")
+def post_smart_mode_reset() -> dict:
+    # Settings → Smart Mode's reset action: campaigns go back to sampling
+    # every enabled gene uniformly.
+    removed = smart_mode.clear(get_config().data_dir)
+    return {"cleared": removed}
 
 
 @app.get("/system/info")
