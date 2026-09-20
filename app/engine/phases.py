@@ -24,6 +24,7 @@ from app.engine.metrics import TradeStats, compute_trade_stats
 from app.engine.monte_carlo import RobustnessResult, draw_noise_params, evaluate_robustness
 from app.engine.news_filter import EconomicEvent, NewsMode
 from app.engine.resources import limit_worker_threads, max_parallel_workers
+from app.engine.walk_forward import WalkForwardResult, run_walk_forward
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genome import Genome, crossover, mutate
 
@@ -37,6 +38,11 @@ DEFAULT_MAX_BREEDING_POPULATION = 200
 # carry information. Scaled from Phase 0's 100-trade rule (REQ-ENGINE-3.2)
 # by the OOS share of history: 100 x 30% = 30.
 MIN_OOS_TRADES = 30
+# Share of walk-forward folds a strategy must have been profitable in.
+# Half is a deliberately modest bar: the point is to reject strategies that
+# worked in exactly one period, not to demand a strategy that never has a
+# losing stretch — no real one exists.
+MIN_PERSISTENCE_PCT = 50.0
 
 
 @dataclass
@@ -68,6 +74,7 @@ class VaultCandidate:
     robustness: RobustnessResult
     equity_is: list[dict] | None = None
     equity_oos: list[dict] | None = None
+    walk_forward: WalkForwardResult | None = None
 
 
 EQUITY_CURVE_MAX_POINTS = 500
@@ -414,6 +421,26 @@ def run_phase_4_robustness(
         if not robustness.passed:
             continue
 
+        # Walk-forward: the 70/30 split tests one period, which a strategy
+        # can pass by being right about one regime. This re-tests it on
+        # consecutive slices and requires it to have been profitable in
+        # most of them. Short histories yield no folds, in which case
+        # persistence is unknown (None) and cannot gate anything.
+        walk_forward = run_walk_forward(
+            candidate.genome, full_df, gene_pool,
+            timeframe=eval_kwargs.get("timeframe", "H1"),
+            initial_balance=initial_balance,
+            point_size=point_size,
+            train_bars=len(is_df),
+            **{
+                k: v
+                for k, v in eval_kwargs.items()
+                if k in ("cost_points", "commission_per_lot", "contract_size", "risk_pct", "htf_df", "news_events", "news_mode")
+            },
+        )
+        if walk_forward is not None and walk_forward.persistence_pct < MIN_PERSISTENCE_PCT:
+            continue
+
         approved.append(
             VaultCandidate(
                 genome=candidate.genome,
@@ -423,6 +450,7 @@ def run_phase_4_robustness(
                 robustness=robustness,
                 equity_is=serialize_equity_curve(is_df, candidate.result.equity_curve) if candidate.result else None,
                 equity_oos=serialize_equity_curve(oos_df, oos_result.equity_curve),
+                walk_forward=walk_forward,
             )
         )
 

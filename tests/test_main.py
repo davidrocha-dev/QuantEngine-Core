@@ -369,10 +369,11 @@ def test_delete_unknown_strategy_404(tmp_path, monkeypatch):
 
 
 def test_refresh_reassess_parity_test_are_honest_about_being_unsupported():
+    # Deploy is no longer on this list — it generates and installs a real
+    # EA (see the deploy tests below).
     assert client.post("/vault/x/refresh").json()["status"] == "not_supported"
     assert client.post("/vault/x/reassess").json()["status"] == "not_supported"
     assert client.post("/vault/x/parity-test").json()["status"] == "not_supported"
-    assert client.post("/deploy/x").json()["status"] == "not_supported"
 
 
 def test_portfolio_create_list_and_add_strategy(tmp_path, monkeypatch):
@@ -425,3 +426,120 @@ def test_best_fitness_handles_missing_and_malformed_input():
     assert main_module._best_fitness(None) is None
     assert main_module._best_fitness("not json") is None
     assert main_module._best_fitness('{"active_population": []}') is None
+
+
+def _seed_deployable_strategy(config, genome_dict: dict, strategy_id: str = "#DEP001") -> None:
+    from sqlalchemy.orm import Session
+
+    from app.db import make_engine
+    from app.models import Strategy
+
+    run_migrations(config.vault_db_path)
+    engine = make_engine(config.vault_db_path)
+    with Session(engine) as session:
+        session.add(
+            Strategy(
+                id=strategy_id, data_source="dukascopy", asset="EURUSD", timeframe="M15",
+                trades=120, return_pct=12.0, max_dd_pct=8.0, score=70, grade="GOOD",
+                genome_json=json.dumps(genome_dict),
+            )
+        )
+        session.commit()
+
+
+def _simple_genome(**overrides) -> dict:
+    genome = {
+        "signal": {"name": "MACD", "params": {"fast": 12, "slow": 26, "signal": 9}},
+        "bias": {"name": "SMA", "params": {"period": 50}},
+        "filters": [],
+        "execution": {"name": "MARKET2", "params": {"confirm_bars": 2}},
+        "management": {"name": "EOD CLOSE", "params": {"close_hour": 21}},
+        "stop_atr_mult": 1.5,
+        "target_atr_mult": 3.0,
+    }
+    genome.update(overrides)
+    return genome
+
+
+def test_export_mql5_writes_the_ea_to_the_chosen_folder(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    _seed_deployable_strategy(fake_config, _simple_genome())
+    destination = tmp_path / "exports"
+
+    response = client.post("/vault/%23DEP001/export-mql5", json={"destination_dir": str(destination)})
+
+    assert response.status_code == 200
+    exported = tmp_path / "exports" / "QE_DEP001.mq5"
+    assert exported.exists()
+    assert "OnTick" in exported.read_text(encoding="utf-8")
+
+
+def test_export_refuses_a_genome_whose_gene_has_no_mql5_equivalent(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    _seed_deployable_strategy(fake_config, _simple_genome(filters=[{"name": "EVENT", "params": {"mode": "FTMO"}}]))
+
+    response = client.post("/vault/%23DEP001/export-mql5", json={"destination_dir": str(tmp_path / "out")})
+
+    assert response.status_code == 422
+    assert "EVENT" in response.json()["detail"]
+
+
+def test_deploy_installs_the_ea_and_marks_the_strategy_deployed(tmp_path, monkeypatch):
+    from sqlalchemy.orm import Session
+
+    from app.broker.mt5_install import InstallResult
+    from app.db import make_engine
+    from app.models import Strategy
+
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    _seed_deployable_strategy(fake_config, _simple_genome())
+
+    captured = {}
+
+    def fake_install(filename, source, compile_after_install=True):
+        captured["filename"], captured["source"] = filename, source
+        return InstallResult(installed_paths=["C:/fake/QE_DEP001.mq5"], detail="Installed into 1 terminal(s).")
+
+    monkeypatch.setattr(main_module, "install_ea", fake_install)
+
+    response = client.post("/deploy/%23DEP001")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "deployed"
+    assert body["filename"] == "QE_DEP001.mq5"
+    assert "OnInit" in captured["source"]
+
+    engine = make_engine(fake_config.vault_db_path)
+    with Session(engine) as session:
+        strategy = session.get(Strategy, "#DEP001")
+        assert strategy.deployed is True
+        # Installing a file is not the same as the EA running on a chart.
+        assert strategy.active_mt5 is False
+
+
+def test_deploy_reports_a_conflict_when_no_terminal_is_installed(tmp_path, monkeypatch):
+    from app.broker.mt5_install import InstallResult
+
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    _seed_deployable_strategy(fake_config, _simple_genome())
+    monkeypatch.setattr(
+        main_module, "install_ea", lambda *a, **k: InstallResult(detail="No MetaTrader 5 terminal data directory was found.")
+    )
+
+    response = client.post("/deploy/%23DEP001")
+
+    assert response.status_code == 409
+    assert "MetaTrader 5" in response.json()["detail"]
+
+
+def test_deploy_unknown_strategy_404(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    run_migrations(fake_config.vault_db_path)
+
+    assert client.post("/deploy/%23NOPE").status_code == 404

@@ -39,6 +39,10 @@ class Strategy(Base):
     # days, so a purge is never an irreversible delete.
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime)
     delete_reason: Mapped[str | None] = mapped_column(Text)
+    # REQ-VAULT-1.1 PERSISTENCE — share of walk-forward folds the strategy
+    # was profitable in, with the per-fold detail behind it.
+    persistence_pct: Mapped[float | None]
+    walk_forward: Mapped[str | None] = mapped_column(Text)  # JSON
 
 
 class Portfolio(Base):

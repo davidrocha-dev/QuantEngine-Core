@@ -17,6 +17,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.broker.mt5_bridge import MT5Bridge
+from app.broker.mt5_install import install_ea
+from app.codegen.mql5 import GeneratedEa, UnsupportedGeneError, generate_ea
 from app.config import get_config, set_auto_backup_before_updates, set_built_in_data_only
 from app.data.provider import get_historical_bars
 from app.data.sync import DeltaSyncRunner, SyncState
@@ -584,6 +586,10 @@ def _serialize_strategy(row: Strategy, *, full: bool) -> dict:
         "archetype": row.archetype,
         "mechanism": _mechanism(row.genome_json),
         "robust_pct": row.robust_pct,
+        # REQ-VAULT-1.1 PERSISTENCE — real walk-forward result, not a
+        # placeholder: the share of test windows the strategy was
+        # profitable in (null when the history was too short to fold).
+        "persistence_pct": row.persistence_pct,
         "icir": row.icir,
         "avg_hold_hours": row.avg_hold_hours,
         "score": row.score,
@@ -599,6 +605,7 @@ def _serialize_strategy(row: Strategy, *, full: bool) -> dict:
         base["equity_is"] = json.loads(row.equity_is) if row.equity_is else None
         base["equity_oos"] = json.loads(row.equity_oos) if row.equity_oos else None
         base["active_genes"] = _active_genes(row.genome_json)
+        base["walk_forward"] = json.loads(row.walk_forward) if row.walk_forward else None
     return base
 
 
@@ -648,12 +655,80 @@ def delete_strategy(strategy_id: str) -> dict:
     return {"deleted": strategy_id}
 
 
+def _generate_ea_for(strategy_id: str) -> tuple[Strategy, "GeneratedEa"]:
+    """Loads a Vault strategy and regenerates its EA from the stored genome."""
+    settings = load_settings(get_config().settings_path)
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        row = session.get(Strategy, strategy_id)
+        if row is None or row.deleted_at is not None:
+            raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+        session.expunge(row)
+
+    try:
+        genome = Genome.from_dict(json.loads(row.genome_json))
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail="This strategy's genome could not be read") from exc
+
+    try:
+        generated = generate_ea(
+            genome,
+            row.id,
+            row.asset,
+            row.timeframe,
+            # The EA risks what Settings says, not what the backtest used —
+            # position size is the user's decision, the rules are not.
+            risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
+            max_spread_points=float(settings["costs"]["manual_spread_points"]),
+        )
+    except UnsupportedGeneError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return row, generated
+
+
+class ExportEaRequest(BaseModel):
+    destination_dir: str
+
+
+@app.post("/vault/{strategy_id}/export-mql5")
+def post_export_mql5(strategy_id: str, body: ExportEaRequest) -> dict:
+    """REQ-TIER-1.3 (MQL5 export) — writes the EA source to a folder of the
+    user's choosing, for people who compile or review it themselves."""
+    _, generated = _generate_ea_for(strategy_id)
+    destination_dir = Path(body.destination_dir)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / generated.filename
+    destination.write_text(generated.source, encoding="utf-8")
+    return {"exported_path": str(destination), "filename": generated.filename}
+
+
 @app.post("/deploy/{strategy_id}")
 def deploy_strategy(strategy_id: str) -> dict:
-    # REQ-VAULT-2.1 — Pro+ action. No MQL5 codegen/MT5 install pipeline
-    # exists yet (that's design.md Part C / later phases), so this is
-    # honestly unsupported rather than silently pretending to deploy.
-    return {"status": "not_supported", "detail": "Deploy isn't implemented yet.", "strategy_id": strategy_id}
+    """REQ-VAULT-2.1 — generate the EA from the stored genome, install it
+    into every MT5 terminal on this machine and compile it. Tier gating is
+    the renderer's job (REQ-TIER-1.5); this endpoint does the work."""
+    row, generated = _generate_ea_for(strategy_id)
+    result = install_ea(generated.filename, generated.source)
+    if not result.installed:
+        raise HTTPException(status_code=409, detail=result.detail)
+
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        strategy = session.get(Strategy, strategy_id)
+        if strategy is not None:
+            strategy.deployed = True
+            # active_mt5 stays false until the EA is actually attached to a
+            # chart — installing a file is not the same as running it.
+            session.commit()
+
+    return {
+        "status": "deployed",
+        "strategy_id": row.id,
+        "filename": generated.filename,
+        "installed_paths": result.installed_paths,
+        "compiled_paths": result.compiled_paths,
+        "detail": result.detail,
+    }
 
 
 @app.post("/vault/{strategy_id}/refresh")

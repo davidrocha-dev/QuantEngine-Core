@@ -34,6 +34,8 @@ def vault_candidate_to_row(candidate: VaultCandidate, asset: str, timeframe: str
         genome_json=json.dumps(candidate.genome.to_dict()),
         equity_is=json.dumps(candidate.equity_is) if candidate.equity_is else None,
         equity_oos=json.dumps(candidate.equity_oos) if candidate.equity_oos else None,
+        persistence_pct=candidate.walk_forward.persistence_pct if candidate.walk_forward else None,
+        walk_forward=json.dumps(candidate.walk_forward.to_dict()) if candidate.walk_forward else None,
         deployed=False,
         active_mt5=False,
     )

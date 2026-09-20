@@ -69,6 +69,14 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE strategies ADD COLUMN delete_reason TEXT",
         ),
     ),
+    Migration(
+        version=3,
+        description="Walk-forward validation: persistence and per-fold results (REQ-VAULT-1.1 PERSISTENCE)",
+        statements=(
+            "ALTER TABLE strategies ADD COLUMN persistence_pct REAL",
+            "ALTER TABLE strategies ADD COLUMN walk_forward TEXT",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = max(m.version for m in MIGRATIONS)
