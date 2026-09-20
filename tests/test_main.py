@@ -368,11 +368,10 @@ def test_delete_unknown_strategy_404(tmp_path, monkeypatch):
     assert client.delete("/vault/nope").status_code == 404
 
 
-def test_refresh_reassess_parity_test_are_honest_about_being_unsupported():
-    # Deploy is no longer on this list — it generates and installs a real
-    # EA (see the deploy tests below).
-    assert client.post("/vault/x/refresh").json()["status"] == "not_supported"
-    assert client.post("/vault/x/reassess").json()["status"] == "not_supported"
+def test_parity_test_is_honest_about_being_unsupported():
+    # Deploy, refresh and reassess all do real work now (see their own
+    # tests below). PARITY TEST still needs MT5 Strategy Tester output to
+    # compare against, which nothing here produces.
     assert client.post("/vault/x/parity-test").json()["status"] == "not_supported"
 
 
@@ -729,3 +728,91 @@ def test_analytics_on_an_empty_vault_is_all_nulls_not_zeros(tmp_path, monkeypatc
     assert body["avg_return_pct"] is None
     assert body["profitable_pct"] is None
     assert body["top_performers"] == []
+
+
+def _seed_strategy_for_revalidation(config, monkeypatch, bars: int = 6_000) -> None:
+    """A Vault row plus enough synthetic history for a re-check to run."""
+    from sqlalchemy.orm import Session
+
+    import app.main as main
+    from app.db import make_engine
+    from app.models import Strategy
+    from tests.helpers import make_synthetic_ohlc
+
+    run_migrations(config.vault_db_path)
+    genome = {
+        "signal": {"name": "BREAKOUT", "params": {"period": 20}},
+        "bias": None,
+        "filters": [],
+        "execution": {"name": "MARKET2", "params": {"confirm_bars": 2}},
+        "management": {"name": "EOD CLOSE", "params": {"close_hour": 21}},
+        "stop_atr_mult": 1.5,
+        "target_atr_mult": 3.0,
+    }
+    engine = make_engine(config.vault_db_path)
+    with Session(engine) as session:
+        session.add(
+            Strategy(
+                id="#REV001", data_source="dukascopy", asset="EURUSD", timeframe="H1",
+                trades=10, return_pct=1.0, max_dd_pct=1.0, score=99, grade="GOOD",
+                genome_json=json.dumps(genome),
+            )
+        )
+        session.commit()
+
+    df = make_synthetic_ohlc(bars, seed=12, drift=0.0004, volatility=0.002)
+    monkeypatch.setattr(main, "_load_bars", lambda *a, **k: df)
+
+
+def test_refresh_restates_the_strategy_against_current_data(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    _seed_strategy_for_revalidation(fake_config, monkeypatch)
+
+    response = client.post("/vault/%23REV001/refresh")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["previous_score"] == 99
+    # The stored row now reflects the re-run, not the numbers it was seeded with.
+    row = [r for r in client.get("/vault").json() if r["id"] == "#REV001"][0]
+    assert row["trades"] == body["trades"]
+
+
+def test_reassess_reapplies_the_phase_4_gates_and_rescores(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    _seed_strategy_for_revalidation(fake_config, monkeypatch)
+
+    body = client.post("/vault/%23REV001/reassess").json()
+
+    assert body["status"] == "ok"
+    assert body["still_passes"] in (True, False)
+    if body["still_passes"] is False:
+        assert body["failed_gate"]
+    else:
+        assert body["score"] is not None and body["grade"] in ("GOOD", "WEAK")
+
+
+def test_revalidation_refuses_when_there_is_not_enough_history(tmp_path, monkeypatch):
+    import app.main as main
+    from tests.helpers import make_synthetic_ohlc
+
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    _seed_strategy_for_revalidation(fake_config, monkeypatch)
+    monkeypatch.setattr(main, "_load_bars", lambda *a, **k: make_synthetic_ohlc(500))
+
+    response = client.post("/vault/%23REV001/reassess")
+
+    assert response.status_code == 409
+    assert "history" in response.json()["detail"]
+
+
+def test_revalidating_an_unknown_strategy_404(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    run_migrations(fake_config.vault_db_path)
+
+    assert client.post("/vault/%23NOPE/refresh").status_code == 404

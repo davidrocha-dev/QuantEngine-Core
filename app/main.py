@@ -43,6 +43,8 @@ from app.engine.campaign_estimate import estimate_campaign_minutes
 from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
 from app.engine.phases import IS_FRACTION
 from app.engine.portfolio import compute_health
+from app.engine.reassess import reassess_strategy as reassess_strategy_engine
+from app.engine.reassess import refresh_strategy as refresh_strategy_engine
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genes import ALL_GENES
 from app.migrations.runner import MigrationError, export_vault, restore_database, run_migrations
@@ -785,14 +787,52 @@ def deploy_strategy(strategy_id: str) -> dict:
     }
 
 
+def _revalidate(strategy_id: str, full: bool) -> dict:
+    """Shared by REFRESH and REASSESS: re-run a stored genome against the
+    data that exists now. The genome is never re-optimised — re-fitting a
+    strategy until it looks good again is how a Vault fills with strategies
+    that have only ever been fitted."""
+    settings = load_settings(get_config().settings_path)
+    engine = make_engine(get_config().vault_db_path)
+
+    with Session(engine) as session:
+        strategy = session.get(Strategy, strategy_id)
+        if strategy is None or strategy.deleted_at is not None:
+            raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+
+        try:
+            config = build_campaign_config(settings, strategy.asset, strategy.timeframe)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        df = _load_bars(strategy.asset, strategy.timeframe, settings["campaign"]["history_depth_years"])
+        if len(df) < int(MIN_IS_BARS / IS_FRACTION):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Not enough {strategy.timeframe} history cached for {strategy.asset} to re-check this strategy.",
+            )
+
+        gene_pool = GenePoolConfig.load(get_config().gene_pool_path)
+        runner = reassess_strategy_engine if full else refresh_strategy_engine
+        result = runner(strategy, df, gene_pool, config)
+        session.commit()
+
+    return {"status": "ok", **result.to_dict()}
+
+
 @app.post("/vault/{strategy_id}/refresh")
 def refresh_strategy(strategy_id: str) -> dict:
-    return {"status": "not_supported", "detail": "Refresh isn't implemented yet.", "strategy_id": strategy_id}
+    # REQ-VAULT-2.1 REFRESH — restate the strategy's numbers against the
+    # data cached today, without re-running the Phase 4 gates.
+    return _revalidate(strategy_id, full=False)
 
 
 @app.post("/vault/{strategy_id}/reassess")
 def reassess_strategy(strategy_id: str) -> dict:
-    return {"status": "not_supported", "detail": "Reassess isn't implemented yet.", "strategy_id": strategy_id}
+    # REQ-VAULT-2.1 REASSESS — REFRESH plus the robustness and walk-forward
+    # gates, re-scored. `still_passes` says whether it would be approved
+    # if it were bred today.
+    return _revalidate(strategy_id, full=True)
 
 
 @app.post("/vault/{strategy_id}/parity-test")
