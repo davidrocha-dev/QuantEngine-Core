@@ -42,6 +42,7 @@ from app.engine.purge import (
 from app.engine.campaign_estimate import estimate_campaign_minutes
 from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
 from app.engine.phases import IS_FRACTION
+from app.engine.portfolio import compute_health
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genes import ALL_GENES
 from app.migrations.runner import MigrationError, export_vault, restore_database, run_migrations
@@ -751,7 +752,15 @@ def list_portfolios() -> list:
     engine = make_engine(get_config().vault_db_path)
     with Session(engine) as session:
         rows = session.scalars(select(Portfolio).order_by(Portfolio.created_at.desc())).all()
-        return [{"id": p.id, "name": p.name, "description": p.description} for p in rows]
+        return [
+            {
+                "id": p.id,
+                "name": p.name,
+                "description": p.description,
+                "member_count": len(_portfolio_members(session, p.id)),
+            }
+            for p in rows
+        ]
 
 
 class CreatePortfolioRequest(BaseModel):
@@ -767,6 +776,76 @@ def create_portfolio(body: CreatePortfolioRequest) -> dict:
         session.add(portfolio)
         session.commit()
         return {"id": portfolio.id, "name": portfolio.name, "description": portfolio.description}
+
+
+def _portfolio_members(session: Session, portfolio_id: str) -> list[Strategy]:
+    member_ids = session.scalars(
+        select(PortfolioStrategy.strategy_id).where(PortfolioStrategy.portfolio_id == portfolio_id)
+    ).all()
+    if not member_ids:
+        return []
+    return list(
+        session.scalars(
+            select(Strategy).where(Strategy.id.in_(member_ids)).where(Strategy.deleted_at.is_(None))
+        )
+    )
+
+
+@app.get("/portfolios/{portfolio_id}")
+def get_portfolio(portfolio_id: str) -> dict:
+    # REQ-PORT-1.1 — the portfolio and its members, for the STRATEGIES tab.
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        portfolio = session.get(Portfolio, portfolio_id)
+        if portfolio is None:
+            raise HTTPException(status_code=404, detail=f"Unknown portfolio: {portfolio_id}")
+        members = _portfolio_members(session, portfolio_id)
+        return {
+            "id": portfolio.id,
+            "name": portfolio.name,
+            "description": portfolio.description,
+            "members": [_serialize_strategy(row, full=True) for row in members],
+        }
+
+
+@app.get("/portfolios/{portfolio_id}/health")
+def get_portfolio_health(portfolio_id: str) -> dict:
+    # REQ-PORT-1.2/1.3/1.4 — AVG CORRELATION, Diversity Grade and the
+    # recommendation chips, plus the combined equity curve (HEALTH tab).
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        if session.get(Portfolio, portfolio_id) is None:
+            raise HTTPException(status_code=404, detail=f"Unknown portfolio: {portfolio_id}")
+        members = _portfolio_members(session, portfolio_id)
+        return compute_health(members).to_dict()
+
+
+@app.delete("/portfolios/{portfolio_id}")
+def delete_portfolio(portfolio_id: str) -> dict:
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        portfolio = session.get(Portfolio, portfolio_id)
+        if portfolio is None:
+            raise HTTPException(status_code=404, detail=f"Unknown portfolio: {portfolio_id}")
+        for membership in session.scalars(
+            select(PortfolioStrategy).where(PortfolioStrategy.portfolio_id == portfolio_id)
+        ):
+            session.delete(membership)
+        session.delete(portfolio)
+        session.commit()
+    return {"deleted": portfolio_id}
+
+
+@app.delete("/portfolios/{portfolio_id}/members/{strategy_id}")
+def remove_portfolio_member(portfolio_id: str, strategy_id: str) -> dict:
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        membership = session.get(PortfolioStrategy, {"portfolio_id": portfolio_id, "strategy_id": strategy_id})
+        if membership is None:
+            raise HTTPException(status_code=404, detail="That strategy is not in this portfolio")
+        session.delete(membership)
+        session.commit()
+    return {"portfolio_id": portfolio_id, "strategy_id": strategy_id, "removed": True}
 
 
 @app.post("/vault/{strategy_id}/add-to-portfolio/{portfolio_id}")

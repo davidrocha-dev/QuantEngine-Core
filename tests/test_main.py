@@ -543,3 +543,111 @@ def test_deploy_unknown_strategy_404(tmp_path, monkeypatch):
     run_migrations(fake_config.vault_db_path)
 
     assert client.post("/deploy/%23NOPE").status_code == 404
+
+
+def _seed_portfolio_with_members(config, member_count: int = 2) -> str:
+    """A portfolio whose members carry stored OOS equity curves, so the
+    health endpoint has something real to correlate."""
+    import uuid
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy.orm import Session
+
+    from app.db import make_engine
+    from app.models import Portfolio, PortfolioStrategy, Strategy
+
+    run_migrations(config.vault_db_path)
+    engine = make_engine(config.vault_db_path)
+    portfolio_id = uuid.uuid4().hex
+
+    def curve(offset: float) -> str:
+        start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+        equity, points = 10_000.0, []
+        for day in range(30):
+            equity *= 1 + (0.01 if (day + offset) % 3 else -0.008)
+            points.append({"t": (start + timedelta(days=day)).isoformat(), "equity": round(equity, 2)})
+        return json.dumps(points)
+
+    with Session(engine) as session:
+        session.add(Portfolio(id=portfolio_id, name="Core"))
+        for index in range(member_count):
+            strategy_id = f"#MEM{index}"
+            session.add(
+                Strategy(
+                    id=strategy_id, data_source="dukascopy", asset="EURUSD" if index else "GBPUSD",
+                    timeframe="M15", archetype="MULTI_SIGNAL", genome_json="{}", score=70, grade="GOOD",
+                    trades=80, return_pct=5.0, max_dd_pct=6.0, equity_oos=curve(index),
+                )
+            )
+            session.add(PortfolioStrategy(portfolio_id=portfolio_id, strategy_id=strategy_id))
+        session.commit()
+    return portfolio_id
+
+
+def test_portfolio_detail_lists_its_members(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    portfolio_id = _seed_portfolio_with_members(fake_config)
+
+    response = client.get(f"/portfolios/{portfolio_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["name"] == "Core"
+    assert {member["id"] for member in body["members"]} == {"#MEM0", "#MEM1"}
+
+
+def test_portfolio_health_reports_correlation_and_a_grade(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    portfolio_id = _seed_portfolio_with_members(fake_config)
+
+    response = client.get(f"/portfolios/{portfolio_id}/health")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strategy_count"] == 2
+    assert body["diversity_grade"] in ("A", "B", "C", "D", "E", "F")
+    assert body["recommendations"]  # two members: it should say to grow
+    assert body["combined_equity"]
+
+
+def test_portfolio_list_reports_member_counts(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    _seed_portfolio_with_members(fake_config, member_count=2)
+
+    body = client.get("/portfolios").json()
+
+    assert body[0]["member_count"] == 2
+
+
+def test_removing_a_member_leaves_the_strategy_in_the_vault(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    portfolio_id = _seed_portfolio_with_members(fake_config)
+
+    removed = client.delete(f"/portfolios/{portfolio_id}/members/%23MEM0")
+
+    assert removed.status_code == 200
+    members = client.get(f"/portfolios/{portfolio_id}").json()["members"]
+    assert {member["id"] for member in members} == {"#MEM1"}
+    assert any(row["id"] == "#MEM0" for row in client.get("/vault").json())
+
+
+def test_deleting_a_portfolio_keeps_its_strategies(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    portfolio_id = _seed_portfolio_with_members(fake_config)
+
+    assert client.delete(f"/portfolios/{portfolio_id}").status_code == 200
+    assert client.get(f"/portfolios/{portfolio_id}").status_code == 404
+    assert len(client.get("/vault").json()) == 2
+
+
+def test_unknown_portfolio_health_404(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    run_migrations(fake_config.vault_db_path)
+
+    assert client.get("/portfolios/nope/health").status_code == 404
