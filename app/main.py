@@ -33,6 +33,7 @@ from app.engine.campaign import (
     run_campaign,
 )
 from app.engine.news_filter import load_calendar
+from app.engine.notifications import notify_event, send_telegram
 from app.engine.purge import (
     RECYCLE_BIN_RETENTION_DAYS,
     empty_expired_recycle_bin,
@@ -268,6 +269,16 @@ def _run_campaign_background(
         df = _load_bars(symbol, timeframe, settings["campaign"]["history_depth_years"])
         with Session(engine) as session:
             outcome = run_campaign(session, campaign_id, df, gene_pool, config, resume=resume, on_generation=on_generation)
+        # REQ-SET-7.1/7.2/7.4 — a campaign runs for tens of minutes, so its
+        # ending is announced on whichever channels are enabled. The OS
+        # notification is the renderer's (Electron owns that API); Telegram
+        # goes from here, so it arrives even with the window closed.
+        summary = (
+            f"QuantEngine: campaign on {symbol} {timeframe} "
+            + (f"could not finish — {outcome.fail_reason}" if outcome.fail_reason else "completed.")
+        )
+        notify_event(settings, "campaign_complete", summary)
+
         if outcome.fail_reason:
             _emit_event_threadsafe(
                 {"type": "campaign_complete", "campaign_id": campaign_id, "status": "cancelled",
@@ -1288,6 +1299,26 @@ def set_gene_pool(body: GenePoolUpdateRequest) -> dict:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     config.save(get_config().gene_pool_path)
     return _gene_pool_response(config)
+
+
+class TestTelegramRequest(BaseModel):
+    bot_token: str | None = None
+    chat_id: str | None = None
+
+
+@app.post("/notifications/test-telegram")
+def post_test_telegram(body: TestTelegramRequest) -> dict:
+    """REQ-SET-7.3 — TEST NOTIFICATION for the Telegram channel. Uses the
+    values passed in (so the user can test before saving) and falls back to
+    what is stored."""
+    settings = load_settings(get_config().settings_path)
+    notifications = settings["notifications"]
+    result = send_telegram(
+        body.bot_token if body.bot_token is not None else notifications["telegram_bot_token"],
+        body.chat_id if body.chat_id is not None else notifications["telegram_chat_id"],
+        "QuantEngine test notification — this channel works.",
+    )
+    return {"sent": result.sent, "detail": result.detail}
 
 
 @app.get("/smart-mode")
