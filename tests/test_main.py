@@ -816,3 +816,70 @@ def test_revalidating_an_unknown_strategy_404(tmp_path, monkeypatch):
     run_migrations(fake_config.vault_db_path)
 
     assert client.post("/vault/%23NOPE/refresh").status_code == 404
+
+
+def test_true_sim_replays_the_members_on_one_account(tmp_path, monkeypatch):
+    import app.main as main
+    from tests.helpers import make_synthetic_ohlc
+
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    portfolio_id = _seed_portfolio_with_members(fake_config)
+    # Members seeded for health tests carry "{}" genomes; give them real ones.
+    _give_members_real_genomes(fake_config)
+    monkeypatch.setattr(main, "_load_bars", lambda *a, **k: make_synthetic_ohlc(3_000, seed=31, drift=0.0004))
+
+    response = client.post(f"/portfolios/{portfolio_id}/true-sim", json={"sizing": "COMPOUNDING", "max_aggregate_risk_pct": 5.0})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["strategy_count"] == 2
+    assert body["sizing"] == "COMPOUNDING"
+    assert body["trades_blocked"] == body["blocked_by_symbol_lock"] + body["blocked_by_aggregate_risk"]
+    assert body["computed_at"]
+
+
+def _give_members_real_genomes(config) -> None:
+    from sqlalchemy.orm import Session
+    from sqlalchemy import select as sa_select
+
+    from app.db import make_engine
+    from app.genome.genes import ALL_GENES
+    from app.models import Strategy
+
+    genome = json.dumps(
+        {
+            "signal": {"name": "BREAKOUT", "params": dict(ALL_GENES[("signal", "BREAKOUT")].default_params)},
+            "bias": None,
+            "filters": [],
+            "execution": {"name": "MARKET2", "params": {"confirm_bars": 2}},
+            "management": None,
+            "stop_atr_mult": 1.5,
+            "target_atr_mult": 3.0,
+        }
+    )
+    engine = make_engine(config.vault_db_path)
+    with Session(engine) as session:
+        for row in session.scalars(sa_select(Strategy)):
+            row.genome_json = genome
+        session.commit()
+
+
+def test_true_sim_on_an_empty_portfolio_is_a_conflict(tmp_path, monkeypatch):
+    from sqlalchemy.orm import Session
+
+    from app.db import make_engine
+    from app.models import Portfolio
+
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    run_migrations(fake_config.vault_db_path)
+    engine = make_engine(fake_config.vault_db_path)
+    with Session(engine) as session:
+        session.add(Portfolio(id="empty", name="Empty"))
+        session.commit()
+
+    response = client.post("/portfolios/empty/true-sim", json={})
+
+    assert response.status_code == 409
+    assert "members" in response.json()["detail"]

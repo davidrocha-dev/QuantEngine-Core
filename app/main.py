@@ -44,6 +44,7 @@ from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
 from app.engine.phases import IS_FRACTION
 from app.engine.portfolio import compute_health
 from app.engine.reassess import reassess_strategy as reassess_strategy_engine
+from app.engine.true_sim import run_true_sim
 from app.engine.reassess import refresh_strategy as refresh_strategy_engine
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genes import ALL_GENES
@@ -911,6 +912,50 @@ def get_portfolio_health(portfolio_id: str) -> dict:
             raise HTTPException(status_code=404, detail=f"Unknown portfolio: {portfolio_id}")
         members = _portfolio_members(session, portfolio_id)
         return compute_health(members).to_dict()
+
+
+class TrueSimRequest(BaseModel):
+    sizing: str = "COMPOUNDING"  # COMPOUNDING | FIXED
+    max_aggregate_risk_pct: float = 5.0
+
+
+@app.post("/portfolios/{portfolio_id}/true-sim")
+def post_true_sim(portfolio_id: str, body: TrueSimRequest) -> dict:
+    """REQ-PORT-2 — replay the members onto one account with Symbol Lock
+    and a cap on total open risk, and report what those guardrails cost."""
+    settings = load_settings(get_config().settings_path)
+    engine = make_engine(get_config().vault_db_path)
+
+    with Session(engine) as session:
+        if session.get(Portfolio, portfolio_id) is None:
+            raise HTTPException(status_code=404, detail=f"Unknown portfolio: {portfolio_id}")
+        members = _portfolio_members(session, portfolio_id)
+        if not members:
+            raise HTTPException(status_code=409, detail="This portfolio has no members to simulate")
+        markets = {(m.asset, m.timeframe) for m in members}
+        session.expunge_all()
+
+    depth_years = settings["campaign"]["history_depth_years"]
+    bars_by_market = {}
+    for symbol, timeframe in markets:
+        bars = _load_bars(symbol, timeframe, depth_years)
+        if not bars.empty:
+            bars_by_market[(symbol, timeframe)] = bars
+    if not bars_by_market:
+        raise HTTPException(status_code=409, detail="No cached history for these members' markets.")
+
+    # Every member is re-simulated on the same cost and risk settings, so
+    # the account they share is internally consistent.
+    config = build_campaign_config(settings, members[0].asset, members[0].timeframe)
+    result = run_true_sim(
+        members,
+        bars_by_market,
+        GenePoolConfig.load(get_config().gene_pool_path),
+        config,
+        sizing=body.sizing,
+        max_aggregate_risk_pct=body.max_aggregate_risk_pct,
+    )
+    return result.to_dict()
 
 
 @app.delete("/portfolios/{portfolio_id}")
