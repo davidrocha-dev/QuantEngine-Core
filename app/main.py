@@ -622,6 +622,59 @@ def list_vault() -> list:
         return [_serialize_strategy(row, full=True) for row in rows]
 
 
+def _breakdown(rows: list[Strategy], key) -> list[dict]:
+    """Per-group counts and averages, ordered by group size."""
+    groups: dict[str, list[Strategy]] = {}
+    for row in rows:
+        groups.setdefault(key(row), []).append(row)
+
+    summary = []
+    for name, members in groups.items():
+        returns = [r.return_pct for r in members if r.return_pct is not None]
+        drawdowns = [r.max_dd_pct for r in members if r.max_dd_pct is not None]
+        scores = [r.score for r in members if r.score is not None]
+        summary.append(
+            {
+                "name": name,
+                "count": len(members),
+                "avg_return_pct": round(sum(returns) / len(returns), 2) if returns else None,
+                "avg_drawdown_pct": round(sum(drawdowns) / len(drawdowns), 2) if drawdowns else None,
+                "avg_score": round(sum(scores) / len(scores), 1) if scores else None,
+                "profitable_pct": round(100 * sum(1 for r in returns if r > 0) / len(returns), 1) if returns else None,
+            }
+        )
+    return sorted(summary, key=lambda entry: entry["count"], reverse=True)
+
+
+@app.get("/analytics")
+def get_analytics(top: int = 10) -> dict:
+    """REQ-ANLY-1 — Vault-wide KPIs and breakdowns. Everything here is an
+    aggregation of stored strategies; nothing is recomputed, so it reflects
+    exactly what the Vault screen shows."""
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        rows = list(session.scalars(select(Strategy).where(Strategy.deleted_at.is_(None))))
+
+        returns = [r.return_pct for r in rows if r.return_pct is not None]
+        drawdowns = [r.max_dd_pct for r in rows if r.max_dd_pct is not None]
+        top_performers = sorted(rows, key=lambda r: (r.score or 0), reverse=True)[:top]
+
+        return {
+            "total_strategies": len(rows),
+            "avg_return_pct": round(sum(returns) / len(returns), 2) if returns else None,
+            "avg_drawdown_pct": round(sum(drawdowns) / len(drawdowns), 2) if drawdowns else None,
+            "profitable_pct": round(100 * sum(1 for r in returns if r > 0) / len(returns), 1) if returns else None,
+            "good_grade_count": sum(1 for r in rows if r.grade == "GOOD"),
+            "deployed_count": sum(1 for r in rows if r.deployed),
+            "by_market": _breakdown(rows, lambda r: f"{r.asset} {r.timeframe}"),
+            "by_archetype": _breakdown(rows, lambda r: r.archetype or "UNKNOWN"),
+            "by_symbol": _breakdown(rows, lambda r: r.asset),
+            "by_timeframe": _breakdown(rows, lambda r: r.timeframe),
+            "by_broker": _breakdown(rows, lambda r: r.data_source),
+            "top_performers": [_serialize_strategy(row, full=False) for row in top_performers],
+        }
+
+
 @app.get("/neural-map")
 def get_neural_map() -> dict:
     # REQ-MAP-1 — 2D UMAP projection + auto-labeled clusters of the whole

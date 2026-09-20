@@ -651,3 +651,81 @@ def test_unknown_portfolio_health_404(tmp_path, monkeypatch):
     run_migrations(fake_config.vault_db_path)
 
     assert client.get("/portfolios/nope/health").status_code == 404
+
+
+def _seed_vault_for_analytics(config) -> None:
+    from sqlalchemy.orm import Session
+
+    from app.db import make_engine
+    from app.models import Strategy
+
+    run_migrations(config.vault_db_path)
+    engine = make_engine(config.vault_db_path)
+    rows = [
+        ("#A1", "EURUSD", "M15", 20.0, 5.0, 80, "GOOD", "MULTI_SIGNAL"),
+        ("#A2", "EURUSD", "M15", -4.0, 12.0, 40, "WEAK", "MULTI_SIGNAL"),
+        ("#A3", "GBPUSD", "H1", 8.0, 7.0, 65, "GOOD", "MEAN_REVERTER"),
+    ]
+    with Session(engine) as session:
+        for strategy_id, asset, timeframe, ret, dd, score, grade, archetype in rows:
+            session.add(
+                Strategy(
+                    id=strategy_id, data_source="dukascopy", asset=asset, timeframe=timeframe,
+                    trades=100, return_pct=ret, max_dd_pct=dd, score=score, grade=grade,
+                    archetype=archetype, genome_json="{}",
+                )
+            )
+        session.commit()
+
+
+def test_analytics_reports_vault_wide_kpis(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    _seed_vault_for_analytics(fake_config)
+
+    body = client.get("/analytics").json()
+
+    assert body["total_strategies"] == 3
+    assert body["avg_return_pct"] == round((20.0 - 4.0 + 8.0) / 3, 2)
+    assert body["avg_drawdown_pct"] == round((5.0 + 12.0 + 7.0) / 3, 2)
+    assert body["profitable_pct"] == round(100 * 2 / 3, 1)
+    assert body["good_grade_count"] == 2
+
+
+def test_analytics_breakdowns_group_and_rank_by_size(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    _seed_vault_for_analytics(fake_config)
+
+    body = client.get("/analytics").json()
+
+    assert body["by_symbol"][0]["name"] == "EURUSD"
+    assert body["by_symbol"][0]["count"] == 2
+    assert body["by_market"][0]["name"] == "EURUSD M15"
+    assert {entry["name"] for entry in body["by_archetype"]} == {"MULTI_SIGNAL", "MEAN_REVERTER"}
+    assert body["by_broker"][0]["name"] == "dukascopy"
+
+
+def test_analytics_top_performers_are_ranked_by_score(tmp_path, monkeypatch):
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    _seed_vault_for_analytics(fake_config)
+
+    top = client.get("/analytics?top=2").json()["top_performers"]
+
+    assert [row["id"] for row in top] == ["#A1", "#A3"]
+
+
+def test_analytics_on_an_empty_vault_is_all_nulls_not_zeros(tmp_path, monkeypatch):
+    # An empty Vault has no average return; reporting 0.0% would read as a
+    # measured result.
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    run_migrations(fake_config.vault_db_path)
+
+    body = client.get("/analytics").json()
+
+    assert body["total_strategies"] == 0
+    assert body["avg_return_pct"] is None
+    assert body["profitable_pct"] is None
+    assert body["top_performers"] == []
