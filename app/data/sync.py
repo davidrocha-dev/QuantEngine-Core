@@ -112,7 +112,7 @@ class DeltaSyncRunner:
         tick_hour = await self._client.fetch_hour(symbol, hour_start)
         if tick_hour.ticks.empty:
             return None
-        return resample_ticks_to_ohlc(tick_hour.ticks, timeframe)
+        return await asyncio.to_thread(resample_ticks_to_ohlc, tick_hour.ticks, timeframe)
 
     async def sync_symbol(self, symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> int:
         """Sync one symbol; returns the number of hours fetched."""
@@ -153,9 +153,15 @@ class DeltaSyncRunner:
                 completed += 1
 
             if frames:
-                self._cache.append_bars(symbol, timeframe, pd.concat(frames, ignore_index=True))
+                # append_bars rewrites the whole parquet file: read, concat,
+                # dedupe, sort, write. On a cache with a year of M1 bars in
+                # it that is far too long to hold the event loop for, and it
+                # happens once per batch.
+                await asyncio.to_thread(
+                    self._cache.append_bars, symbol, timeframe, pd.concat(frames, ignore_index=True)
+                )
             if completed:
-                self._cache.set_last_synced_hour(symbol, batch[completed - 1])
+                await asyncio.to_thread(self._cache.set_last_synced_hour, symbol, batch[completed - 1])
                 hours_synced += completed
                 progress.hours_done += completed
                 batch_start += completed

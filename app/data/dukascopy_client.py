@@ -144,8 +144,15 @@ class DukascopyClient:
             if self._request_delay_seconds:
                 await asyncio.sleep(self._request_delay_seconds)
 
-            decompressed = decompress_bi5(response.content)
-            ticks = parse_ticks(decompressed, instrument, hour_start)
+            # LZMA decompression plus a struct unpack of several thousand
+            # ticks is tens of milliseconds of pure CPU, and the sync runs
+            # hundreds of these. Left on the event loop it starves every
+            # HTTP request the app makes while a sync is running, which
+            # reads as a frozen UI. Off the loop it is just work.
+            ticks = await asyncio.to_thread(
+                lambda payload: parse_ticks(decompress_bi5(payload), instrument, hour_start),
+                response.content,
+            )
             return TickHour(symbol, hour_start, ticks)
 
         raise DukascopyDownloadError(f"rate-limited after {self._max_retries} retries: {url}")
