@@ -1,6 +1,6 @@
 # PyInstaller spec — design.md B.9. Bundles the Python runtime + engine
 # into a single binary consumed by electron-builder's extraResources
-# (see app/electron-builder.json5).
+# (see app/electron-builder.config.cjs).
 # Build: pyinstaller quantengine-engine.spec
 
 block_cipher = None
