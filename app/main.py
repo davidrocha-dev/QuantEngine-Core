@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 
 import pandas as pd
@@ -42,6 +43,7 @@ from app.engine.purge import (
     run_purge,
 )
 from app.engine.campaign_estimate import estimate_campaign_minutes
+from app.logging_setup import configure_crash_reporting, configure_logging, log_dir
 from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
 from app.engine.phases import IS_FRACTION
 from app.engine.health import check_all_brokers, ladder, run_health_check
@@ -387,6 +389,12 @@ async def lifespan(_: FastAPI):
     _main_loop = asyncio.get_running_loop()
     config = get_config()
     config.data_dir.mkdir(parents=True, exist_ok=True)
+    # REQ-NFR-2 — rotating local logs, so "the engine stopped" leaves
+    # something diagnosable behind. Crash reporting stays opt-in.
+    log_path = configure_logging(config.data_dir)
+    settings = load_settings(config.settings_path)
+    configure_crash_reporting(settings["system"]["crash_reporting_enabled"])
+    logging.getLogger("quantengine").info("Engine starting — logging to %s", log_path)
     # REQ-SET-6 — versioned migrations, auto-backed-up (when enabled) and
     # transactionally applied, instead of a bare create-tables-if-missing.
     try:
@@ -1446,11 +1454,16 @@ def get_system_info() -> dict:
     # REQ-SET (System section) — paths shown in Settings → System, and the
     # Support/Diagnostics snapshot (REQ-SET, Support section).
     config = get_config()
+    settings = load_settings(config.settings_path)
     return {
         "data_dir": str(config.data_dir),
         "vault_db_path": str(config.vault_db_path),
         "cache_dir": str(config.cache_dir),
         "built_in_data_only": config.built_in_data_only,
+        # REQ-NFR-2 — where to look when something went wrong, and whether
+        # anything is being sent anywhere (it is not, unless opted in).
+        "log_dir": str(log_dir(config.data_dir)),
+        "crash_reporting_enabled": settings["system"]["crash_reporting_enabled"],
     }
 
 

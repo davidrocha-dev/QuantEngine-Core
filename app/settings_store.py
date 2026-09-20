@@ -83,6 +83,11 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
     "smart_mode": {
         "smart_insights_enabled": True,
     },
+    # REQ-NFR-2 — logs are always written; sending anything anywhere is
+    # opt-in and off by default.
+    "system": {
+        "crash_reporting_enabled": False,
+    },
     # AUTOMATION (Elite) — tasks.md 12.2/12.6. The scheduler in
     # app/main.py reads these; `last_*_at` are written by it, not by the UI.
     "automation": {
