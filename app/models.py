@@ -79,6 +79,28 @@ class Campaign(Base):
     last_checkpoint_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
+class LiveTrade(Base):
+    """One closed deal reported by the Pilot EA — REQ-PORT-4.
+
+    `strategy_id` is resolved from the deal's magic number, which the
+    generated EA derives from the strategy's Hash ID. A deal whose magic
+    matches no Vault strategy is still stored, with a null strategy_id:
+    dropping it would hide a bot running from a strategy that was deleted.
+    """
+
+    __tablename__ = "live_trades"
+
+    deal_ticket: Mapped[str] = mapped_column(String, primary_key=True)
+    strategy_id: Mapped[str | None] = mapped_column(String)
+    magic: Mapped[int] = mapped_column(Integer, nullable=False)
+    symbol: Mapped[str] = mapped_column(String, nullable=False)
+    closed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    volume: Mapped[float | None]
+    profit: Mapped[float] = mapped_column(nullable=False)
+    exit_price: Mapped[float | None]
+    imported_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
 class SchemaMigration(Base):
     __tablename__ = "schema_migrations"
 

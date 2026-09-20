@@ -77,6 +77,26 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE strategies ADD COLUMN walk_forward TEXT",
         ),
     ),
+    Migration(
+        version=4,
+        description="Live trades reported by the QuantEngine Pilot EA (REQ-PORT-4)",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS live_trades (
+                deal_ticket TEXT PRIMARY KEY,
+                strategy_id TEXT,
+                magic INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                closed_at DATETIME NOT NULL,
+                volume REAL,
+                profit REAL NOT NULL,
+                exit_price REAL,
+                imported_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_live_trades_strategy ON live_trades (strategy_id, closed_at)",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = max(m.version for m in MIGRATIONS)

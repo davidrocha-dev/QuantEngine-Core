@@ -17,6 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.broker.mt5_bridge import MT5Bridge
+from app.broker import pilot
 from app.broker.mt5_install import install_ea
 from app.codegen.mql5 import GeneratedEa, UnsupportedGeneError, generate_ea
 from app.config import get_config, set_auto_backup_before_updates, set_built_in_data_only
@@ -43,6 +44,7 @@ from app.engine.purge import (
 from app.engine.campaign_estimate import estimate_campaign_minutes
 from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
 from app.engine.phases import IS_FRACTION
+from app.engine.health import ladder, run_health_check
 from app.engine.portfolio import compute_health
 from app.engine import smart_mode
 from app.engine.reassess import reassess_strategy as reassess_strategy_engine
@@ -52,7 +54,7 @@ from app.genome.gene_pool import GenePoolConfig
 from app.genome.genes import ALL_GENES
 from app.migrations.runner import MigrationError, export_vault, restore_database, run_migrations
 from app.genome.genome import Genome
-from app.models import Campaign, Portfolio, PortfolioStrategy, Strategy
+from app.models import Campaign, LiveTrade, Portfolio, PortfolioStrategy, Strategy
 from app.settings_store import load_settings, update_section
 
 
@@ -1319,6 +1321,84 @@ def post_test_telegram(body: TestTelegramRequest) -> dict:
         "QuantEngine test notification — this channel works.",
     )
     return {"sent": result.sent, "detail": result.detail}
+
+
+@app.get("/pilot/status")
+def get_pilot_status() -> dict:
+    """REQ-PORT-4.2 — whether the Pilot is reporting. The Dashboard banner
+    and the Incubation tab both need to know, because without it no live
+    result reaches the app and no bot can be promoted (REQ-PORT-4.3)."""
+    path = pilot.report_path()
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        latest = session.scalar(select(LiveTrade).order_by(LiveTrade.closed_at.desc()))
+        total = len(list(session.scalars(select(LiveTrade.deal_ticket))))
+    return {
+        "report_found": path is not None,
+        "report_path": str(path) if path else None,
+        "live_trades": total,
+        "last_trade_at": latest.closed_at.isoformat() if latest else None,
+        "detail": (
+            "Pilot is reporting."
+            if path
+            else "No Pilot report found. Install the Pilot and attach it to any chart in MT5."
+        ),
+    }
+
+
+@app.post("/pilot/install")
+def post_pilot_install() -> dict:
+    # REQ-PORT-4.1 — install the Pilot helper EA into every terminal.
+    result = pilot.install_pilot()
+    if not result.installed:
+        raise HTTPException(status_code=409, detail=result.detail)
+    return {
+        "installed_paths": result.installed_paths,
+        "compiled_paths": result.compiled_paths,
+        "detail": result.detail + " Attach it to any one chart per terminal.",
+    }
+
+
+@app.post("/pilot/import")
+def post_pilot_import() -> dict:
+    """Reads whatever the Pilot has written since last time. Idempotent:
+    rows are keyed by the broker's own deal ticket."""
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        return pilot.import_live_trades(session).to_dict()
+
+
+@app.post("/health-check")
+def post_health_check(strategy_ids: list[str] | None = None) -> dict:
+    """REQ-AUTO-2/5 — compare deployed strategies against the backtests
+    that approved them. Imports the Pilot's latest report first, so the
+    verdict is never based on stale live data."""
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        imported = pilot.import_live_trades(session)
+        verdicts = run_health_check(session, strategy_ids)
+
+    counts = {status: sum(1 for v in verdicts if v.status == status) for status in ("healthy", "degraded", "too_early", "no_data")}
+    return {
+        "imported": imported.to_dict(),
+        "verdicts": [verdict.to_dict() for verdict in verdicts],
+        # REQ-AUTO-5's "N holding / N decayed / N too early".
+        "summary": counts,
+    }
+
+
+@app.get("/incubation")
+def get_incubation() -> dict:
+    """REQ-PORT-3 — the ladder: which stage each deployed bot is at, and
+    what is holding back the ones that cannot advance."""
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        pilot.import_live_trades(session)
+        entries = ladder(session)
+    return {
+        "pilot_reporting": pilot.report_path() is not None,
+        "entries": [entry.to_dict() for entry in entries],
+    }
 
 
 @app.get("/smart-mode")
