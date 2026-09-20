@@ -90,6 +90,22 @@ def compile_ea(source_path: Path) -> tuple[bool, str]:
     return compiled.exists(), log
 
 
+def uninstall_ea(filename: str) -> list[str]:
+    """Removes a generated EA from every terminal, returning what it took.
+
+    Only the .mq5 and its compiled .ex5 are touched. A chart still running
+    the EA keeps running until MT5 is told otherwise — removing the file
+    stops it being loaded again, it does not reach into a live chart.
+    """
+    removed: list[str] = []
+    for terminal in terminal_data_dirs():
+        for path in (terminal / EXPERTS_SUBDIR / filename, (terminal / EXPERTS_SUBDIR / filename).with_suffix(".ex5")):
+            if path.exists():
+                path.unlink()
+                removed.append(str(path))
+    return removed
+
+
 def install_ea(filename: str, source: str, compile_after_install: bool = True) -> InstallResult:
     """Writes the EA into every MT5 terminal found and compiles it."""
     targets = terminal_data_dirs()

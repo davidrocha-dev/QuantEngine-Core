@@ -46,6 +46,7 @@ from app.engine.campaign_estimate import estimate_campaign_minutes
 from app.logging_setup import configure_crash_reporting, configure_logging, log_dir
 from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
 from app.engine.phases import IS_FRACTION
+from app.engine.auto_deploy import replace_degraded
 from app.engine.health import auto_promote, check_all_brokers, ladder, promote, risk_shares, run_health_check
 from app.engine.portfolio import compute_health
 from app.engine import smart_mode
@@ -323,6 +324,9 @@ async def _startup_delta_sync() -> None:
 
 
 SCHEDULER_TICK_SECONDS = 60
+# How often auto-deploy re-checks. Hourly is deliberate: a degraded
+# verdict comes from live trades, which arrive over hours, not seconds.
+AUTO_DEPLOY_INTERVAL_HOURS = 6
 
 
 def _due(last_at: str | None, interval: timedelta, now: datetime) -> bool:
@@ -363,6 +367,27 @@ async def _scheduler_loop() -> None:
                     update_section(config.settings_path, "automation", {"last_campaign_started_at": now.isoformat()})
                 except HTTPException:
                     pass  # A campaign is already running; try again next tick.
+
+            # REQ-AUTO-4 — only with both the toggle and the explicit
+            # first-activation confirmation, and never mid-campaign.
+            if (
+                automation["auto_deploy_enabled"]
+                and automation["auto_deploy_confirmed"]
+                and _active_campaign_id is None
+                and _due(automation["last_auto_deploy_at"], timedelta(hours=AUTO_DEPLOY_INTERVAL_HOURS), now)
+            ):
+                engine = make_engine(config.vault_db_path)
+                with Session(engine) as session:
+                    pilot.import_live_trades(session)
+                    actions = replace_degraded(
+                        session,
+                        risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
+                        max_spread_points=float(settings["costs"]["manual_spread_points"]),
+                    )
+                update_section(config.settings_path, "automation", {"last_auto_deploy_at": now.isoformat()})
+                for action in actions:
+                    logging.getLogger("quantengine").info("Auto-deploy: %s", action.detail)
+                    notify_event(settings, "bot_degradation", f"QuantEngine: {action.detail}")
 
             maintenance = settings["vault_maintenance"]
             if maintenance["automatic_purge_enabled"] and _due(
@@ -1432,6 +1457,37 @@ def post_graduate(strategy_id: str) -> dict:
             raise HTTPException(status_code=409, detail=detail)
         pilot.write_risk_shares(risk_shares(session))
     return {"promoted": True, "detail": detail, "entry": entry.to_dict() if entry else None}
+
+
+@app.post("/automation/auto-deploy/confirm")
+def post_confirm_auto_deploy() -> dict:
+    """REQ-AUTO-4.2 — the explicit first-activation confirmation.
+
+    Kept separate from the toggle on purpose: turning a switch on is not
+    the same as understanding that the app may retire a running bot and
+    install another one without asking again.
+    """
+    updated = update_section(get_config().settings_path, "automation", {"auto_deploy_confirmed": True})
+    return {"confirmed": updated["auto_deploy_confirmed"]}
+
+
+@app.post("/automation/auto-deploy/run")
+def post_run_auto_deploy() -> dict:
+    """Runs the replacement pass now, for a user who would rather trigger
+    it than wait for the scheduler."""
+    settings = load_settings(get_config().settings_path)
+    if not settings["automation"]["auto_deploy_confirmed"]:
+        raise HTTPException(status_code=409, detail="Auto-deploy has not been confirmed yet.")
+
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        pilot.import_live_trades(session)
+        actions = replace_degraded(
+            session,
+            risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
+            max_spread_points=float(settings["costs"]["manual_spread_points"]),
+        )
+    return {"actions": [action.to_dict() for action in actions]}
 
 
 @app.get("/smart-mode")

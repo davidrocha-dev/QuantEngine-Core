@@ -98,6 +98,12 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
         # REQ-PORT-3.6 — AUTO off by default: a promotion raises real money
         # at risk, so it starts as something the user does deliberately.
         "auto_graduate_enabled": False,
+        # REQ-AUTO-4 — replacing a degraded bot is the most consequential
+        # unattended action here, so it needs both a toggle and an explicit
+        # first-activation confirmation (4.2) before it will act.
+        "auto_deploy_enabled": False,
+        "auto_deploy_confirmed": False,
+        "last_auto_deploy_at": None,
     },
 }
 
