@@ -95,6 +95,9 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
         "recurring_interval_hours": 24,
         "last_campaign_started_at": None,
         "last_purge_at": None,
+        # REQ-PORT-3.6 — AUTO off by default: a promotion raises real money
+        # at risk, so it starts as something the user does deliberately.
+        "auto_graduate_enabled": False,
     },
 }
 

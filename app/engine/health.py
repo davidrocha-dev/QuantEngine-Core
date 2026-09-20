@@ -61,7 +61,8 @@ class HealthVerdict:
 @dataclass
 class LadderEntry:
     strategy_id: str
-    stage: str
+    stage: str  # where the bot actually is
+    eligible_stage: str  # where its live record would allow it to be
     risk_share: float
     live_trades: int
     winning_trades: int
@@ -233,30 +234,34 @@ def ladder_entry(session: Session, strategy: Strategy, now: datetime | None = No
         first = first.replace(tzinfo=timezone.utc)
     days_live = (now - first).days if first else 0
 
+    # REQ-PORT-3.5 — an unusually strong opening run can skip the wait.
     hot_start = len(trades) >= HOT_START_TRADES and winning / max(len(trades), 1) >= HOT_START_WIN_RATE
-    qualifies_full = len(trades) >= FULL_RISK_TRADES or days_live >= FULL_RISK_DAYS
-    qualifies_proving = len(trades) >= PROVING_TRADES or days_live >= PROVING_DAYS or hot_start
-
-    if qualifies_full:
-        stage = "FULL RISK"
-    elif qualifies_proving:
-        stage = "PROVING"
+    if len(trades) >= FULL_RISK_TRADES or days_live >= FULL_RISK_DAYS:
+        eligible_stage = "FULL RISK"
+    elif len(trades) >= PROVING_TRADES or days_live >= PROVING_DAYS or hot_start:
+        eligible_stage = "PROVING"
     else:
-        stage = "INCUBATION"
+        eligible_stage = "INCUBATION"
 
-    # REQ-PORT-3.4 — evidence can qualify a bot for the next stage and
-    # still not earn it: losing money is a hard stop.
-    blocked_reason = None
-    if net < 0:
-        blocked_reason = f"underwater ({round(net, 2)}) — promotion is blocked until it recovers"
-        stage = "INCUBATION" if stage == "PROVING" else stage
-    elif not trades:
-        blocked_reason = "no live trades reported yet"
-
+    # Where the bot actually is: a promotion is a recorded decision, not a
+    # number recomputed from its record on every read (REQ-PORT-3.6 — with
+    # AUTO off, evidence alone must not move it).
+    stage = strategy.incubation_stage if strategy.incubation_stage in STAGES else STAGES[0]
     next_stage = STAGES[STAGES.index(stage) + 1] if stage != "FULL RISK" else None
+
+    # REQ-PORT-3.4 — evidence can qualify a bot and still not earn it.
+    blocked_reason = None
+    if not trades:
+        blocked_reason = "no live trades reported yet"
+    elif net < 0:
+        blocked_reason = f"underwater ({round(net, 2)}) — promotion is blocked until it recovers"
+    elif next_stage is not None and STAGES.index(eligible_stage) <= STAGES.index(stage):
+        blocked_reason = f"not enough live evidence for {next_stage} yet"
+
     return LadderEntry(
         strategy_id=strategy.id,
         stage=stage,
+        eligible_stage=eligible_stage,
         risk_share=STAGE_RISK_SHARE[stage],
         live_trades=len(trades),
         winning_trades=winning,
@@ -265,6 +270,49 @@ def ladder_entry(session: Session, strategy: Strategy, now: datetime | None = No
         blocked_reason=blocked_reason,
         next_stage=next_stage,
     )
+
+
+def promote(session: Session, strategy_id: str, now: datetime | None = None) -> tuple[bool, str, LadderEntry | None]:
+    """REQ-PORT-3.6 — the manual GRADUATE action.
+
+    Promotion is only ever *allowed* by evidence, never forced by it: the
+    same blocking rules apply whether a human clicks the button or AUTO
+    does it, so this is the single path both take.
+    """
+    strategy = session.get(Strategy, strategy_id)
+    if strategy is None or strategy.deleted_at is not None:
+        return False, f"Unknown strategy: {strategy_id}", None
+
+    entry = ladder_entry(session, strategy, now)
+    if entry.next_stage is None:
+        return False, "Already at full target risk.", entry
+    if entry.blocked_reason:
+        return False, entry.blocked_reason, entry
+    if not entry.can_promote:
+        return False, "Not enough live evidence to promote yet.", entry
+
+    strategy.incubation_stage = entry.next_stage
+    session.commit()
+
+    promoted = ladder_entry(session, strategy, now)
+    return True, f"Promoted to {promoted.stage} ({int(promoted.risk_share * 100)}% of target risk).", promoted
+
+
+def auto_promote(session: Session, now: datetime | None = None) -> list[LadderEntry]:
+    """REQ-PORT-3.6 with AUTO on — promotes everything eligible, silently
+    skipping everything that is not. Returns what actually changed."""
+    promoted: list[LadderEntry] = []
+    for entry in ladder(session, now):
+        if entry.can_promote:
+            ok, _, updated = promote(session, entry.strategy_id, now)
+            if ok and updated is not None:
+                promoted.append(updated)
+    return promoted
+
+
+def risk_shares(session: Session, now: datetime | None = None) -> dict[str, float]:
+    """What each deployed bot should currently risk, as a share of target."""
+    return {entry.strategy_id: entry.risk_share for entry in ladder(session, now)}
 
 
 def ladder(session: Session, now: datetime | None = None) -> list[LadderEntry]:

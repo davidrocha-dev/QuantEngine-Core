@@ -102,6 +102,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         description="Which broker a live trade came from, for multi-broker health checks (REQ-AUTO-3)",
         statements=("ALTER TABLE live_trades ADD COLUMN broker TEXT",),
     ),
+    Migration(
+        version=6,
+        description="Incubation stage per deployed strategy (REQ-PORT-3)",
+        statements=("ALTER TABLE strategies ADD COLUMN incubation_stage TEXT",),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = max(m.version for m in MIGRATIONS)

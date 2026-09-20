@@ -43,6 +43,11 @@ class Strategy(Base):
     # was profitable in, with the per-fold detail behind it.
     persistence_pct: Mapped[float | None]
     walk_forward: Mapped[str | None] = mapped_column(Text)  # JSON
+    # REQ-PORT-3 — the stage this bot has actually been promoted to. Null
+    # means it has never been promoted, i.e. INCUBATION. Kept separate from
+    # what its live record would *allow*, so a promotion is a decision that
+    # sticks rather than a number recomputed on every page load.
+    incubation_stage: Mapped[str | None] = mapped_column(String)
 
 
 class Portfolio(Base):

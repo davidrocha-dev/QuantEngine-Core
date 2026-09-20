@@ -46,7 +46,7 @@ from app.engine.campaign_estimate import estimate_campaign_minutes
 from app.logging_setup import configure_crash_reporting, configure_logging, log_dir
 from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
 from app.engine.phases import IS_FRACTION
-from app.engine.health import check_all_brokers, ladder, run_health_check
+from app.engine.health import auto_promote, check_all_brokers, ladder, promote, risk_shares, run_health_check
 from app.engine.portfolio import compute_health
 from app.engine import smart_mode
 from app.engine.reassess import reassess_strategy as reassess_strategy_engine
@@ -1403,14 +1403,35 @@ def post_health_check(strategy_ids: list[str] | None = None) -> dict:
 def get_incubation() -> dict:
     """REQ-PORT-3 — the ladder: which stage each deployed bot is at, and
     what is holding back the ones that cannot advance."""
+    settings = load_settings(get_config().settings_path)
     engine = make_engine(get_config().vault_db_path)
     with Session(engine) as session:
         pilot.import_live_trades(session)
+        if settings["automation"]["auto_graduate_enabled"]:
+            auto_promote(session)  # REQ-PORT-3.6 — AUTO on
         entries = ladder(session)
+        # REQ-PORT-3.7 — publish the sizes so running EAs pick them up for
+        # their next trade; positions already open are untouched.
+        pilot.write_risk_shares(risk_shares(session))
     return {
         "pilot_reporting": pilot.report_path() is not None,
+        "auto_graduate": settings["automation"]["auto_graduate_enabled"],
         "entries": [entry.to_dict() for entry in entries],
     }
+
+
+@app.post("/incubation/{strategy_id}/graduate")
+def post_graduate(strategy_id: str) -> dict:
+    """REQ-PORT-3.6 — the manual GRADUATE action. Same blocking rules as
+    AUTO: a promotion is allowed by live evidence, never forced by it."""
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        pilot.import_live_trades(session)
+        promoted, detail, entry = promote(session, strategy_id)
+        if not promoted:
+            raise HTTPException(status_code=409, detail=detail)
+        pilot.write_risk_shares(risk_shares(session))
+    return {"promoted": True, "detail": detail, "entry": entry.to_dict() if entry else None}
 
 
 @app.get("/smart-mode")

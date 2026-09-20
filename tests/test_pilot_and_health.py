@@ -150,24 +150,82 @@ def test_a_fresh_bot_starts_in_incubation_at_a_quarter_risk(session):
     assert entry.risk_share == 0.25
 
 
-def test_enough_healthy_trades_moves_a_bot_up_the_ladder(session):
+def test_evidence_makes_a_bot_eligible_but_does_not_move_it_on_its_own(session):
+    # REQ-PORT-3.6 — with AUTO off, a promotion is a decision someone made,
+    # not a number that quietly changed.
     strategy = make_strategy(session)
     add_live_trades(session, strategy.id, [2.0] * PROVING_TRADES)
+
+    entry = ladder(session)[0]
+
+    assert entry.stage == "INCUBATION"
+    assert entry.eligible_stage == "PROVING"
+    assert entry.can_promote is True
+
+
+def test_graduating_moves_the_bot_and_its_risk_share(session):
+    from app.engine.health import promote
+
+    strategy = make_strategy(session)
+    add_live_trades(session, strategy.id, [2.0] * PROVING_TRADES)
+
+    ok, detail, entry = promote(session, strategy.id)
+
+    assert ok is True
+    assert entry.stage == "PROVING"
+    assert entry.risk_share == 0.5
+    assert "PROVING" in detail
     assert ladder(session)[0].stage == "PROVING"
 
-    add_live_trades(
-        session, strategy.id + "x", [], start=None
-    )  # no-op, keeps the helper's ticket namespace distinct
-    for index in range(FULL_RISK_TRADES):
-        session.add(
-            LiveTrade(
-                deal_ticket=f"extra-{index}", strategy_id=strategy.id, magic=_magic_number(strategy.id),
-                symbol="EURUSD", closed_at=datetime.now(timezone.utc), volume=0.1, profit=1.0,
-            )
-        )
-    session.commit()
 
-    assert ladder(session)[0].stage == "FULL RISK"
+def test_a_bot_cannot_skip_a_stage_in_one_promotion(session):
+    from app.engine.health import promote
+
+    strategy = make_strategy(session)
+    add_live_trades(session, strategy.id, [2.0] * FULL_RISK_TRADES)
+
+    promote(session, strategy.id)
+
+    assert ladder(session)[0].stage == "PROVING"
+
+
+def test_auto_promotes_everything_eligible_and_skips_the_rest(session):
+    from app.engine.health import auto_promote
+
+    ready = make_strategy(session, "#READY")
+    add_live_trades(session, ready.id, [2.0] * PROVING_TRADES)
+    make_strategy(session, "#FRESH")
+
+    promoted = auto_promote(session)
+
+    assert [entry.strategy_id for entry in promoted] == ["#READY"]
+    stages = {entry.strategy_id: entry.stage for entry in ladder(session)}
+    assert stages["#READY"] == "PROVING"
+    assert stages["#FRESH"] == "INCUBATION"
+
+
+def test_risk_shares_are_published_per_strategy(session):
+    from app.engine.health import promote, risk_shares
+
+    strategy = make_strategy(session)
+    add_live_trades(session, strategy.id, [2.0] * PROVING_TRADES)
+
+    assert risk_shares(session)[strategy.id] == 0.25
+    promote(session, strategy.id)
+    assert risk_shares(session)[strategy.id] == 0.5
+
+
+def test_the_risk_file_lists_each_bot_by_its_magic_number(session, tmp_path, monkeypatch):
+    from app.broker import pilot
+    from app.engine.health import risk_shares
+
+    monkeypatch.setattr(pilot, "common_files_dir", lambda: tmp_path)
+    make_strategy(session)
+
+    path = pilot.write_risk_shares(risk_shares(session))
+
+    assert path is not None
+    assert path.read_text(encoding="utf-8").strip() == f"{_magic_number('#LIVE01')},0.2500"
 
 
 def test_an_underwater_bot_is_not_promoted_however_many_trades_it_has(session):

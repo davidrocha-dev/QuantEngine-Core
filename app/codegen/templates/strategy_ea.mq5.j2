@@ -16,6 +16,7 @@
 #include <Trade/Trade.mqh>
 
 input double RiskPercent      = {{ risk_pct }};   // % of equity risked per trade
+input string RiskOverrideFile = "quantengine_risk.csv";  // COMMON Files; written by the Incubation ladder
 input double MaxSpreadPoints  = {{ max_spread_points }};  // skip entries above this spread
 input long   MagicNumber      = {{ magic }};
 input bool   AllowLong        = true;
@@ -213,11 +214,41 @@ bool HasOpenPosition()
    return false;
 }
 
-//--- Risk sizing: a full stop-out costs exactly RiskPercent of equity.
+//+------------------------------------------------------------------+
+//| REQ-PORT-3 - the Incubation ladder's share of target risk, read   |
+//| from a file QuantEngine writes (magic,share per line). Read at    |
+//| entry time only, so a promotion applies to NEW trades and never   |
+//| touches a position already open (REQ-PORT-3.7).                   |
+//|                                                                   |
+//| A missing or unreadable file means full target risk: the EA must  |
+//| not stop trading because the app is closed.                       |
+//+------------------------------------------------------------------+
+double RiskShare()
+{
+   int handle = FileOpen(RiskOverrideFile, FILE_READ | FILE_CSV | FILE_ANSI | FILE_COMMON, ',');
+   if(handle == INVALID_HANDLE) return 1.0;
+
+   double share = 1.0;
+   while(!FileIsEnding(handle))
+   {
+      long magic = StringToInteger(FileReadString(handle));
+      double value = StringToDouble(FileReadString(handle));
+      if(magic == MagicNumber && value > 0.0 && value <= 1.0)
+      {
+         share = value;
+         break;
+      }
+   }
+   FileClose(handle);
+   return share;
+}
+
+//--- Risk sizing: a full stop-out costs exactly RiskPercent of equity,
+//--- scaled by whatever stage the Incubation ladder has this bot at.
 double LotsForRisk(double stopDistance)
 {
    if(stopDistance <= 0.0) return 0.0;
-   double riskAmount = AccountInfoDouble(ACCOUNT_EQUITY) * RiskPercent / 100.0;
+   double riskAmount = AccountInfoDouble(ACCOUNT_EQUITY) * RiskPercent * RiskShare() / 100.0;
    double tickValue  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    if(tickValue <= 0.0 || tickSize <= 0.0) return 0.0;

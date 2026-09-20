@@ -68,6 +68,27 @@ def report_path() -> Path | None:
     return path if path.exists() else None
 
 
+RISK_FILENAME = "quantengine_risk.csv"
+
+
+def write_risk_shares(shares: dict[str, float]) -> Path | None:
+    """REQ-PORT-3.7 — publishes each bot's share of target risk.
+
+    The generated EA reads this at entry time only, so a promotion applies
+    to new trades and never resizes a position already open. Writing the
+    file whole (not appending) means a removed line means "full risk",
+    which is the safe reading of an absent instruction.
+    """
+    directory = common_files_dir()
+    if directory is None:
+        return None
+
+    path = directory / RISK_FILENAME
+    lines = [f"{_magic_number(strategy_id)},{share:.4f}" for strategy_id, share in sorted(shares.items())]
+    path.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return path
+
+
 def install_pilot():
     """REQ-PORT-4.1 — put the Pilot in every terminal and compile it."""
     source = PILOT_SOURCE.read_text(encoding="utf-8")
