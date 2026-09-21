@@ -107,6 +107,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         description="Incubation stage per deployed strategy (REQ-PORT-3)",
         statements=("ALTER TABLE strategies ADD COLUMN incubation_stage TEXT",),
     ),
+    Migration(
+        version=7,
+        description="Backtest win rate, so a health check can compare magnitudes and not only signs (REQ-AUTO-2)",
+        statements=("ALTER TABLE strategies ADD COLUMN win_rate_pct REAL",),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = max(m.version for m in MIGRATIONS)

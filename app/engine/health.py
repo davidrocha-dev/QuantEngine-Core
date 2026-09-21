@@ -28,7 +28,14 @@ from app.models import LiveTrade, Strategy
 
 # Below this many live trades, live numbers say more about luck than edge.
 MIN_TRADES_FOR_VERDICT = 10
-# Live profit per trade this far below the backtest's is degradation.
+# A live win rate this far below the backtest's is degradation.
+#
+# Win rate rather than profit: live results are money and the Vault stores
+# percentages, and converting between them needs an account balance this
+# server never sees. A ratio is comparable on both sides without inventing
+# a conversion. What it will not catch on its own is a strategy that keeps
+# winning as often but earns less when it does - the sign check below is
+# what catches that, once the losses add up.
 DEGRADATION_THRESHOLD_PCT = 50.0
 
 # REQ-PORT-3.1-3.3 — stages, and what it takes to leave each one.
@@ -84,18 +91,18 @@ def _live_trades(session: Session, strategy_id: str) -> list[LiveTrade]:
 
 
 def _expected_profit_per_trade(strategy: Strategy, live_profit_total: float, live_trades: int) -> float | None:
-    """The backtest's return per trade, expressed in the live account's own
-    money so the two are comparable.
+    """The backtest's return per trade, as a percentage of its own equity.
 
-    The Vault stores percentages, not currency, so the expectation is
-    scaled by what the live trades themselves imply about position size —
-    which is why this is a ratio check, not a precise P&L forecast.
+    This is shown, not compared. It is a percentage and live profit is
+    money, and turning one into the other needs the account balance behind
+    those trades, which nothing here records. Presenting it as a like-for
+    -like expectation would be inventing a conversion; the magnitude test
+    is done on win rate instead, where both sides are ratios.
     """
     if not strategy.trades or strategy.return_pct is None or strategy.trades == 0:
         return None
     if live_trades == 0 or live_profit_total == 0:
         return None
-    # Backtest return per trade, as a fraction of the backtest's own equity.
     return strategy.return_pct / strategy.trades
 
 
@@ -134,13 +141,40 @@ def check_strategy(session: Session, strategy: Strategy) -> HealthVerdict:
             detail=f"Losing live ({round(live_profit, 2)}) on a strategy whose backtest was profitable.",
         )
 
-    win_rate = sum(1 for trade in trades if trade.profit > 0) / len(trades)
+    live_win_rate_pct = sum(1 for trade in trades if trade.profit > 0) / len(trades) * 100
+
+    # The magnitude check. A bot can be net positive and still be a shadow
+    # of the thing that was approved - winning a third as often as the
+    # backtest did is decay, even while the balance creeps up.
+    expected_win_rate_pct = strategy.win_rate_pct
+    if expected_win_rate_pct:
+        shortfall_pct = (expected_win_rate_pct - live_win_rate_pct) / expected_win_rate_pct * 100
+        if shortfall_pct >= DEGRADATION_THRESHOLD_PCT:
+            return HealthVerdict(
+                strategy_id=strategy.id, live_trades=len(trades), live_profit=round(live_profit, 2),
+                live_profit_per_trade=round(per_trade, 2),
+                expected_profit_per_trade=_expected_profit_per_trade(strategy, live_profit, len(trades)),
+                deviation_pct=round(shortfall_pct, 1), status="degraded",
+                detail=(
+                    f"Winning {round(live_win_rate_pct)}% of live trades against "
+                    f"{round(expected_win_rate_pct)}% in the backtest - {round(shortfall_pct)}% below it."
+                ),
+            )
+
+    # A strategy bred before the win rate was recorded has nothing to
+    # compare against, and an absent number is not evidence of decay.
+    basis = (
+        f" vs {round(expected_win_rate_pct)}% expected" if expected_win_rate_pct else ""
+    )
     return HealthVerdict(
         strategy_id=strategy.id, live_trades=len(trades), live_profit=round(live_profit, 2),
         live_profit_per_trade=round(per_trade, 2),
         expected_profit_per_trade=_expected_profit_per_trade(strategy, live_profit, len(trades)),
         deviation_pct=None, status="healthy",
-        detail=f"{len(trades)} live trades, {round(win_rate * 100)}% winners, {round(live_profit, 2)} net.",
+        detail=(
+            f"{len(trades)} live trades, {round(live_win_rate_pct)}% winners{basis}, "
+            f"{round(live_profit, 2)} net."
+        ),
     )
 
 

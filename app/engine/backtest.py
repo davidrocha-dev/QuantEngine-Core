@@ -119,31 +119,47 @@ def _combine_filter_veto(df: pd.DataFrame, genome: Genome, htf_df: pd.DataFrame 
 
 
 def _apply_management_exit(
-    df: pd.DataFrame, genome: Genome, entry_idx: int, exit_idx: int, direction: int, entry_price: float
+    genome: Genome,
+    hours: np.ndarray,
+    weekdays: np.ndarray,
+    closes: np.ndarray,
+    entry_idx: int,
+    exit_idx: int,
+    direction: int,
+    entry_price: float,
 ) -> tuple[int, str] | None:
     """Checks Management-gene early-exit conditions (EOD CLOSE, FRIDAY
     PROFIT) between entry and the baseline SL/TP exit. Returns the earlier
     (bar_index, reason) if one fires, else None. PARTIAL TP is handled
-    separately in `simulate_trades` since it doesn't end the trade."""
+    separately in `simulate_trades` since it doesn't end the trade.
+
+    Takes the hour and weekday of every bar as plain arrays rather than
+    the DataFrame itself. This runs once per trade, and slicing a frame
+    and rebuilding a DatetimeIndex each time was two thirds of the entire
+    backtest - the same derivation, thousands of times, for data that
+    never changes within a run.
+    """
     if genome.management is None:
         return None
     name, params = genome.management.name, genome.management.params
     if name not in ("EOD CLOSE", "FRIDAY PROFIT"):
         return None
 
-    window = df.iloc[entry_idx + 1 : exit_idx + 1]
-    if window.empty:
+    start, stop = entry_idx + 1, exit_idx + 1
+    if start >= stop:
         return None
-    timestamps = pd.DatetimeIndex(window["timestamp"])
 
     if name == "EOD CLOSE":
-        hit = timestamps.hour >= params.get("close_hour", 21)
+        hit = hours[start:stop] >= params.get("close_hour", 21)
     else:  # FRIDAY PROFIT — only locks in a position that is actually in profit
-        in_profit = ((window["close"].to_numpy() - entry_price) * direction) > 0
-        hit = (timestamps.dayofweek == 4) & (timestamps.hour >= params.get("lock_hour", 18)) & in_profit
+        in_profit = ((closes[start:stop] - entry_price) * direction) > 0
+        hit = (weekdays[start:stop] == 4) & (hours[start:stop] >= params.get("lock_hour", 18)) & in_profit
 
     if hit.any():
-        return int(window.index[np.argmax(hit)]), name
+        # Positional, so a caller that hands over a frame whose index does
+        # not start at zero cannot silently get a bar index from another
+        # part of history.
+        return start + int(np.argmax(hit)), name
     return None
 
 
@@ -189,6 +205,14 @@ def simulate_trades(
 
     atr_series = ta.atr(df).to_numpy()
     closes, highs, lows, opens = (df[c].to_numpy() for c in ("close", "high", "low", "open"))
+    # Only the Management genes need these, but deriving them here costs
+    # one pass over the series instead of one per trade.
+    if genome.management is not None and genome.management.name in ("EOD CLOSE", "FRIDAY PROFIT"):
+        _timestamps = pd.DatetimeIndex(df["timestamp"])
+        bar_hours = _timestamps.hour.to_numpy()
+        bar_weekdays = _timestamps.dayofweek.to_numpy()
+    else:
+        bar_hours = bar_weekdays = np.empty(0, dtype=np.int64)
     signal_arr, bias_arr, veto_arr = signal.to_numpy(), bias.to_numpy(), veto.to_numpy()
 
     n = len(df)
@@ -254,7 +278,9 @@ def simulate_trades(
             )
 
         exit_idx, exit_reason, partial_closed = baseline_exit_idx, _EXIT_NAMES[exit_code], partial_r is not None
-        management_hit = _apply_management_exit(df, genome, entry_idx, baseline_exit_idx, int(direction), entry_price)
+        management_hit = _apply_management_exit(
+            genome, bar_hours, bar_weekdays, closes, entry_idx, baseline_exit_idx, int(direction), entry_price
+        )
         if management_hit is not None and management_hit[0] <= baseline_exit_idx:
             exit_idx, exit_reason = management_hit
             exit_price = closes[exit_idx]

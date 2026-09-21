@@ -313,3 +313,58 @@ def test_per_broker_comparison_normalises_by_trade_count(session):
     assert verdict.per_broker["Small"]["profit_per_trade"] == 1.0
     assert verdict.per_broker["Large"]["profit_per_trade"] == 10.0
     assert verdict.classification == "healthy"
+
+
+# --- the magnitude check (REQ-AUTO-2) ------------------------------------
+
+
+def test_a_bot_winning_far_less_often_is_degraded_even_while_profitable(session):
+    """A bot can be net positive and still be a shadow of what was
+    approved. Before this, the only thing that counted as degradation was
+    losing money outright, so a strategy winning a third as often as its
+    backtest read as healthy for as long as the balance crept up."""
+    strategy = make_strategy(session)
+    strategy.win_rate_pct = 60.0
+    session.commit()
+    # 2 winners in 12 (17%), but big enough to stay net positive.
+    add_live_trades(session, strategy.id, [200.0, 200.0] + [-20.0] * 10)
+
+    verdict = check_strategy(session, strategy)
+
+    assert verdict.status == "degraded"
+    assert verdict.live_profit > 0
+    assert verdict.deviation_pct is not None and verdict.deviation_pct > 50
+
+
+def test_a_bot_holding_its_win_rate_is_healthy(session):
+    strategy = make_strategy(session)
+    strategy.win_rate_pct = 60.0
+    session.commit()
+    add_live_trades(session, strategy.id, [50.0] * 7 + [-40.0] * 5)  # 58%
+
+    verdict = check_strategy(session, strategy)
+
+    assert verdict.status == "healthy"
+    assert "expected" in verdict.detail
+
+
+def test_a_strategy_bred_before_win_rate_was_recorded_is_not_called_degraded(session):
+    # An absent number is not evidence of decay, and every strategy bred
+    # before this column existed has one.
+    strategy = make_strategy(session)
+    assert strategy.win_rate_pct is None
+    add_live_trades(session, strategy.id, [10.0, 10.0] + [-1.0] * 10)
+
+    verdict = check_strategy(session, strategy)
+
+    assert verdict.status == "healthy"
+    assert verdict.deviation_pct is None
+
+
+def test_the_win_rate_check_still_needs_enough_live_trades(session):
+    strategy = make_strategy(session)
+    strategy.win_rate_pct = 60.0
+    session.commit()
+    add_live_trades(session, strategy.id, [-20.0] * (MIN_TRADES_FOR_VERDICT - 1))
+
+    assert check_strategy(session, strategy).status == "too_early"

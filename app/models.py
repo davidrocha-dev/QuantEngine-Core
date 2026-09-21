@@ -27,6 +27,11 @@ class Strategy(Base):
     archetype: Mapped[str | None] = mapped_column(String)
     robust_pct: Mapped[float | None]
     icir: Mapped[float | None]
+    # REQ-AUTO-2 - the out-of-sample win rate, kept so a live health check
+    # has something to compare against that needs no currency conversion.
+    # Live profit is money and the Vault's return is a percentage; win rate
+    # is a ratio on both sides, which is what makes it comparable at all.
+    win_rate_pct: Mapped[float | None]
     avg_hold_hours: Mapped[float | None]
     score: Mapped[int | None] = mapped_column(Integer)
     grade: Mapped[str | None] = mapped_column(String)

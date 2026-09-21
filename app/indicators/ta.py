@@ -10,8 +10,34 @@ technical-analysis definition").
 
 from __future__ import annotations
 
+import numba
 import numpy as np
 import pandas as pd
+
+
+@numba.njit(cache=True)
+def _rolling_mean_abs_deviation(values: np.ndarray, period: int) -> np.ndarray:
+    """Rolling mean absolute deviation, compiled.
+
+    Pandas has no vectorised form of this - the window's mean has to be
+    known before its deviations can be measured - so the natural spelling
+    is `rolling(period).apply(lambda ...)`, which runs a Python function
+    once per window. On a year of M15 bars that single lambda was the
+    most expensive thing in the entire indicator layer.
+    """
+    n = values.size
+    out = np.full(n, np.nan)
+    for end in range(period - 1, n):
+        start = end - period + 1
+        total = 0.0
+        for index in range(start, end + 1):
+            total += values[index]
+        mean = total / period
+        deviation = 0.0
+        for index in range(start, end + 1):
+            deviation += abs(values[index] - mean)
+        out[end] = deviation / period
+    return out
 
 
 def sma(series: pd.Series, period: int = 20) -> pd.Series:
@@ -64,8 +90,9 @@ def cci(df: pd.DataFrame, period: int = 20) -> pd.Series:
     """Commodity Channel Index: (typical price - SMA) / (0.015 * mean deviation)."""
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
     tp_sma = sma(typical_price, period)
-    mean_deviation = typical_price.rolling(period).apply(
-        lambda x: np.abs(x - x.mean()).mean(), raw=True
+    mean_deviation = pd.Series(
+        _rolling_mean_abs_deviation(typical_price.to_numpy(dtype=np.float64), period),
+        index=typical_price.index,
     )
     return (typical_price - tp_sma) / (0.015 * mean_deviation.replace(0, np.nan))
 

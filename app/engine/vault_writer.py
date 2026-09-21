@@ -28,6 +28,7 @@ def vault_candidate_to_row(candidate: VaultCandidate, asset: str, timeframe: str
         archetype=classify_archetype(candidate.genome),
         robust_pct=100 - max(candidate.robustness.monte_carlo_degradation_pct, candidate.robustness.noise_degradation_pct),
         icir=candidate.stats_oos.icir,
+        win_rate_pct=candidate.stats_oos.win_rate * 100,
         avg_hold_hours=candidate.stats_oos.avg_hold_hours,
         score=score,
         grade=compute_grade(score),

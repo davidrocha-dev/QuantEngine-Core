@@ -86,6 +86,7 @@ def refresh_strategy(
     strategy.cagr_pct = oos_stats.cagr_pct
     strategy.max_dd_pct = oos_stats.max_dd_pct
     strategy.icir = oos_stats.icir
+    strategy.win_rate_pct = oos_stats.win_rate * 100
     strategy.avg_hold_hours = oos_stats.avg_hold_hours
     strategy.equity_is = _json(serialize_equity_curve(is_df, is_result.equity_curve))
     strategy.equity_oos = _json(serialize_equity_curve(oos_df, oos_result.equity_curve))
