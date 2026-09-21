@@ -2,6 +2,7 @@ import numpy as np
 
 from app.engine.backtest import BacktestResult, Trade
 from app.engine.metrics import (
+    BARS_PER_YEAR_BY_TIMEFRAME,
     avg_hold_hours,
     cagr_pct,
     information_coefficient_information_ratio,
@@ -78,3 +79,54 @@ def test_avg_hold_hours():
     trades = [make_trade(0, 2, 10), make_trade(3, 7, 10)]
     result = avg_hold_hours(trades, df)
     assert result == (2 + 4) / 2  # hourly bars: 2h and 4h holds
+
+
+def test_a_short_window_reports_no_cagr_rather_than_a_fantasy():
+    """Compounding six weeks up to a year is arithmetic, not forecasting.
+
+    The Vault had strategies showing 27,929,074,494,351%/yr because a
+    two-month M1 backtest was annualised and then clamped. A clamped
+    absurdity is worse than nothing: it looks like a measurement and it
+    sorts like one.
+    """
+    from app.engine.metrics import MIN_YEARS_TO_ANNUALISE, cagr_pct
+
+    six_weeks_of_m1 = int(BARS_PER_YEAR_BY_TIMEFRAME["M1"] * 0.12)
+    curve = np.linspace(10_000, 13_000, six_weeks_of_m1)
+
+    assert cagr_pct(curve, 10_000, six_weeks_of_m1, "M1") is None
+
+
+def test_a_long_enough_window_still_reports_one():
+    from app.engine.metrics import cagr_pct
+
+    two_years = BARS_PER_YEAR_BY_TIMEFRAME["H1"] * 2
+    curve = np.linspace(10_000, 14_400, two_years)  # +44% over two years
+
+    result = cagr_pct(curve, 10_000, two_years, "H1")
+
+    assert result is not None
+    assert 15 < result < 25  # about 20%/yr
+
+
+def test_the_cap_still_holds_on_a_long_window():
+    from app.engine.metrics import MAX_REPORTED_CAGR_PCT, cagr_pct
+
+    year = BARS_PER_YEAR_BY_TIMEFRAME["H1"]
+    curve = np.linspace(10_000, 10_000_000, year)
+
+    assert cagr_pct(curve, 10_000, year, "H1") == MAX_REPORTED_CAGR_PCT
+
+
+def test_phase_2_fitness_survives_an_unannualisable_window():
+    # F2 is CAGR x PF x payoff; None would crash it, and zero would flatten
+    # every candidate in the tribe to the same score.
+    from app.engine.fitness import fitness_f2_expansion
+    from app.engine.metrics import TradeStats
+
+    stats = TradeStats(
+        trade_count=120, profit_factor=1.8, win_rate=0.5, sharpe_ratio=1.0, max_dd_pct=10.0,
+        net_profit_pct=25.0, cagr_pct=None, payoff_ratio=1.5, icir=1.0, avg_hold_hours=4.0,
+    )
+
+    assert fitness_f2_expansion(stats) > 0

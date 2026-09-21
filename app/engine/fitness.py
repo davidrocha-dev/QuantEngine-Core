@@ -33,6 +33,14 @@ def fitness_f1_stability(stats: TradeStats) -> float:
 
 
 def fitness_f2_expansion(stats: TradeStats) -> float:
-    """REQ-ENGINE-3.4 (Phase 2, Tribe B): F2 = CAGR% × Profit Factor × Payoff Ratio."""
+    """REQ-ENGINE-3.4 (Phase 2, Tribe B): F2 = CAGR% × Profit Factor × Payoff Ratio.
+
+    CAGR is None on a window too short to annualise honestly (see
+    metrics.cagr_pct). The total return stands in for it there: over a few
+    weeks the raw return *is* the growth figure, and substituting zero
+    would flatten every candidate in the tribe to the same score and turn
+    the ranking into a coin toss.
+    """
     profit_factor = stats.profit_factor if stats.profit_factor != float("inf") else 0.0
-    return stats.cagr_pct * profit_factor * stats.payoff_ratio
+    growth = stats.cagr_pct if stats.cagr_pct is not None else stats.net_profit_pct
+    return growth * profit_factor * stats.payoff_ratio

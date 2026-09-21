@@ -13,6 +13,9 @@ from app.engine.backtest import BacktestResult, Trade
 
 TRADING_DAYS_PER_YEAR = 252
 MAX_REPORTED_CAGR_PCT = 1000.0
+# Below this much history, annualising is extrapolation dressed as a
+# measurement. Half a year is already generous for the claim "per year".
+MIN_YEARS_TO_ANNUALISE = 0.5
 BARS_PER_YEAR_BY_TIMEFRAME = {
     "M1": 252 * 24 * 60, "M5": 252 * 24 * 12, "M15": 252 * 24 * 4, "M30": 252 * 24 * 2,
     "H1": 252 * 24, "H2": 252 * 12, "H4": 252 * 6, "D1": 252,
@@ -27,7 +30,7 @@ class TradeStats:
     sharpe_ratio: float
     max_dd_pct: float
     net_profit_pct: float
-    cagr_pct: float
+    cagr_pct: float | None
     payoff_ratio: float
     icir: float
     avg_hold_hours: float
@@ -70,18 +73,34 @@ def net_profit_pct(equity_curve: np.ndarray, initial_balance: float) -> float:
     return float((equity_curve[-1] - initial_balance) / initial_balance * 100)
 
 
-def cagr_pct(equity_curve: np.ndarray, initial_balance: float, bar_count: int, timeframe: str) -> float:
+def cagr_pct(
+    equity_curve: np.ndarray, initial_balance: float, bar_count: int, timeframe: str
+) -> float | None:
+    """Annualised growth rate, or None when the window is too short to
+    annualise honestly.
+
+    Compounding a six-week result up to a year is arithmetic, not
+    forecasting: a good month becomes four figures a year and a great one
+    becomes millions of percent. Clamping that to a large finite number
+    was worse than useless - it turned nonsense into something that
+    looked like a measurement and sorted like one.
+
+    So a window under `MIN_YEARS_TO_ANNUALISE` reports nothing at all.
+    "We cannot say" is a fact; "+27,929,074,494,351%/yr" is not.
+    """
     if len(equity_curve) == 0 or equity_curve[-1] <= 0 or bar_count == 0:
         return 0.0
     bars_per_year = BARS_PER_YEAR_BY_TIMEFRAME.get(timeframe, TRADING_DAYS_PER_YEAR)
     years = bar_count / bars_per_year
     if years <= 0:
         return 0.0
+    if years < MIN_YEARS_TO_ANNUALISE:
+        return None
     total_return = equity_curve[-1] / initial_balance
     if total_return <= 0:
         return -100.0
-    # Annualising a short sample explodes (a few good weeks extrapolate to
-    # millions of percent); clamp so the number stays readable and sortable.
+    # Even over a long enough window, a runaway compounding figure helps
+    # nobody read a table; the cap keeps it sortable.
     return float(min(max((total_return ** (1 / years) - 1) * 100, -100.0), MAX_REPORTED_CAGR_PCT))
 
 
