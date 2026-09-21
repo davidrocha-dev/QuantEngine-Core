@@ -11,6 +11,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from app.broker.terminal_watch import forget as forget_terminal_state
+from app.broker.terminal_watch import terminal_is_running
+
 try:
     import MetaTrader5 as mt5  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - only available on Windows w/ terminal
@@ -31,10 +34,27 @@ class MT5Bridge:
     def __init__(self) -> None:
         self._connected = False
 
-    def connect(self) -> bool:
+    def connect(self, launch: bool = False) -> bool:
+        """Attach to a running terminal. Launch one only when asked.
+
+        `mt5.initialize()` starts MetaTrader when none is running, which
+        made simply opening QuantEngine open MetaTrader - the Dashboard
+        polls this, so it happened on every launch whether or not anybody
+        wanted it. Nothing here needs the terminal running: EAs are
+        installed by writing files into its data directory and the
+        Pilot's reports are read out of one, both of which work on a
+        closed terminal. The connection is for live spread, and only
+        while a campaign is being configured.
+        """
         if mt5 is None:
             return False
+        if not launch and not terminal_is_running():
+            self._connected = False
+            return False
         self._connected = bool(mt5.initialize())
+        if self._connected:
+            # A launch changes the answer the watcher just cached.
+            forget_terminal_state()
         return self._connected
 
     def disconnect(self) -> None:

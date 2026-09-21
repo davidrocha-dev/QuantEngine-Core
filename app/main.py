@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.broker.mt5_bridge import MT5Bridge
 from app.broker import pilot
+from app.broker.terminal_watch import terminal_is_running
 from app.broker.mt5_install import install_compiled_ea, install_ea
 from app.codegen.mql5 import GeneratedEa, UnsupportedGeneError, generate_ea
 from app.config import get_config, set_auto_backup_before_updates, set_built_in_data_only
@@ -196,6 +197,12 @@ def _spread_points(costs: dict, symbol: str, instrument) -> float:
     rather than silently backtesting at zero spread."""
     if costs["spread_mode"] != "AUTO":
         return float(costs["manual_spread_points"])
+    # AUTO spread is the one thing that actually wants the terminal. It
+    # attaches to a running one if it has not already - never launches,
+    # because a campaign starting is not a reason to open a broker
+    # terminal - and falls back to MANUAL when there is none.
+    if not _mt5_bridge.is_connected():
+        _mt5_bridge.connect()
     quote = _mt5_bridge.get_live_quote(symbol) if _mt5_bridge.is_connected() else None
     if quote is None:
         return float(costs["manual_spread_points"])
@@ -539,16 +546,27 @@ def get_status() -> dict:
 
 @app.get("/mt5/status")
 def get_mt5_status() -> dict:
-    # REQ-DASH-1.2, 1.3, 1.4 — Dashboard's MT5 connection card.
+    """REQ-DASH-1.2, 1.3, 1.4 — Dashboard's MT5 connection card.
+
+    Polled, so it must never start anything: `connect()` attaches to a
+    terminal that is already open and reports nothing otherwise. Opening
+    this app used to open MetaTrader, every time, because this line ran.
+    """
     if not _mt5_bridge.is_connected() and not _mt5_bridge.connect():
-        return {"connected": False, "server": None, "latency_ms": None, "is_metaquotes_demo": False}
+        return {
+            "connected": False, "server": None, "latency_ms": None, "is_metaquotes_demo": False,
+            "terminal_running": terminal_is_running(),
+        }
 
     started = time.perf_counter()
     server_info = _mt5_bridge.get_server_info()
     latency_ms = round((time.perf_counter() - started) * 1000, 1)
 
     if server_info is None:
-        return {"connected": False, "server": None, "latency_ms": None, "is_metaquotes_demo": False}
+        return {
+            "connected": False, "server": None, "latency_ms": None, "is_metaquotes_demo": False,
+            "terminal_running": terminal_is_running(),
+        }
 
     return {
         "connected": True,
@@ -556,6 +574,25 @@ def get_mt5_status() -> dict:
         "latency_ms": latency_ms,
         "is_metaquotes_demo": server_info["is_metaquotes_demo"],
     }
+
+
+@app.post("/mt5/connect")
+def connect_mt5() -> dict:
+    """Start MetaTrader and attach to it — the deliberate version.
+
+    Separate from the status poll on purpose. Launching a broker terminal
+    is a decision, and the person using the app is the one who gets to
+    make it.
+    """
+    if not _mt5_bridge.connect(launch=True):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Could not start MetaTrader 5. Check it is installed, and that you have logged into an "
+                "account in it at least once."
+            ),
+        )
+    return get_mt5_status()
 
 
 @app.get("/campaign/estimate")
