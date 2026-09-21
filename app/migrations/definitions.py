@@ -112,6 +112,31 @@ MIGRATIONS: tuple[Migration, ...] = (
         description="Backtest win rate, so a health check can compare magnitudes and not only signs (REQ-AUTO-2)",
         statements=("ALTER TABLE strategies ADD COLUMN win_rate_pct REAL",),
     ),
+    Migration(
+        version=8,
+        description="The trades behind each Vault row, so a strategy's history survives its summary",
+        statements=(
+            """
+            CREATE TABLE IF NOT EXISTS strategy_trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                strategy_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                opened_at TIMESTAMP,
+                closed_at TIMESTAMP,
+                direction INTEGER NOT NULL,
+                entry_price REAL NOT NULL,
+                exit_price REAL NOT NULL,
+                stop_price REAL NOT NULL,
+                target_price REAL NOT NULL,
+                r_multiple REAL NOT NULL,
+                pnl REAL NOT NULL,
+                exit_reason TEXT NOT NULL,
+                FOREIGN KEY (strategy_id) REFERENCES strategies (id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_strategy_trades ON strategy_trades (strategy_id, sequence)",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = max(m.version for m in MIGRATIONS)

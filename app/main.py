@@ -934,16 +934,37 @@ def post_export_mql5(strategy_id: str, body: ExportEaRequest) -> dict:
 
 
 @app.post("/deploy/{strategy_id}")
-def deploy_strategy(strategy_id: str) -> dict:
+def deploy_strategy(strategy_id: str, acknowledge_overlap: bool = False) -> dict:
     """REQ-VAULT-2.1 — generate the EA from the stored genome, install it
     into every MT5 terminal on this machine and compile it. Tier gating is
-    the renderer's job (REQ-TIER-1.5); this endpoint does the work."""
+    the renderer's job (REQ-TIER-1.5); this endpoint does the work.
+
+    Refuses once, with a 409, if this strategy moves in step with one
+    already deployed. Correlation used to be checked only inside a
+    portfolio - the one place somebody had already decided to think about
+    diversification - so three versions of the same idea could go live
+    one after another and the account would carry three times the
+    intended risk on a single bet.  is the
+    caller saying they know and meant it.
+    """
+    from app.engine.overlap import check_against_deployed
+
+    engine = make_engine(get_config().vault_db_path)
+    if not acknowledge_overlap:
+        with Session(engine) as session:
+            candidate = session.get(Strategy, strategy_id)
+            warning = check_against_deployed(session, candidate) if candidate is not None else None
+        if warning is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "correlated_with_deployed", **warning.to_dict()},
+            )
+
     row, generated = _generate_ea_for(strategy_id)
     result = install_ea(generated.filename, generated.source)
     if not result.installed:
         raise HTTPException(status_code=409, detail=result.detail)
 
-    engine = make_engine(get_config().vault_db_path)
     with Session(engine) as session:
         strategy = session.get(Strategy, strategy_id)
         if strategy is not None:
@@ -1130,6 +1151,55 @@ async def tick_verify_strategy(strategy_id: str, max_trades: int = TICK_VERIFY_M
             if row.changed or row.ambiguous
         ][:20],
     }
+
+
+@app.get("/vault/{strategy_id}/trades")
+def get_strategy_trades(strategy_id: str, limit: int = 500) -> dict:
+    """The trades behind a Vault row.
+
+    Stored at breeding time rather than re-simulated on demand: the
+    aggregates rank a strategy, and these are what let anyone actually
+    interrogate one. Strategies bred before this existed have none, and
+    say so rather than pretending the strategy made no trades.
+    """
+    from app.models import StrategyTrade
+
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        strategy = session.get(Strategy, strategy_id)
+        if strategy is None or strategy.deleted_at is not None:
+            raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+        rows = list(
+            session.scalars(
+                select(StrategyTrade)
+                .where(StrategyTrade.strategy_id == strategy_id)
+                .order_by(StrategyTrade.sequence)
+                .limit(max(1, min(limit, 2000)))
+            )
+        )
+        return {
+            "strategy_id": strategy_id,
+            "trades": [
+                {
+                    "sequence": row.sequence,
+                    "opened_at": row.opened_at.isoformat() if row.opened_at else None,
+                    "closed_at": row.closed_at.isoformat() if row.closed_at else None,
+                    "direction": row.direction,
+                    "entry_price": row.entry_price,
+                    "exit_price": row.exit_price,
+                    "stop_price": row.stop_price,
+                    "target_price": row.target_price,
+                    "r_multiple": round(row.r_multiple, 3),
+                    "pnl": round(row.pnl, 2),
+                    "exit_reason": row.exit_reason,
+                }
+                for row in rows
+            ],
+            "detail": (
+                "" if rows else
+                "This strategy was bred before its trades were kept. REFRESH records them."
+            ),
+        }
 
 
 @app.post("/vault/{strategy_id}/parity-test")

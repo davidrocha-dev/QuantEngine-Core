@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import pandas as pd
+from sqlalchemy.orm import object_session
 
 from app.engine.backtest import simulate_trades
 from app.engine.metrics import compute_trade_stats
@@ -31,6 +32,7 @@ from app.engine.phases import (
     split_is_oos,
 )
 from app.engine.scoring import compute_grade, compute_score
+from app.engine.trade_log import replace_trades
 from app.engine.walk_forward import run_walk_forward
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genome import Genome
@@ -90,6 +92,12 @@ def refresh_strategy(
     strategy.avg_hold_hours = oos_stats.avg_hold_hours
     strategy.equity_is = _json(serialize_equity_curve(is_df, is_result.equity_curve))
     strategy.equity_oos = _json(serialize_equity_curve(oos_df, oos_result.equity_curve))
+    # A REFRESH re-runs the same genome over newer data, so the stored
+    # trades are replaced rather than added to: keeping both runs would
+    # leave a history that belongs to no single backtest.
+    session = object_session(strategy)
+    if session is not None:
+        replace_trades(session, strategy.id, oos_result.trades, oos_df)
 
     return ReassessResult(
         strategy_id=strategy.id,
@@ -140,7 +148,7 @@ def reassess_strategy(
 
     score = compute_score(oos_stats, robustness)
     strategy.score = score
-    strategy.grade = compute_grade(score)
+    strategy.grade = compute_grade(score, oos_stats.trade_count)
     strategy.robust_pct = 100 - max(robustness.monte_carlo_degradation_pct, robustness.noise_degradation_pct)
     if walk_forward is not None:
         strategy.persistence_pct = walk_forward.persistence_pct

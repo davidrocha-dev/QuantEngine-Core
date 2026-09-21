@@ -351,11 +351,15 @@ def run_campaign(
     )
     _set_survivors_per_phase(session, campaign_id, PHASE_ROBUSTNESS, len(vault_candidates))
 
+    # The out-of-sample slice is the window Phase 4 judged these on, so it
+    # is the one their trade timestamps belong to.
+    _, oos_df = split_is_oos(df)
     write_vault_candidates(
         session, vault_candidates,
         asset=campaign.asset or "UNKNOWN",
         timeframe=campaign.timeframe or config.timeframe,
         data_source=config.data_source,
+        oos_bars=oos_df,
     )
 
     campaign.status = "completed"

@@ -1,3 +1,5 @@
+import pytest
+
 from app.engine.metrics import TradeStats
 from app.engine.monte_carlo import RobustnessResult
 from app.engine.scoring import classify_archetype, compute_grade, compute_score
@@ -62,3 +64,55 @@ def test_compute_score_bounded_0_100():
 def test_compute_grade_boundary():
     assert compute_grade(57) == "GOOD"
     assert compute_grade(56) == "WEAK"
+
+
+# --- how much evidence is behind the score --------------------------------
+
+
+def test_a_thin_sample_scores_below_the_same_result_on_a_thick_one():
+    """The gap this closed.
+
+    A strategy with 30 out-of-sample trades and one with 400 used to
+    score identically, and the Vault is sorted by score — so the thin one
+    could sit at the top of the list and be the one someone deploys.
+    """
+    thin = compute_score(make_stats(trade_count=30), make_robustness())
+    thick = compute_score(make_stats(trade_count=400), make_robustness())
+
+    assert thin < thick
+    assert thick - thin >= 5  # enough to change where it sorts
+
+
+def test_the_sample_component_stops_rewarding_past_the_point_it_matters():
+    from app.engine.scoring import FULL_CONFIDENCE_TRADES, sample_adequacy
+
+    assert sample_adequacy(FULL_CONFIDENCE_TRADES) == 1.0
+    assert sample_adequacy(FULL_CONFIDENCE_TRADES * 10) == 1.0
+    # Square root, because that is how the precision of an estimate scales
+    # with its sample: four times the trades is twice the confidence.
+    assert sample_adequacy(FULL_CONFIDENCE_TRADES // 4) == pytest.approx(0.5, abs=0.01)
+
+
+def test_no_trades_is_no_confidence():
+    from app.engine.scoring import sample_adequacy
+
+    assert sample_adequacy(0) == 0.0
+
+
+def test_a_strong_result_on_a_thin_sample_is_never_graded_good():
+    """A dozen trades is a fluke until proven otherwise, however good it
+    looks - and one component in six cannot hold back a result that is
+    excellent on every other axis. Only a floor can."""
+    from app.engine.scoring import MIN_TRADES_FOR_GOOD
+
+    stats = make_stats(trade_count=12)
+    score = compute_score(stats, make_robustness())
+
+    assert score >= 57  # it still looks good on every other measure
+    assert compute_grade(score, stats.trade_count) == "WEAK"
+    assert compute_grade(score, MIN_TRADES_FOR_GOOD) == "GOOD"
+
+
+def test_grading_without_a_trade_count_still_works():
+    # Callers that only have a score keep the old behaviour.
+    assert compute_grade(70) == "GOOD"

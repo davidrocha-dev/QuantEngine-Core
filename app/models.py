@@ -55,6 +55,39 @@ class Strategy(Base):
     incubation_stage: Mapped[str | None] = mapped_column(String)
 
 
+class StrategyTrade(Base):
+    """One backtested trade behind a Vault row.
+
+    The Vault stored aggregates and an equity curve, which is enough to
+    rank a strategy and not enough to interrogate one. Every question
+    worth asking after the fact - which hours it actually makes money in,
+    whether it survives without its three best trades, what the exits
+    really looked like - needed a full re-simulation, and the tick
+    verification had to re-run the whole out-of-sample window before it
+    could check a single fill.
+
+    Timestamps rather than bar indices, because an index only means
+    something against the exact bar series it came from, and that series
+    is a cache that grows every day.
+    """
+
+    __tablename__ = "strategy_trades"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    strategy_id: Mapped[str] = mapped_column(ForeignKey("strategies.id", ondelete="CASCADE"), nullable=False)
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    opened_at: Mapped[datetime | None] = mapped_column(DateTime)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    direction: Mapped[int] = mapped_column(Integer, nullable=False)  # 1 long, -1 short
+    entry_price: Mapped[float] = mapped_column(nullable=False)
+    exit_price: Mapped[float] = mapped_column(nullable=False)
+    stop_price: Mapped[float] = mapped_column(nullable=False)
+    target_price: Mapped[float] = mapped_column(nullable=False)
+    r_multiple: Mapped[float] = mapped_column(nullable=False)
+    pnl: Mapped[float] = mapped_column(nullable=False)
+    exit_reason: Mapped[str] = mapped_column(String, nullable=False)
+
+
 class Portfolio(Base):
     __tablename__ = "portfolios"
 

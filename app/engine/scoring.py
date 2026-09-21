@@ -22,6 +22,16 @@ from app.genome.genome import Genome
 
 GOOD_GRADE_THRESHOLD = 57
 
+# Out-of-sample trades for the sample-adequacy component to reach full
+# marks. Below it, a score is a claim made on thin evidence.
+#
+# The precision of an estimated edge scales with the square root of the
+# sample, so the component does too. 150 is where a profit factor or a
+# win rate starts being worth quoting; the phase gate already refuses
+# anything under 30 (phases.MIN_OOS_TRADES), so the realistic range this
+# operates over is 30 to 150.
+FULL_CONFIDENCE_TRADES = 150
+
 _MEAN_REVERTER_SIGNALS = {"FADE", "CCI", "STOCH", "WILLIAMS"}
 _PATTERN_SPOTTER_SIGNALS = {"ENGULFING", "THREE SOLDIERS", "WICK REJECTION", "INSIDE BREAKOUT", "LIQSWEEP", "FIB", "DOJI"}
 # Everything else (BREAKOUT, MACD, MOM BREAK, ORB, VWAP, ATR RUN) defaults
@@ -42,21 +52,69 @@ def _clamp01(value: float) -> float:
 
 
 def compute_score(stats_oos: TradeStats, robustness: RobustnessResult) -> int:
-    """0-100 composite: profit factor, win rate, Sharpe, drawdown control,
-    and Phase 4 robustness margin (headroom below the 25% degradation
-    discard threshold), each weighted 20%."""
+    """0-100 composite, six equally weighted parts: profit factor, win
+    rate, Sharpe, drawdown control, Phase 4 robustness margin, and how
+    much out-of-sample evidence there is behind all five.
+
+    The sixth is the one that was missing. Without it a strategy with 30
+    out-of-sample trades and one with 400 scored identically, and since
+    the Vault is sorted by score, the thin one could sit at the top of
+    the list and be the one someone deploys. Everything else here
+    measures how good the result was; this measures how much the result
+    is worth believing.
+    """
     pf_component = _clamp01(stats_oos.profit_factor / 2.0) if stats_oos.profit_factor != float("inf") else 1.0
     win_rate_component = _clamp01(stats_oos.win_rate)
     sharpe_component = _clamp01(stats_oos.sharpe_ratio / 2.0)
     drawdown_component = _clamp01(1 - stats_oos.max_dd_pct / 50.0)
     worst_degradation = max(robustness.monte_carlo_degradation_pct, robustness.noise_degradation_pct)
     robustness_component = _clamp01(1 - worst_degradation / 25.0)
+    sample_component = sample_adequacy(stats_oos.trade_count)
 
     composite = (
-        pf_component + win_rate_component + sharpe_component + drawdown_component + robustness_component
-    ) / 5.0
+        pf_component
+        + win_rate_component
+        + sharpe_component
+        + drawdown_component
+        + robustness_component
+        + sample_component
+    ) / 6.0
     return round(composite * 100)
 
 
-def compute_grade(score: int) -> str:
-    return "GOOD" if score >= GOOD_GRADE_THRESHOLD else "WEAK"
+def sample_adequacy(trade_count: int) -> float:
+    """0-1: how much the rest of the score is worth believing.
+
+    Square root, because that is how the precision of an estimate scales
+    with its sample. 30 trades scores 0.45, 75 scores 0.71, 150 and above
+    scores 1.0.
+    """
+    if trade_count <= 0:
+        return 0.0
+    return _clamp01((trade_count / FULL_CONFIDENCE_TRADES) ** 0.5)
+
+
+# No number of good-looking trades makes a dozen of them enough. This
+# matches the phase gate (phases.MIN_OOS_TRADES) rather than inventing a
+# second bar: if a sample is too thin to get into the Vault on its own
+# merits, it is too thin to be called GOOD once it is there.
+MIN_TRADES_FOR_GOOD = 30
+
+
+def compute_grade(score: int, trade_count: int | None = None) -> str:
+    """GOOD needs both a good result and enough of it.
+
+    The score already carries a sample-adequacy component, but one part
+    in six cannot hold back a result that is excellent on every other
+    axis: a twelve-trade fluke still scores in the seventies. Weighting
+    cannot express "not enough evidence to call this anything" - only a
+    floor can.
+
+    `trade_count` is optional so a caller with only a score still works;
+    it grades on the score alone, which is the old behaviour.
+    """
+    if score < GOOD_GRADE_THRESHOLD:
+        return "WEAK"
+    if trade_count is not None and trade_count < MIN_TRADES_FOR_GOOD:
+        return "WEAK"
+    return "GOOD"

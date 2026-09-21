@@ -76,6 +76,10 @@ class VaultCandidate:
     equity_is: list[dict] | None = None
     equity_oos: list[dict] | None = None
     walk_forward: WalkForwardResult | None = None
+    # The out-of-sample trades themselves. The Vault used to keep only
+    # aggregates and a curve, which ranks a strategy but cannot answer a
+    # question about it without re-simulating the whole window.
+    trades: list = field(default_factory=list)
 
 
 EQUITY_CURVE_MAX_POINTS = 500
@@ -464,6 +468,7 @@ def run_phase_4_robustness(
                 equity_is=serialize_equity_curve(is_df, candidate.result.equity_curve) if candidate.result else None,
                 equity_oos=serialize_equity_curve(oos_df, oos_result.equity_curve),
                 walk_forward=walk_forward,
+                trades=list(oos_result.trades),
             )
         )
 

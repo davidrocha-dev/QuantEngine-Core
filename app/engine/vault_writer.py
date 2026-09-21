@@ -6,7 +6,10 @@ import json
 
 from sqlalchemy.orm import Session
 
+import pandas as pd
+
 from app.engine.hash_id import assign_hash_id
+from app.engine.trade_log import replace_trades
 from app.engine.phases import VaultCandidate
 from app.engine.scoring import classify_archetype, compute_grade, compute_score
 from app.models import Strategy
@@ -31,7 +34,7 @@ def vault_candidate_to_row(candidate: VaultCandidate, asset: str, timeframe: str
         win_rate_pct=candidate.stats_oos.win_rate * 100,
         avg_hold_hours=candidate.stats_oos.avg_hold_hours,
         score=score,
-        grade=compute_grade(score),
+        grade=compute_grade(score, candidate.stats_oos.trade_count),
         genome_json=json.dumps(candidate.genome.to_dict()),
         equity_is=json.dumps(candidate.equity_is) if candidate.equity_is else None,
         equity_oos=json.dumps(candidate.equity_oos) if candidate.equity_oos else None,
@@ -54,7 +57,12 @@ def _unique_hash_id(session: Session, candidate: VaultCandidate, taken: set[str]
 
 
 def write_vault_candidates(
-    session: Session, candidates: list[VaultCandidate], asset: str, timeframe: str, data_source: str = "dukascopy"
+    session: Session,
+    candidates: list[VaultCandidate],
+    asset: str,
+    timeframe: str,
+    data_source: str = "dukascopy",
+    oos_bars: pd.DataFrame | None = None,
 ) -> list[Strategy]:
     taken: set[str] = set()
     for candidate in candidates:
@@ -62,4 +70,15 @@ def write_vault_candidates(
     rows = [vault_candidate_to_row(c, asset, timeframe, data_source) for c in candidates]
     session.add_all(rows)
     session.commit()
+
+    # The trades behind each row, so the strategy can be interrogated
+    # later without re-simulating it. `oos_bars` is optional because a
+    # caller that does not have them should still be able to write the
+    # Vault rows themselves.
+    if oos_bars is not None:
+        for candidate, row in zip(candidates, rows):
+            if candidate.trades:
+                replace_trades(session, row.id, candidate.trades, oos_bars)
+        session.commit()
+
     return rows

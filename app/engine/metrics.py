@@ -85,14 +85,39 @@ def cagr_pct(equity_curve: np.ndarray, initial_balance: float, bar_count: int, t
     return float(min(max((total_return ** (1 / years) - 1) * 100, -100.0), MAX_REPORTED_CAGR_PCT))
 
 
-def sharpe_ratio(equity_curve: np.ndarray, bars_per_year: float) -> float:
+def sharpe_ratio(equity_curve: np.ndarray, timestamps: pd.DatetimeIndex | None = None) -> float:
+    """Annualised Sharpe on **daily** returns.
+
+    This used to run on bar-by-bar returns annualised by bars-per-year.
+    That is defensible arithmetic and it is not the number anyone else
+    means by "Sharpe": a strategy holding one position at a time leaves
+    the equity curve flat through most bars, so the series being measured
+    was mostly zeros, and the figure was not comparable to a Sharpe quoted
+    anywhere else in the industry.
+
+    Daily closes, annualised by sqrt(252), is the convention. It is also
+    what `portfolio.daily_returns` already used for correlation, so the
+    two halves of the product now measure risk the same way.
+    """
     if len(equity_curve) < 3:
         return 0.0
-    returns = np.diff(equity_curve) / equity_curve[:-1]
+
+    if timestamps is None or len(timestamps) != len(equity_curve):
+        # No calendar to resample against: fall back to per-observation
+        # returns rather than inventing dates.
+        returns = np.diff(equity_curve) / equity_curve[:-1]
+    else:
+        # Equity is a step function between trades, so the last value of
+        # each day is that day's close.
+        daily = pd.Series(equity_curve, index=pd.DatetimeIndex(timestamps)).resample("1D").last().dropna()
+        if len(daily) < 3:
+            return 0.0
+        returns = daily.pct_change().dropna().to_numpy()
+
     returns = returns[np.isfinite(returns)]
     if len(returns) < 2 or returns.std() == 0:
         return 0.0
-    return float(returns.mean() / returns.std() * np.sqrt(bars_per_year))
+    return float(returns.mean() / returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR))
 
 
 def information_coefficient_information_ratio(trades: list[Trade]) -> float:
@@ -129,7 +154,7 @@ def compute_trade_stats(result: BacktestResult, df: pd.DataFrame, initial_balanc
         trade_count=len(result.trades),
         profit_factor=profit_factor(result.trades),
         win_rate=win_rate(result.trades),
-        sharpe_ratio=sharpe_ratio(result.equity_curve, bars_per_year),
+        sharpe_ratio=sharpe_ratio(result.equity_curve, pd.DatetimeIndex(df["timestamp"]) if "timestamp" in df else None),
         max_dd_pct=max_drawdown_pct(result.equity_curve),
         net_profit_pct=net_profit_pct(result.equity_curve, initial_balance),
         cagr_pct=cagr_pct(result.equity_curve, initial_balance, len(df), timeframe),
