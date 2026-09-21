@@ -14,6 +14,7 @@ manual compile — instead of claiming a deploy that did not occur.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -133,4 +134,39 @@ def install_ea(filename: str, source: str, compile_after_install: bool = True) -
             f"Installed into {len(result.installed_paths)} terminal(s). MetaEditor did not compile it "
             "(not found or reported errors) — open the file in MetaEditor and press F7."
         )
+    return result
+
+
+def install_compiled_ea(filename: str, content: bytes, expected_sha256: str | None = None) -> InstallResult:
+    """Installs an already-compiled `.ex5` — REQ-MKT-1.3.
+
+    A Marketplace subscription hands over the compiled EA and never the
+    source, so there is nothing to compile here and MetaEditor is not
+    involved. The checksum is verified before anything is written: this
+    binary arrived over the network and is about to be given permission
+    to trade, which is not a moment to skip a two-line check.
+    """
+    if not filename.lower().endswith(".ex5"):
+        return InstallResult(detail="Only compiled .ex5 files can be installed this way.")
+    if expected_sha256:
+        actual = hashlib.sha256(content).hexdigest()
+        if actual != expected_sha256:
+            return InstallResult(detail="Checksum mismatch - the download was corrupted or tampered with.")
+
+    targets = terminal_data_dirs()
+    if not targets:
+        return InstallResult(detail="No MetaTrader 5 terminal data directory was found on this machine.")
+
+    result = InstallResult()
+    for terminal in targets:
+        experts_dir = terminal / EXPERTS_SUBDIR
+        experts_dir.mkdir(parents=True, exist_ok=True)
+        destination = experts_dir / filename
+        destination.write_bytes(content)
+        result.installed_paths.append(str(destination))
+        # It is already compiled: from MT5's point of view it is ready to
+        # attach to a chart as soon as the terminal rescans Experts.
+        result.compiled_paths.append(str(destination))
+
+    result.detail = f"Installed into {len(result.installed_paths)} terminal(s)."
     return result

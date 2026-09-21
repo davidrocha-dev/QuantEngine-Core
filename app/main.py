@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 
 from app.broker.mt5_bridge import MT5Bridge
 from app.broker import pilot
-from app.broker.mt5_install import install_ea
+from app.broker.mt5_install import install_compiled_ea, install_ea
 from app.codegen.mql5 import GeneratedEa, UnsupportedGeneError, generate_ea
 from app.config import get_config, set_auto_backup_before_updates, set_built_in_data_only
 from app.data.provider import get_historical_bars
@@ -1558,3 +1558,36 @@ async def events(websocket: WebSocket) -> None:
         pass
     finally:
         _ws_clients.discard(websocket)
+
+
+class MarketplaceInstallRequest(BaseModel):
+    """A compiled EA bought on the Marketplace - REQ-MKT-1.3.
+
+    The bytes arrive base64-encoded because they travel as JSON from the
+    shell, which is the only process holding the licence key needed to
+    fetch them. The engine is the only process that knows where MT5 keeps
+    its Experts folder, so the two halves meet here.
+    """
+
+    filename: str
+    content_base64: str
+    sha256: str | None = None
+
+
+@app.post("/marketplace/install")
+def post_marketplace_install(body: MarketplaceInstallRequest) -> dict:
+    import base64
+    import binascii
+
+    try:
+        content = base64.b64decode(body.content_base64, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise HTTPException(status_code=422, detail="The EA payload is not valid base64.") from error
+
+    result = install_compiled_ea(body.filename, content, body.sha256)
+    if not result.installed_paths:
+        raise HTTPException(status_code=409, detail=result.detail)
+    return {
+        "installed_paths": result.installed_paths,
+        "detail": result.detail,
+    }
