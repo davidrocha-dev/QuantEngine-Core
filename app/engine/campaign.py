@@ -16,7 +16,11 @@ from sqlalchemy.orm import Session
 
 from app.engine.fitness import PHASE_0_MIN_TRADES
 from app.engine.metrics import TradeStats
+from app.config import get_config
 from app.engine.control import CampaignControl, CampaignPaused
+from app.engine.failure_signal import load as load_gene_outcomes
+from app.engine.failure_signal import record_screening
+from app.engine.failure_signal import save as save_gene_outcomes
 from app.engine.phases import (
     DEFAULT_MAX_BREEDING_POPULATION,
     IS_FRACTION,
@@ -283,14 +287,22 @@ def run_campaign(
         phase_0_survivors: list[CandidateResult] = []
         drawn = 0
         max_draws = config.population_size * MAX_SCREENING_ROUNDS
+        # What screening rejects is the only large sample of failure this
+        # product ever sees, and it was being thrown away. Two counters
+        # per gene turn it into something the next campaign can use.
+        outcomes = load_gene_outcomes(get_config().data_dir)
         while drawn < max_draws:
             population = random_population(gene_pool, config.population_size, config.gene_weights or None)
             phase_0 = run_phase_0_screening(population, is_df, gene_pool, max_workers=config.max_workers, **eval_kwargs)
+            record_screening(outcomes, population, [c.genome for c in phase_0.survivors])
             phase_0_survivors.extend(phase_0.survivors)
             drawn += config.population_size
             _set_survivors_per_phase(session, campaign_id, PHASE_SCREENING, len(phase_0_survivors))
             if len(phase_0_survivors) >= MIN_BREEDING_POPULATION:
                 break
+
+        outcomes.campaigns += 1
+        save_gene_outcomes(get_config().data_dir, outcomes)
 
         if not phase_0_survivors:
             campaign.status = "cancelled"

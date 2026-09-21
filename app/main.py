@@ -209,6 +209,28 @@ def _spread_points(costs: dict, symbol: str, instrument) -> float:
     return float(quote.spread_points * instrument.point_divisor)
 
 
+def _learned_gene_weights() -> dict[str, float]:
+    """Smart Mode's weights, tempered by what keeps failing screening.
+
+    Two signals, and they answer different questions. Smart Mode asks
+    which genes appear in strategies that made it into the Vault; the
+    failure counters ask which genes keep being drawn and keep not
+    surviving. A gene can be absent from the Vault because nobody tried
+    it or because it has been tried thousands of times and never works,
+    and only the second signal can tell those apart.
+
+    Both live under the Smart Mode toggle. Someone who turned learning
+    off meant all of it.
+    """
+    from app.engine.failure_signal import load as load_gene_outcomes
+    from app.engine.failure_signal import penalties
+
+    weights = dict(smart_mode.load(get_config().data_dir).weights)
+    for key, penalty in penalties(load_gene_outcomes(get_config().data_dir)).items():
+        weights[key] = weights.get(key, 1.0) * penalty
+    return weights
+
+
 def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> CampaignConfig:
     """Translates the Settings screen into engine parameters. Everything the
     user configures — risk, costs, cores, POWER, HIGHER TF — has to reach the
@@ -250,7 +272,7 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
         data_source="bundled" if get_config().built_in_data_only else "dukascopy",
         # SMART MODE (Settings → Campaign) biases which genes get drawn,
         # using what the Vault has already shown to work.
-        gene_weights=smart_mode.load(get_config().data_dir).weights if campaign_settings["smart_mode"] else {},
+        gene_weights=_learned_gene_weights() if campaign_settings["smart_mode"] else {},
         htf_df=htf_df,
         news_events=news_events,
     )
@@ -1051,6 +1073,88 @@ def _revalidate(strategy_id: str, full: bool) -> dict:
         session.commit()
 
     return {"status": "ok", **result.to_dict()}
+
+
+@app.post("/vault/recompute")
+def recompute_vault(limit: int = 500) -> dict:
+    """Bring every Vault row onto the current scoring basis.
+
+    Scores are not comparable across versions of the formula, and the
+    Vault is sorted by score - so a Vault holding rows from two bases is
+    a list that cannot be read. Strategies bred before the sample-size
+    component, the daily Sharpe or the trade log carry none of them, and
+    REFRESH fixes one strategy at a time.
+
+    This is REFRESH over all of them. It re-runs each stored genome
+    against today's data; it never re-optimises anything, because
+    re-fitting a strategy until it looks good again is how a Vault fills
+    with strategies that have only ever been fitted.
+
+    Slow by nature - it is a backtest per strategy - which is why it
+    reports what it did rather than pretending to be instant.
+    """
+    settings = load_settings(get_config().settings_path)
+    engine = make_engine(get_config().vault_db_path)
+    gene_pool = GenePoolConfig.load(get_config().gene_pool_path)
+
+    updated: list[dict] = []
+    skipped: list[dict] = []
+
+    with Session(engine) as session:
+        strategies = list(
+            session.scalars(
+                select(Strategy).where(Strategy.deleted_at.is_(None)).order_by(Strategy.score.desc()).limit(
+                    max(1, min(limit, 2000))
+                )
+            )
+        )
+
+        # Bars are loaded once per market rather than once per strategy:
+        # a Vault of two hundred EURUSD strategies would otherwise read
+        # and resample the same year of history two hundred times.
+        bars_by_market: dict[tuple[str, str], object] = {}
+
+        for strategy in strategies:
+            market = (strategy.asset, strategy.timeframe)
+            try:
+                if market not in bars_by_market:
+                    bars_by_market[market] = _load_bars(
+                        strategy.asset, strategy.timeframe, settings["campaign"]["history_depth_years"]
+                    )
+                df = bars_by_market[market]
+                if df is None or len(df) < int(MIN_IS_BARS / IS_FRACTION):
+                    skipped.append({"strategy_id": strategy.id, "reason": "not enough history cached"})
+                    continue
+
+                config = build_campaign_config(settings, strategy.asset, strategy.timeframe)
+                before = strategy.score
+                result = refresh_strategy_engine(strategy, df, gene_pool, config)
+                session.commit()
+                updated.append(
+                    {
+                        "strategy_id": strategy.id,
+                        "score_before": before,
+                        "score_after": strategy.score,
+                        "trades": result.trades,
+                    }
+                )
+            except Exception as error:  # one bad row must not stop the rest
+                session.rollback()
+                skipped.append({"strategy_id": strategy.id, "reason": str(error)})
+
+    moved = [row for row in updated if row["score_before"] != row["score_after"]]
+    return {
+        "status": "ok",
+        "recomputed": len(updated),
+        "skipped": len(skipped),
+        "changed": len(moved),
+        "detail": (
+            f"Recomputed {len(updated)} strategies on the current scoring basis; {len(moved)} changed score."
+            + (f" {len(skipped)} could not be re-run." if skipped else "")
+        ),
+        "changes": sorted(moved, key=lambda row: abs((row["score_after"] or 0) - (row["score_before"] or 0)), reverse=True)[:25],
+        "skipped_detail": skipped[:25],
+    }
 
 
 @app.post("/vault/{strategy_id}/refresh")
