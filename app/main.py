@@ -175,7 +175,17 @@ HIGHER_TF_BY_TIMEFRAME = {"M15": "H1", "M30": "H1", "H1": "H4", "H2": "D1", "H4"
 
 # Contract size per lot, used to price Settings → Costs commission against
 # the position that fixed-fractional sizing implies.
-CONTRACT_SIZE_BY_CATEGORY = {"fx": 100_000.0, "metal": 100.0, "index": 1.0}
+# Contract size only scales the commission charge (lots = risk / (stop x
+# contract size)); the P&L itself comes from R multiples, so an imperfect
+# value here cannot distort a return. Smaller is the conservative
+# direction, because it implies more lots and therefore more commission.
+CONTRACT_SIZE_BY_CATEGORY = {
+    "fx": 100_000.0,
+    "metal": 100.0,
+    "index": 1.0,
+    "commodity": 100.0,  # barrels per lot, on the cautious side of broker practice
+    "crypto": 1.0,       # one coin per lot
+}
 
 
 def _spread_points(costs: dict, symbol: str, instrument) -> float:
@@ -1256,7 +1266,88 @@ def get_data_config() -> dict:
 def get_instruments() -> dict:
     # REQ-SET-1.1 — Settings → Target Markets: full catalog, not just the
     # pre-bundled subset (/data/config's bundled_symbols).
-    return {"symbols": list(INSTRUMENTS.keys()), "timeframes": list(TIMEFRAMES)}
+    from app.data.custom_instruments import all_instruments
+
+    instruments = all_instruments(get_config().data_dir)
+    return {
+        "symbols": list(instruments.keys()),
+        "timeframes": list(TIMEFRAMES),
+        "instruments": [
+            {
+                "symbol": row.symbol,
+                "category": row.category,
+                "custom": row.symbol not in INSTRUMENTS,
+            }
+            for row in instruments.values()
+        ],
+    }
+
+
+class CustomInstrumentProbe(BaseModel):
+    dukascopy_code: str
+    point_divisor: int
+
+
+class CustomInstrumentRequest(BaseModel):
+    symbol: str
+    dukascopy_code: str
+    point_divisor: int
+    category: str = "fx"
+
+
+@app.post("/markets/custom/probe")
+async def probe_custom_instrument(body: CustomInstrumentProbe) -> dict:
+    """Ask the feed what this code and divisor actually give.
+
+    The app shows the resulting price before anything is saved, so the
+    user confirms a number they recognise instead of a divisor they had
+    to guess. A wrong divisor does not fail - it silently backtests at the
+    wrong order of magnitude.
+    """
+    from app.data.custom_instruments import InstrumentRefused, probe
+
+    try:
+        result = await probe(body.dukascopy_code.strip(), body.point_divisor)
+    except InstrumentRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {
+        "code": result.code,
+        "point_divisor": result.point_divisor,
+        "ticks": result.ticks,
+        "median_price": result.median_price,
+        "first_price": result.first_price,
+        "last_price": result.last_price,
+        "hour": result.hour,
+        "usable": result.ticks > 0,
+        "detail": result.detail,
+    }
+
+
+@app.post("/markets/custom")
+def add_custom_instrument(body: CustomInstrumentRequest) -> dict:
+    from app.data.custom_instruments import InstrumentRefused, save
+
+    try:
+        instrument = save(
+            get_config().data_dir, body.symbol, body.dukascopy_code, body.point_divisor, body.category
+        )
+    except InstrumentRefused as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    return {
+        "symbol": instrument.symbol,
+        "dukascopy_code": instrument.dukascopy_code,
+        "point_divisor": instrument.point_divisor,
+        "category": instrument.category,
+    }
+
+
+@app.delete("/markets/custom/{symbol}")
+def delete_custom_instrument(symbol: str) -> dict:
+    from app.data.custom_instruments import remove
+
+    if not remove(get_config().data_dir, symbol.upper()):
+        raise HTTPException(status_code=404, detail=f"No custom instrument called {symbol}.")
+    return {"removed": symbol.upper()}
 
 
 @app.post("/data/built-in-only")
