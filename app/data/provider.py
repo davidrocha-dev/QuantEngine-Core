@@ -23,6 +23,15 @@ _RESAMPLE_FREQ = {
 }
 
 
+# How long one bar lasts. Anything that has to turn a bar index back into
+# a wall-clock window - tick verification, for one - needs this, and a
+# second copy of it elsewhere would be a second thing to get wrong.
+TIMEFRAME_MINUTES = {
+    "M1": 1, "M5": 5, "M15": 15, "M30": 30,
+    "H1": 60, "H2": 120, "H4": 240, "D1": 1440,
+}
+
+
 def resample_bars(bars: pd.DataFrame, timeframe: str) -> pd.DataFrame:
     """Aggregates M1 OHLCV bars into `timeframe` bars (left-labelled, like
     MT5: a bar's timestamp is its open time). Empty periods (weekends,

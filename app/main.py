@@ -22,7 +22,7 @@ from app.broker import pilot
 from app.broker.mt5_install import install_compiled_ea, install_ea
 from app.codegen.mql5 import GeneratedEa, UnsupportedGeneError, generate_ea
 from app.config import get_config, set_auto_backup_before_updates, set_built_in_data_only
-from app.data.provider import get_historical_bars
+from app.data.provider import TIMEFRAME_MINUTES, get_historical_bars
 from app.data.sync import DeltaSyncRunner, SyncState
 from app.data.symbols import BUNDLED_SYMBOLS, INSTRUMENTS, TIMEFRAMES, get_instrument
 from app.db import make_engine
@@ -45,7 +45,8 @@ from app.engine.purge import (
 from app.engine.campaign_estimate import estimate_campaign_minutes
 from app.logging_setup import configure_crash_reporting, configure_logging, log_dir
 from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
-from app.engine.phases import IS_FRACTION
+from app.engine.backtest import simulate_trades
+from app.engine.phases import IS_FRACTION, split_is_oos
 from app.engine.auto_deploy import replace_degraded
 from app.engine.health import auto_promote, check_all_brokers, ladder, promote, risk_shares, run_health_check
 from app.engine.portfolio import compute_health
@@ -948,6 +949,128 @@ def reassess_strategy(strategy_id: str) -> dict:
     # gates, re-scored. `still_passes` says whether it would be approved
     # if it were bred today.
     return _revalidate(strategy_id, full=True)
+
+
+# design.md Part C - tick mode. Bounded on purpose: this downloads raw
+# ticks from the feed while a user waits, and an unbounded verification of
+# a strategy with 900 trades would sit there for an hour. The most recent
+# trades are the ones worth checking anyway.
+TICK_VERIFY_MAX_TRADES = 60
+TICK_VERIFY_MAX_HOURS = 400
+
+
+@app.post("/vault/{strategy_id}/tick-verify")
+async def tick_verify_strategy(strategy_id: str, max_trades: int = TICK_VERIFY_MAX_TRADES) -> dict:
+    """Re-resolves a strategy's exits against raw ticks.
+
+    The bar backtester cannot see inside a bar, so when one bar spans both
+    the stop and the target it assumes the stop came first. This measures
+    how often that guess was wrong, and what the stops actually filled at
+    - a -1R stop that really filled at -2R is invisible in bar data and is
+    the kind of thing that empties an account while the curve looks fine.
+    """
+    from app.data.ticks import TickStore, concat_hours, hours_covering
+    from app.engine.tick_verify import verify_trades
+
+    settings = load_settings(get_config().settings_path)
+    engine = make_engine(get_config().vault_db_path)
+
+    with Session(engine) as session:
+        strategy = session.get(Strategy, strategy_id)
+        if strategy is None or strategy.deleted_at is not None:
+            raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+        asset, timeframe = strategy.asset, strategy.timeframe
+        genome = Genome.from_dict(json.loads(strategy.genome_json))
+
+    try:
+        config = build_campaign_config(settings, asset, timeframe)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    df = _load_bars(asset, timeframe, settings["campaign"]["history_depth_years"])
+    if df.empty:
+        raise HTTPException(status_code=409, detail=f"No {timeframe} history cached for {asset}.")
+
+    # The out-of-sample slice is the half anyone actually judges a
+    # strategy on, so it is the half worth verifying.
+    _, oos_df = split_is_oos(df, IS_FRACTION)
+    gene_pool = GenePoolConfig.load(get_config().gene_pool_path)
+    result = simulate_trades(
+        oos_df,
+        genome,
+        gene_pool,
+        initial_balance=config.initial_balance,
+        point_size=config.point_size,
+        cost_points=config.cost_points,
+        commission_per_lot=config.commission_per_lot,
+        contract_size=config.contract_size,
+        risk_pct=config.risk_pct,
+    )
+    trades = result.trades[-max(1, min(max_trades, TICK_VERIFY_MAX_TRADES)):]
+    if not trades:
+        return {
+            "status": "ok", "strategy_id": strategy_id, "trades_checked": 0,
+            "detail": "This strategy made no trades in its out-of-sample window.",
+        }
+
+    bar_duration = timedelta(minutes=TIMEFRAME_MINUTES.get(timeframe, 60))
+    windows = [
+        (
+            pd.Timestamp(oos_df["timestamp"].iloc[trade.entry_idx]).to_pydatetime(),
+            pd.Timestamp(oos_df["timestamp"].iloc[trade.exit_idx]).to_pydatetime() + bar_duration,
+        )
+        for trade in trades
+    ]
+    hours = hours_covering(windows)
+    if len(hours) > TICK_VERIFY_MAX_HOURS:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"These {len(trades)} trades span {len(hours)} hours of ticks, over the "
+                f"{TICK_VERIFY_MAX_HOURS}-hour limit. Verify fewer trades at a time."
+            ),
+        )
+
+    store = TickStore(get_config())
+    try:
+        fetched = await store.ensure(asset, hours)
+    except Exception as exc:  # the feed is external and throttles hard
+        raise HTTPException(status_code=502, detail=f"Could not fetch ticks: {exc}") from exc
+    finally:
+        await store.aclose()
+
+    ticks = concat_hours(fetched)
+    verification = verify_trades(
+        trades, oos_df, ticks, bar_duration=bar_duration,
+        cost_points=config.cost_points, point_size=config.point_size,
+    )
+
+    return {
+        "status": "ok",
+        "strategy_id": strategy_id,
+        "trades_checked": verification.trades_checked,
+        "ambiguous_trades": verification.ambiguous_trades,
+        "changed_trades": verification.changed_trades,
+        "agreement_pct": round(verification.agreement_pct, 1),
+        "r_bars": round(verification.return_pct_bars, 2),
+        "r_ticks": round(verification.return_pct_ticks, 2),
+        "ticks_used": verification.ticks_used,
+        "hours_fetched": len(hours),
+        "detail": verification.detail,
+        "sample": [
+            {
+                "entry_time": row.entry_time.isoformat(),
+                "direction": row.direction,
+                "bar_exit": row.bar_exit,
+                "tick_exit": row.tick_exit,
+                "ambiguous": row.ambiguous,
+                "r_bar": round(row.r_multiple_bar, 2),
+                "r_tick": round(row.r_multiple_tick, 2),
+            }
+            for row in verification.resolutions
+            if row.changed or row.ambiguous
+        ][:20],
+    }
 
 
 @app.post("/vault/{strategy_id}/parity-test")
