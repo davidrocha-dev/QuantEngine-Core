@@ -244,6 +244,27 @@ def _learned_gene_weights() -> dict[str, float]:
     return weights
 
 
+def _higher_timeframe(timeframe: str, campaign_settings: dict) -> str | None:
+    """The timeframe a HIGHER TF filter reads its context from.
+
+    A manual choice is only honoured when it is actually higher than the
+    one being traded. The screen offers nothing else, but the value is
+    stored in settings.json and survives a change of trading timeframe -
+    breed on H1 with a manual H4 context, drop to M15, and the stored H4
+    is still above it; breed on M15 with H1 and move up to H4 and it is
+    not. Loading a *lower* timeframe as "higher context" would not fail,
+    it would quietly resample the wrong series into every gene that
+    consults it, so an out-of-order value falls back to the mapping.
+    """
+    manual = campaign_settings.get("higher_tf_manual_timeframe")
+    automatic = HIGHER_TF_BY_TIMEFRAME.get(timeframe)
+    if campaign_settings.get("higher_tf_mode") != "MANUAL" or not manual:
+        return automatic
+    if timeframe not in TIMEFRAMES or manual not in TIMEFRAMES:
+        return automatic
+    return manual if TIMEFRAMES.index(manual) > TIMEFRAMES.index(timeframe) else automatic
+
+
 def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> CampaignConfig:
     """Translates the Settings screen into engine parameters. Everything the
     user configures — risk, costs, cores, POWER, HIGHER TF — has to reach the
@@ -255,11 +276,7 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
 
     htf_df = None
     if campaign_settings["higher_tf_enabled"]:
-        htf_timeframe = (
-            campaign_settings["higher_tf_manual_timeframe"]
-            if campaign_settings["higher_tf_mode"] == "MANUAL" and campaign_settings["higher_tf_manual_timeframe"]
-            else HIGHER_TF_BY_TIMEFRAME.get(timeframe)
-        )
+        htf_timeframe = _higher_timeframe(timeframe, campaign_settings)
         if htf_timeframe:
             htf_df = _load_bars(symbol, htf_timeframe, campaign_settings["history_depth_years"])
 
