@@ -23,6 +23,7 @@ from app.engine.hash_id import assign_hash_id
 from app.engine.metrics import TradeStats, compute_trade_stats
 from app.engine.monte_carlo import RobustnessResult, draw_noise_params, evaluate_robustness
 from app.engine.news_filter import EconomicEvent, NewsMode
+from app.engine.control import CampaignControl  # noqa: F401 - used in annotations
 from app.engine.resources import limit_worker_threads, max_parallel_workers
 from app.engine.walk_forward import WalkForwardResult, run_walk_forward
 from app.genome.gene_pool import GenePoolConfig
@@ -217,6 +218,7 @@ def run_generational_phase(
     start_generation: int = 0,
     max_workers: int | None = None,
     max_population: int = DEFAULT_MAX_BREEDING_POPULATION,
+    control: "CampaignControl | None" = None,
     **eval_kwargs,
 ) -> PhaseOutcome:
     """Iterated select -> crossover -> mutate -> evaluate loop within one
@@ -279,6 +281,14 @@ def run_generational_phase(
             if on_generation_complete is not None:
                 on_generation_complete(generation, population)
 
+            # The one moment where stopping is free: the generation has
+            # been evaluated and checkpointed, so a pause loses nothing
+            # and a resume starts from a population that really existed.
+            if control is not None:
+                control.checkpoint()  # raises CampaignPaused if asked to stop
+                if control.take_skip():
+                    break
+
     return PhaseOutcome(passed=True, survivors=population[:top_n])
 
 
@@ -292,13 +302,14 @@ def run_phase_1_stability(
     start_generation: int = 0,
     max_workers: int | None = None,
     max_population: int = DEFAULT_MAX_BREEDING_POPULATION,
+    control: "CampaignControl | None" = None,
     **eval_kwargs,
 ) -> PhaseOutcome:
     """REQ-ENGINE-3.3 — Tribe A, ranked by F1 = (Net Profit / Max DD%) × Win Rate × Sharpe."""
     return run_generational_phase(
         phase_0_survivors, fitness_f1_stability, "A", gene_pool, df, generations, top_n,
         on_generation_complete=on_generation_complete, start_generation=start_generation,
-        max_workers=max_workers, max_population=max_population, **eval_kwargs,
+        max_workers=max_workers, max_population=max_population, control=control, **eval_kwargs,
     )
 
 
@@ -312,6 +323,7 @@ def run_phase_2_expansion(
     start_generation: int = 0,
     max_workers: int | None = None,
     max_population: int = DEFAULT_MAX_BREEDING_POPULATION,
+    control: "CampaignControl | None" = None,
     **eval_kwargs,
 ) -> PhaseOutcome:
     """REQ-ENGINE-3.4 — Tribe B, ranked by F2 = CAGR% × Profit Factor × Payoff Ratio.
@@ -319,7 +331,7 @@ def run_phase_2_expansion(
     return run_generational_phase(
         phase_0_survivors, fitness_f2_expansion, "B", gene_pool, df, generations, top_n,
         on_generation_complete=on_generation_complete, start_generation=start_generation,
-        max_workers=max_workers, max_population=max_population, **eval_kwargs,
+        max_workers=max_workers, max_population=max_population, control=control, **eval_kwargs,
     )
 
 
@@ -330,6 +342,7 @@ def run_phase_3_hybridization(
     df: pd.DataFrame,
     num_children: int,
     max_workers: int | None = None,
+    control: "CampaignControl | None" = None,
     **eval_kwargs,
 ) -> PhaseOutcome:
     """REQ-ENGINE-3.5 — crossover top Phase 1 x Phase 2 individuals. Fails

@@ -26,6 +26,7 @@ from app.data.provider import TIMEFRAME_MINUTES, get_historical_bars
 from app.data.sync import DeltaSyncRunner, SyncState
 from app.data.symbols import BUNDLED_SYMBOLS, INSTRUMENTS, TIMEFRAMES, get_instrument
 from app.db import make_engine
+from app.engine.control import CampaignControl, CampaignPaused
 from app.engine.campaign import (
     MIN_HISTORY_DAYS,
     MIN_IS_BARS,
@@ -284,7 +285,10 @@ def _run_campaign_background(
         settings = load_settings(get_config().settings_path)
         df = _load_bars(symbol, timeframe, settings["campaign"]["history_depth_years"])
         with Session(engine) as session:
-            outcome = run_campaign(session, campaign_id, df, gene_pool, config, resume=resume, on_generation=on_generation)
+            outcome = run_campaign(
+                session, campaign_id, df, gene_pool, config,
+                resume=resume, on_generation=on_generation, control=_campaign_control,
+            )
         # REQ-SET-7.1/7.2/7.4 — a campaign runs for tens of minutes, so its
         # ending is announced on whichever channels are enabled. The OS
         # notification is the renderer's (Electron owns that API); Telegram
@@ -301,6 +305,19 @@ def _run_campaign_background(
                  "phase": None, "generation": None, "tribe": None, "fitness": None,
                  "survivors_per_phase": {}, "detail": outcome.fail_reason}
             )
+    except CampaignPaused:
+        # Not a failure. The generation that was running finished and was
+        # checkpointed; the campaign stops there and resumes from it.
+        with Session(engine) as session:
+            campaign = session.get(Campaign, campaign_id)
+            if campaign is not None:
+                campaign.status = "paused"
+                session.commit()
+        _emit_event_threadsafe(
+            {"type": "campaign_paused", "campaign_id": campaign_id, "status": "paused",
+             "phase": None, "generation": None, "tribe": None, "fitness": None,
+             "survivors_per_phase": {}, "detail": "Paused after the current generation."}
+        )
     except Exception:
         import traceback
 
@@ -312,7 +329,13 @@ def _run_campaign_background(
                 session.commit()
     finally:
         _active_campaign_id = None
+        _campaign_control.clear()
 
+
+# PAUSE and SKIP set flags here; the phase loop reads them at a
+# generation boundary. One object for the process, because only one
+# campaign runs at a time (see the guard in launch_campaign).
+_campaign_control = CampaignControl()
 
 _sync_state = SyncState()
 
@@ -667,15 +690,41 @@ def discard_crashed_campaign(campaign_id: str) -> dict:
 
 @app.post("/campaign/pause")
 def pause_campaign() -> dict:
-    # The GA loop (app/engine/phases.py) has no cooperative-cancellation
-    # hook to pause mid-generation — honest "not supported" beats a pause
-    # button that silently does nothing.
-    return {"status": "not_supported", "detail": "Pausing mid-run isn't implemented yet — the campaign keeps running."}
+    """REQ-BREED-1.2 — stop after the current generation, keep the work.
+
+    Nothing is interrupted mid-generation: that would throw away the work
+    in flight and leave the checkpoint describing a population that no
+    longer exists. The flag is read at the next generation boundary, so a
+    pause costs at most one generation of waiting and resumes from a
+    checkpoint that was always going to be written.
+    """
+    if _active_campaign_id is None:
+        raise HTTPException(status_code=409, detail="No campaign is running.")
+    _campaign_control.request_pause()
+    return {
+        "status": "pausing",
+        "campaign_id": _active_campaign_id,
+        "detail": "Pausing after the current generation finishes. Resume picks up from there.",
+    }
 
 
 @app.post("/campaign/skip")
 def skip_campaign() -> dict:
-    return {"status": "not_supported", "detail": "Skipping a phase mid-run isn't implemented yet."}
+    """REQ-BREED-1.2 — end the current phase early and move on.
+
+    The phase keeps whatever it has evolved so far and hands it to the
+    next one, which is what someone means when a tribe has clearly
+    stopped improving. It applies to the current phase only; skipping
+    every remaining phase with one click is not what anyone wants.
+    """
+    if _active_campaign_id is None:
+        raise HTTPException(status_code=409, detail="No campaign is running.")
+    _campaign_control.request_skip()
+    return {
+        "status": "skipping",
+        "campaign_id": _active_campaign_id,
+        "detail": "Ending this phase after the current generation; its survivors carry forward.",
+    }
 
 
 def _active_genes(genome_json: str) -> list[dict]:
@@ -1085,7 +1134,22 @@ async def tick_verify_strategy(strategy_id: str, max_trades: int = TICK_VERIFY_M
 
 @app.post("/vault/{strategy_id}/parity-test")
 def parity_test_strategy(strategy_id: str) -> dict:
-    return {"status": "not_supported", "detail": "Parity test isn't implemented yet.", "strategy_id": strategy_id}
+    """Is the EA executing what was approved? - guide_parity_test.md.
+
+    Narrower than a health check on purpose. A decayed edge is a market
+    problem and the answer is to retire the strategy; an EA on the wrong
+    chart, on the wrong timeframe, or with algo trading switched off is an
+    operator problem and the strategy was never wrong. Both look like
+    disappointing live results, and the fixes are opposites.
+    """
+    from app.engine.parity import check_parity
+
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        strategy = session.get(Strategy, strategy_id)
+        if strategy is None or strategy.deleted_at is not None:
+            raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+        return {"status": "ok", **check_parity(session, strategy).to_dict()}
 
 
 @app.get("/portfolios")

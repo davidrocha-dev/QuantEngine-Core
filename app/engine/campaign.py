@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.engine.fitness import PHASE_0_MIN_TRADES
 from app.engine.metrics import TradeStats
+from app.engine.control import CampaignControl, CampaignPaused
 from app.engine.phases import (
     DEFAULT_MAX_BREEDING_POPULATION,
     IS_FRACTION,
@@ -202,6 +203,7 @@ def run_campaign(
     config: CampaignConfig,
     resume: bool = False,
     on_generation: Callable[[int, int, list[CandidateResult]], None] | None = None,
+    control: CampaignControl | None = None,
 ) -> PhaseOutcome:
     """Runs Phase 0 -> 1 -> 2 -> 3 -> 4 -> Vault write end to end,
     checkpointing after every Phase 1/2 generation. `resume=True` reloads
@@ -265,7 +267,7 @@ def run_campaign(
         "news_events": config.news_events or None,
         "news_mode": config.news_mode,
     }
-    phase_kwargs = {"max_workers": config.max_workers}
+    phase_kwargs = {"max_workers": config.max_workers, "control": control}
 
     loaded = load_checkpoint(campaign) if resume else None
 

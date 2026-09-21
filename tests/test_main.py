@@ -226,9 +226,29 @@ def test_campaign_start_409_when_already_running(tmp_path, monkeypatch):
     assert response.status_code == 409
 
 
-def test_campaign_pause_and_skip_are_honest_about_being_unsupported():
-    assert client.post("/campaign/pause").json()["status"] == "not_supported"
-    assert client.post("/campaign/skip").json()["status"] == "not_supported"
+def test_pausing_when_nothing_is_running_says_so(monkeypatch):
+    # Both of these used to answer "not supported" while the campaign
+    # carried on regardless. They do the job now; asking with no campaign
+    # running is the one case where refusing is still right.
+    monkeypatch.setattr(main_module, "_active_campaign_id", None)
+
+    assert client.post("/campaign/pause").status_code == 409
+    assert client.post("/campaign/skip").status_code == 409
+
+
+def test_pause_and_skip_raise_the_flags_the_engine_reads(monkeypatch):
+    monkeypatch.setattr(main_module, "_active_campaign_id", "campaign-1")
+    main_module._campaign_control.clear()
+
+    paused = client.post("/campaign/pause").json()
+    assert paused["status"] == "pausing"
+    assert main_module._campaign_control.pause_requested is True
+
+    skipped = client.post("/campaign/skip").json()
+    assert skipped["status"] == "skipping"
+    assert main_module._campaign_control.take_skip() is True
+
+    main_module._campaign_control.clear()
 
 
 def test_vault_lists_strategies(tmp_path, monkeypatch):
@@ -368,11 +388,17 @@ def test_delete_unknown_strategy_404(tmp_path, monkeypatch):
     assert client.delete("/vault/nope").status_code == 404
 
 
-def test_parity_test_is_honest_about_being_unsupported():
-    # Deploy, refresh and reassess all do real work now (see their own
-    # tests below). PARITY TEST still needs MT5 Strategy Tester output to
-    # compare against, which nothing here produces.
-    assert client.post("/vault/x/parity-test").json()["status"] == "not_supported"
+def test_parity_test_on_a_strategy_that_does_not_exist(tmp_path, monkeypatch):
+    # The parity test is implemented (see test_parity.py): it compares how
+    # often the EA actually trades against how often the backtest did,
+    # which is what catches a robot on the wrong chart.
+    from app.migrations.runner import run_migrations
+
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    run_migrations(fake_config.vault_db_path)
+
+    assert client.post("/vault/nope/parity-test").status_code == 404
 
 
 def test_portfolio_create_list_and_add_strategy(tmp_path, monkeypatch):
