@@ -173,7 +173,20 @@ async def _poll_campaigns_loop() -> None:
 
 
 # REQ-BREED-2.1 — the higher-timeframe context each trading timeframe reads.
-HIGHER_TF_BY_TIMEFRAME = {"M15": "H1", "M30": "H1", "H1": "H4", "H2": "D1", "H4": "D1"}
+# REQ-BREED-2 — the timeframe a HIGHER TF filter reads its context from.
+# M1 and M5 were missing, so the toggle on the Breed screen read "no
+# higher context available" for the two timeframes people reach for
+# first. Roughly one order of magnitude up in each case: enough context
+# to be worth consulting, close enough to still be about the same trade.
+HIGHER_TF_BY_TIMEFRAME = {
+    "M1": "M15",
+    "M5": "H1",
+    "M15": "H1",
+    "M30": "H1",
+    "H1": "H4",
+    "H2": "D1",
+    "H4": "D1",
+}
 
 # Contract size per lot, used to price Settings → Costs commission against
 # the position that fixed-fractional sizing implies.
