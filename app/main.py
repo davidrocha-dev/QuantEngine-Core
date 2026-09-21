@@ -934,15 +934,23 @@ def get_neural_map() -> dict:
 
 @app.delete("/vault/{strategy_id}")
 def delete_strategy(strategy_id: str) -> dict:
-    # REQ-VAULT-2.2 — DELETE is a Free-tier action; real deletion, not a stub.
+    """REQ-VAULT-2.2 — DELETE, into the Recycle Bin.
+
+    This used to remove the row outright while PURGE - the automated,
+    bulk, criteria-driven one - sent its strategies to a Recycle Bin
+    recoverable for thirty days (REQ-SET-4.3). The safety net was on the
+    operation nobody performs by accident, and absent from the one that
+    is a single click next to "Deploy".
+    """
     engine = make_engine(get_config().vault_db_path)
     with Session(engine) as session:
         row = session.get(Strategy, strategy_id)
-        if row is None:
+        if row is None or row.deleted_at is not None:
             raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
-        session.delete(row)
+        row.deleted_at = datetime.now(timezone.utc)
+        row.delete_reason = "Deleted by hand"
         session.commit()
-    return {"deleted": strategy_id}
+    return {"deleted": strategy_id, "recoverable": True}
 
 
 def _generate_ea_for(strategy_id: str) -> tuple[Strategy, "GeneratedEa"]:

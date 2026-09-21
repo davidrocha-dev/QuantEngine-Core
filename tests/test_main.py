@@ -909,3 +909,46 @@ def test_true_sim_on_an_empty_portfolio_is_a_conflict(tmp_path, monkeypatch):
 
     assert response.status_code == 409
     assert "members" in response.json()["detail"]
+
+
+def test_deleting_a_strategy_by_hand_is_recoverable(tmp_path, monkeypatch):
+    """DELETE used to remove the row outright.
+
+    PURGE — the automated, bulk, criteria-driven one — sent its
+    strategies to a Recycle Bin recoverable for thirty days. The safety
+    net was on the operation nobody performs by accident and missing from
+    the one that is a single click beside "Deploy".
+    """
+    from sqlalchemy.orm import Session as OrmSession
+
+    from app.migrations.runner import run_migrations
+    from app.models import Strategy
+
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    run_migrations(fake_config.vault_db_path)
+
+    engine = main_module.make_engine(fake_config.vault_db_path)
+    with OrmSession(engine) as session:
+        session.add(
+            Strategy(
+                id="#GONE", data_source="dukascopy", asset="EURUSD", timeframe="M15",
+                genome_json="{}", trades=120, score=70, grade="GOOD",
+            )
+        )
+        session.commit()
+
+    response = client.delete("/vault/%23GONE")
+    assert response.status_code == 200
+    assert response.json()["recoverable"] is True
+
+    with OrmSession(engine) as session:
+        row = session.get(Strategy, "#GONE")
+        assert row is not None              # still there to be restored
+        assert row.deleted_at is not None   # and out of the Vault listing
+
+    # It is gone from the Vault, and deleting it twice is not a thing.
+    # (%23 is the # every strategy id starts with; the app encodes it the
+    # same way.)
+    assert "#GONE" not in [row["id"] for row in client.get("/vault").json()]
+    assert client.delete("/vault/%23GONE").status_code == 404
