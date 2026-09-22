@@ -440,9 +440,11 @@ def run_phase_4_robustness(
 
         # Walk-forward: the 70/30 split tests one period, which a strategy
         # can pass by being right about one regime. This re-tests it on
-        # consecutive slices and requires it to have been profitable in
-        # most of them. Short histories yield no folds, in which case
-        # persistence is unknown (None) and cannot gate anything.
+        # consecutive slices after the training period and requires it to
+        # have been profitable in most of them. A history too short to
+        # hold MIN_OOS_FOLDS such slices leaves persistence unknown
+        # (None), which cannot gate anything - the strategy is then in the
+        # Vault on the strength of the single OOS period and nothing more.
         walk_forward = run_walk_forward(
             candidate.genome, full_df, gene_pool,
             timeframe=eval_kwargs.get("timeframe", "H1"),
@@ -455,7 +457,8 @@ def run_phase_4_robustness(
                 if k in ("cost_points", "commission_per_lot", "contract_size", "risk_pct", "htf_df", "news_events", "news_mode")
             },
         )
-        if walk_forward is not None and walk_forward.persistence_pct < MIN_PERSISTENCE_PCT:
+        persistence = walk_forward.persistence_pct if walk_forward else None
+        if persistence is not None and persistence < MIN_PERSISTENCE_PCT:
             continue
 
         approved.append(

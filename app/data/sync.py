@@ -100,13 +100,40 @@ class DeltaSyncRunner:
     def state(self) -> SyncState:
         return self._state
 
+    def _depth_start(self) -> datetime:
+        depth_start = datetime.now(timezone.utc) - timedelta(days=365 * self._history_years)
+        epoch = datetime(DUKASCOPY_EPOCH_YEAR, DUKASCOPY_EPOCH_MONTH, 1, tzinfo=timezone.utc)
+        return max(depth_start, epoch)
+
     def _sync_start(self, symbol: str) -> datetime:
         last_synced = self._cache.get_last_synced_hour(symbol)
         if last_synced is not None:
             return last_synced + timedelta(hours=1)
-        depth_start = datetime.now(timezone.utc) - timedelta(days=365 * self._history_years)
-        epoch = datetime(DUKASCOPY_EPOCH_YEAR, DUKASCOPY_EPOCH_MONTH, 1, tzinfo=timezone.utc)
-        return max(depth_start, epoch)
+        return self._depth_start()
+
+    def _backfill_hours(self, symbol: str, timeframe: str) -> list[datetime]:
+        """Hours older than the cache that the configured depth asks for.
+
+        A single forward watermark cannot express this. Sync resumed from
+        it and only ever walked towards now, so raising HISTORY DEPTH
+        after a symbol had been synced did nothing whatsoever - no error,
+        no message, no download. The setting said three years, the cache
+        held one, and the next campaign trained on the one without ever
+        saying so. That is not a small difference: a strategy fitted to
+        twelve months of a single regime scores well on the tail of its
+        own training data and then meets the years it never saw.
+        """
+        first_synced = self._cache.get_first_synced_hour(symbol)
+        if first_synced is None:
+            # Written by a build that only tracked the forward edge; the
+            # bars on disk still say where the cache begins.
+            first_synced = self._cache.get_first_bar_hour(symbol, timeframe)
+        if first_synced is None:
+            return []  # Nothing cached: the forward pass starts at the depth anyway.
+        depth_start = self._depth_start()
+        if depth_start >= first_synced:
+            return []
+        return list(utc_hour_range(depth_start, first_synced))
 
     async def _fetch_bars(self, symbol: str, hour_start: datetime, timeframe: str) -> pd.DataFrame | None:
         tick_hour = await self._client.fetch_hour(symbol, hour_start)
@@ -116,13 +143,13 @@ class DeltaSyncRunner:
 
     async def sync_symbol(self, symbol: str, timeframe: str = DEFAULT_TIMEFRAME) -> int:
         """Sync one symbol; returns the number of hours fetched."""
-        start = self._sync_start(symbol)
         end = datetime.now(timezone.utc) - SYNC_LAG
-        hours = list(utc_hour_range(start, end))
+        hours = list(utc_hour_range(self._sync_start(symbol), end))
+        backfill = self._backfill_hours(symbol, timeframe)
 
-        progress = SyncProgress(symbol=symbol, hours_total=len(hours))
+        progress = SyncProgress(symbol=symbol, hours_total=len(hours) + len(backfill))
         self._state.per_symbol[symbol] = progress
-        if not hours:
+        if not hours and not backfill:
             progress.finished = True
             return 0
 
@@ -182,8 +209,63 @@ class DeltaSyncRunner:
             logger.info("Sync backing off %ss for %s (attempt %s)", backoff, symbol, attempts)
             await asyncio.sleep(backoff)
 
+        # The forward pass goes first so the app is current within
+        # minutes; the older years, which can be tens of thousands of
+        # hours, arrive behind it.
+        hours_synced += await self._backfill(symbol, timeframe, backfill, progress, fetch)
+
         progress.finished = True
         return hours_synced
+
+    async def _backfill(
+        self,
+        symbol: str,
+        timeframe: str,
+        hours: list[datetime],
+        progress: SyncProgress,
+        fetch,
+    ) -> int:
+        """Fetches `hours` from the newest backwards, one contiguous block
+        at a time.
+
+        Unlike the forward pass, a partly-finished block is not committed.
+        Forward, a short batch just means the cache stops earlier than it
+        could and the next run resumes there. Backwards, it would leave a
+        hole in the middle of the cached range that nothing downstream can
+        detect: `read_bars` returns a frame, the backtester resamples it,
+        and the missing weeks simply are not there.
+        """
+        synced = 0
+        attempts = 0
+        end = len(hours)
+        while end > 0:
+            start = max(0, end - WRITE_BATCH_HOURS)
+            batch = hours[start:end]
+            results = await asyncio.gather(*(fetch(hour) for hour in batch), return_exceptions=True)
+
+            failure = next((r for r in results if isinstance(r, Exception)), None)
+            if failure is not None:
+                attempts += 1
+                if attempts > MAX_BATCH_RETRIES:
+                    progress.error = str(failure)
+                    logger.warning("Backfill stopped for %s at %s: %s", symbol, batch[0], failure)
+                    break
+                backoff = RETRY_BACKOFF_SECONDS * attempts
+                logger.info("Backfill backing off %ss for %s (attempt %s)", backoff, symbol, attempts)
+                await asyncio.sleep(backoff)
+                continue
+
+            frames = [r for r in results if r is not None and not r.empty]
+            if frames:
+                await asyncio.to_thread(
+                    self._cache.append_bars, symbol, timeframe, pd.concat(frames, ignore_index=True)
+                )
+            await asyncio.to_thread(self._cache.set_first_synced_hour, symbol, batch[0])
+            synced += len(batch)
+            progress.hours_done += len(batch)
+            end = start
+            attempts = 0
+        return synced
 
     async def sync_all(self, symbols: list[str], timeframe: str = DEFAULT_TIMEFRAME) -> dict[str, int]:
         results: dict[str, int] = {}

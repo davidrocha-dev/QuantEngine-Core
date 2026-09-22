@@ -162,11 +162,11 @@ def reassess_strategy(
     if not robustness.passed:
         result.still_passes = False
         result.failed_gate = robustness.fail_reason
-    elif walk_forward is not None and walk_forward.persistence_pct < MIN_PERSISTENCE_PCT:
+    elif result.persistence_pct is not None and result.persistence_pct < MIN_PERSISTENCE_PCT:
         result.still_passes = False
         result.failed_gate = (
-            f"profitable in only {walk_forward.persistence_pct}% of walk-forward windows "
-            f"(needs {MIN_PERSISTENCE_PCT}%)"
+            f"profitable in only {result.persistence_pct}% of the walk-forward windows after "
+            f"its training period (needs {MIN_PERSISTENCE_PCT}%)"
         )
     else:
         result.still_passes = True

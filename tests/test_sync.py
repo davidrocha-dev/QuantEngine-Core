@@ -141,3 +141,122 @@ async def test_a_running_sync_does_not_freeze_the_rest_of_the_engine(tmp_path):
     # At least one write happened, so the loop had something to be blocked
     # by; it answered many times anyway.
     assert heartbeats > 5
+
+
+# --- Backfill -----------------------------------------------------------
+#
+# Raising HISTORY DEPTH after a symbol had been synced used to do nothing:
+# sync resumed from the forward watermark and only ever walked towards now.
+# The setting said three years, the cache held one, and the campaign
+# trained on the one without saying so.
+
+
+def seed_bars(cache: LocalCache, symbol: str, first: datetime, hours: int) -> None:
+    stamps = [first + timedelta(hours=i) for i in range(hours)]
+    cache.append_bars(
+        symbol,
+        "M1",
+        pd.DataFrame(
+            {
+                "timestamp": stamps,
+                "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0,
+            }
+        ),
+    )
+
+
+def test_backfill_asks_for_the_years_the_cache_is_missing(tmp_path):
+    cache = make_cache(tmp_path)
+    runner = DeltaSyncRunner(cache=cache, client=FakeClient(), history_years=3)
+
+    one_year_ago = (datetime.now(timezone.utc) - timedelta(days=365)).replace(minute=0, second=0, microsecond=0)
+    cache.set_first_synced_hour("XAUUSD", one_year_ago)
+
+    hours = runner._backfill_hours("XAUUSD", "M1")
+
+    assert hours, "raising the depth must ask for the older years"
+    assert max(hours) < one_year_ago
+    # Three years back, minus the year already held.
+    assert 700 * 24 < len(hours) < 740 * 24
+
+
+def test_no_backfill_when_the_cache_already_reaches_the_configured_depth(tmp_path):
+    cache = make_cache(tmp_path)
+    runner = DeltaSyncRunner(cache=cache, client=FakeClient(), history_years=1)
+
+    four_years_ago = (datetime.now(timezone.utc) - timedelta(days=4 * 365)).replace(minute=0, second=0, microsecond=0)
+    cache.set_first_synced_hour("XAUUSD", four_years_ago)
+
+    assert runner._backfill_hours("XAUUSD", "M1") == []
+
+
+def test_backfill_falls_back_to_the_bars_on_disk(tmp_path):
+    # A manifest written before `first` existed - which is every cache the
+    # released build produced.
+    cache = make_cache(tmp_path)
+    runner = DeltaSyncRunner(cache=cache, client=FakeClient(), history_years=3)
+
+    start = (datetime.now(timezone.utc) - timedelta(days=200)).replace(minute=0, second=0, microsecond=0)
+    seed_bars(cache, "XAUUSD", start, 48)
+    cache.set_last_synced_hour("XAUUSD", datetime.now(timezone.utc) - timedelta(hours=1))
+    assert cache.get_first_synced_hour("XAUUSD") is None
+
+    hours = runner._backfill_hours("XAUUSD", "M1")
+
+    assert hours and max(hours) < start
+
+
+def test_legacy_string_manifest_still_reads(tmp_path):
+    cache = make_cache(tmp_path)
+    hour = datetime(2026, 1, 2, 3, tzinfo=timezone.utc)
+    cache.write_manifest({"EURUSD": hour.isoformat()})
+
+    assert cache.get_last_synced_hour("EURUSD") == hour
+    assert cache.get_first_synced_hour("EURUSD") is None
+
+
+def test_first_synced_hour_only_ever_retreats(tmp_path):
+    cache = make_cache(tmp_path)
+    early = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    cache.set_first_synced_hour("EURUSD", early)
+    cache.set_first_synced_hour("EURUSD", datetime(2025, 1, 1, tzinfo=timezone.utc))
+
+    assert cache.get_first_synced_hour("EURUSD") == early
+
+
+@pytest.mark.asyncio
+async def test_backfill_commits_only_whole_blocks(tmp_path):
+    """A hole in the middle of the cached range is undetectable downstream:
+    read_bars returns a frame, the backtester resamples it, and the missing
+    weeks simply are not there."""
+    cache = make_cache(tmp_path)
+    runner = DeltaSyncRunner(cache=cache, client=FakeClient())
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    hours = [start + timedelta(hours=i) for i in range(10)]
+    progress = __import__("app.data.sync", fromlist=["SyncProgress"]).SyncProgress(symbol="XAUUSD")
+
+    calls: list[datetime] = []
+
+    async def fetch(hour):
+        calls.append(hour)
+        if hour == hours[3]:
+            raise RuntimeError("feed threw")
+        return pd.DataFrame(
+            {"timestamp": [hour], "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0}
+        )
+
+    import app.data.sync as sync_module
+
+    original = sync_module.RETRY_BACKOFF_SECONDS
+    sync_module.RETRY_BACKOFF_SECONDS = 0
+    try:
+        synced = await runner._backfill("XAUUSD", "M1", hours, progress, fetch)
+    finally:
+        sync_module.RETRY_BACKOFF_SECONDS = original
+
+    # The whole run is one block, and one hour in it fails, so nothing is
+    # committed rather than nine tenths of a range claiming to be whole.
+    assert synced == 0
+    assert cache.get_first_synced_hour("XAUUSD") is None
+    assert progress.error
