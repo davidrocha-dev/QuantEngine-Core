@@ -379,6 +379,22 @@ def _run_partial_tp(
     R (None if never reached) and the remainder's (exit_idx, price, code)."""
     r_target = genome.management.params.get("r_multiple", 1.0)
     stop_distance = abs(entry_price - stop_price)
+    if stop_distance <= 0:
+        return None, exit_idx, exit_price, exit_code
+
+    # The take-profit is a real order sitting in the book: a position
+    # cannot run through it to reach a partial level beyond it. This used
+    # to scan from entry with `partial_price` standing in for the target,
+    # which let a trade whose target sits at 0.39R keep going to 2.0R,
+    # bank most of the position there, and only then close the remainder.
+    # Every such winner was reported at several times the R the geometry
+    # allows - and because the search reads those numbers, it bred towards
+    # exactly this shape: a near target with a far partial level. The GA
+    # was selecting for the bug.
+    target_r = (target_price - entry_price) * direction / stop_distance
+    if target_r <= r_target:
+        return None, exit_idx, exit_price, exit_code
+
     partial_price = entry_price + direction * r_target * stop_distance
     partial_idx, _, partial_code = _scan_exit_numba(
         highs, lows, entry_idx, direction, stop_price, partial_price, MAX_HOLD_BARS
