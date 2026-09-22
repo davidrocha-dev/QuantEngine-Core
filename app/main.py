@@ -1687,14 +1687,29 @@ def set_data_built_in_only(body: BuiltInDataOnlyRequest) -> dict:
     return {"built_in_data_only": body.enabled}
 
 
+class SyncRequest(BaseModel):
+    """Which markets to sync. Omitted or null means every enabled one.
+
+    This used to be a bare `symbols: list[str] | None` parameter, which
+    FastAPI binds as the *whole* body - so the only accepted shape was a
+    raw JSON array. The renderer posts `{}`, as it does to every other
+    endpoint here, and got a 422 back: "Sync now" had never once worked.
+    The cached history came entirely from the startup sync, which calls
+    the runner directly and never goes near this route.
+    """
+
+    symbols: list[str] | None = None
+
+
 @app.post("/data/sync")
-async def sync_data(symbols: list[str] | None = None) -> dict:
-    """Manual re-sync (Settings → System). The startup sync is the normal
-    path — REQ-DATA-1.5 — and this returns immediately rather than holding
-    the request open for what can be an hours-long first download; poll
-    /data/sync/status for progress."""
+async def sync_data(request: SyncRequest | None = None) -> dict:
+    """Manual re-sync (Dashboard → Historical Data, Settings → System).
+    The startup sync is the normal path — REQ-DATA-1.5 — and this returns
+    immediately rather than holding the request open for what can be an
+    hours-long first download; poll /data/sync/status for progress."""
     if _sync_state.running:
         raise HTTPException(status_code=409, detail="A data sync is already running")
+    symbols = request.symbols if request else None
     settings = load_settings(get_config().settings_path)
     target_symbols = symbols or settings["target_markets"]["enabled_symbols"] or list(BUNDLED_SYMBOLS)
     runner = DeltaSyncRunner(history_years=settings["campaign"]["history_depth_years"], state=_sync_state)

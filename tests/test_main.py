@@ -952,3 +952,38 @@ def test_deleting_a_strategy_by_hand_is_recoverable(tmp_path, monkeypatch):
     # same way.)
     assert "#GONE" not in [row["id"] for row in client.get("/vault").json()]
     assert client.delete("/vault/%23GONE").status_code == 404
+
+
+def test_sync_now_accepts_the_body_the_app_actually_sends():
+    """"Sync now" had never worked.
+
+    `symbols: list[str] | None` binds as the *whole* request body, so the
+    only shape FastAPI accepted was a bare JSON array. The renderer posts
+    `{}`, as it does everywhere else, and got 422 back. Every cached bar
+    came from the startup sync, which calls the runner directly.
+    """
+    from unittest.mock import patch
+
+    import app.main as main_module
+
+    captured: dict = {}
+
+    class FakeRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        async def sync_all(self, symbols):
+            captured["symbols"] = symbols
+            return {}
+
+    with patch.object(main_module, "DeltaSyncRunner", FakeRunner):
+        with TestClient(main_module.app) as client:
+            main_module._sync_state.running = False
+            response = client.post("/data/sync", json={})
+            assert response.status_code == 200, response.text
+            assert response.json()["started"] is True
+
+            main_module._sync_state.running = False
+            response = client.post("/data/sync", json={"symbols": ["XAUUSD"]})
+            assert response.status_code == 200, response.text
+            assert response.json()["symbols"] == ["XAUUSD"]
