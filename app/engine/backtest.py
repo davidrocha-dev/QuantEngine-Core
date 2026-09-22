@@ -248,11 +248,30 @@ def simulate_trades(
             entry_price = opens[entry_idx]
 
         atr_at_entry = atr_series[i]
+
+        # Costs move where the position sits, not only what it earns.
+        #
+        # Bars here are mid prices (data/dukascopy_client). A long is
+        # filled at the ask and its stop and target are both triggered on
+        # the bid, so in the bars' own space the stop ends up a full
+        # spread nearer and the target a full spread further away. The
+        # position is paid for once, at entry, and the barriers follow
+        # from what was paid.
+        #
+        # This used to charge the cost as a flat deduction from R after
+        # the fact, which leaves both barriers at their nominal distance
+        # and therefore never changes which one is reached. It makes a
+        # trade slightly less profitable; it cannot make it lose. For a
+        # strategy anywhere near its break-even win rate that is the
+        # entire result - at a 0.38 reward:risk the break-even is 72.4%,
+        # and this reported 76.7% where the broker delivered 72.8%.
+        effective_entry = entry_price + direction * cost_points * point_size
+
         # Risk geometry is part of the genome (app/genome/genome.py), not a
         # constant: the GA searches stop/target distance like any other gene
         # parameter. The module constants remain the documented default.
-        stop_price = entry_price - direction * genome.stop_atr_mult * atr_at_entry
-        target_price = entry_price + direction * genome.target_atr_mult * atr_at_entry
+        stop_price = effective_entry - direction * genome.stop_atr_mult * atr_at_entry
+        target_price = effective_entry + direction * genome.target_atr_mult * atr_at_entry
         risk_amount = balance * risk_pct
 
         # Every execution gene fills intrabar (LIMIT/LIMIT2/STOP) or at the
@@ -273,35 +292,35 @@ def simulate_trades(
         partial_r = None
         if not entry_bar_stopped and genome.management is not None and genome.management.name == "PARTIAL TP":
             partial_r, baseline_exit_idx, exit_price, exit_code = _run_partial_tp(
-                genome, highs, lows, closes, entry_idx, int(direction), entry_price, stop_price, target_price,
+                genome, highs, lows, closes, entry_idx, int(direction), effective_entry, stop_price, target_price,
                 baseline_exit_idx, exit_price, exit_code,
             )
 
         exit_idx, exit_reason, partial_closed = baseline_exit_idx, _EXIT_NAMES[exit_code], partial_r is not None
         management_hit = _apply_management_exit(
-            genome, bar_hours, bar_weekdays, closes, entry_idx, baseline_exit_idx, int(direction), entry_price
+            genome, bar_hours, bar_weekdays, closes, entry_idx, baseline_exit_idx, int(direction), effective_entry
         )
         if management_hit is not None and management_hit[0] <= baseline_exit_idx:
             exit_idx, exit_reason = management_hit
             exit_price = closes[exit_idx]
 
         gross_pnl, r_multiple = _blend_partial_tp(
-            genome, direction, entry_price, stop_price, exit_price, risk_amount, partial_r
+            genome, direction, effective_entry, stop_price, exit_price, risk_amount, partial_r
         )
-        stop_distance = abs(entry_price - stop_price)
-        # Round-trip spread/slippage, charged as a price cost over the
-        # position the risk sizing implies. Phase 4's noise injection adds a
-        # further random perturbation on top of this baseline (REQ-ENGINE-3.8).
-        cost_r = (cost_points * point_size) / stop_distance if stop_distance > 0 else 0.0
+        stop_distance = abs(effective_entry - stop_price)
+        # Spread and slippage are already in `effective_entry`, and so
+        # in every distance measured from it. Commission is not a price:
+        # it is cash, charged against the position that fixed-fractional
+        # sizing implies. Phase 4's noise injection perturbs the entry on
+        # top of this baseline (REQ-ENGINE-3.8).
         lots = risk_amount / (stop_distance * contract_size) if stop_distance > 0 else 0.0
         commission = commission_per_lot * lots
-        pnl_amount = gross_pnl - risk_amount * cost_r - commission
-        r_multiple -= cost_r
+        pnl_amount = gross_pnl - commission
 
         # Mark-to-market between entry and exit, so Max DD reflects the
         # drawdown actually lived through, not only closed-trade equity.
         if exit_idx > entry_idx and stop_distance > 0:
-            unrealized_r = (closes[entry_idx:exit_idx] - entry_price) * direction / stop_distance
+            unrealized_r = (closes[entry_idx:exit_idx] - effective_entry) * direction / stop_distance
             equity_curve[entry_idx:exit_idx] = balance + risk_amount * unrealized_r
             if max_leverage_breach_balance > 0 and float(equity_curve[entry_idx:exit_idx].min()) < max_leverage_breach_balance:
                 margin_breach = True
@@ -313,7 +332,7 @@ def simulate_trades(
 
         trades.append(
             Trade(
-                entry_idx, exit_idx, int(direction), entry_price, exit_price, stop_price, target_price,
+                entry_idx, exit_idx, int(direction), effective_entry, exit_price, stop_price, target_price,
                 r_multiple, pnl_amount, exit_reason, partial_closed,
             )
         )

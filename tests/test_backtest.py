@@ -98,7 +98,7 @@ def _partial_tp_genome(r_multiple: float, target_atr_mult: float) -> Genome:
         signal=GeneChoice("MACD", {"fast": 12, "slow": 26, "signal": 9}),
         bias=None,
         filters=[],
-        execution=GeneChoice("MARKET", {}),
+        execution=GeneChoice("MARKET2", {"confirm_bars": 1}),
         management=GeneChoice("PARTIAL TP", {"r_multiple": r_multiple, "close_fraction": 0.7}),
         stop_atr_mult=2.79,
         target_atr_mult=target_atr_mult,
@@ -154,3 +154,72 @@ def test_partial_tp_still_fires_when_the_target_is_further_out():
     )
 
     assert partial_r == 1.0
+
+
+def test_costs_change_which_barrier_is_reached_not_just_the_pnl():
+    """Costs used to be a flat deduction from R after the fact.
+
+    That leaves the stop and the target at their nominal distances, so it
+    can make a trade less profitable but never make it lose: the win rate
+    came out identical at any spread. In a mid-priced series a long is
+    filled at the ask and both its barriers trigger on the bid, so the
+    stop sits a spread nearer and the target a spread further. For a
+    strategy near its break-even win rate that is the entire result.
+    """
+    df = make_synthetic_ohlc(6_000, seed=21, drift=0.0, volatility=0.004)
+    pool = GenePoolConfig()
+    genome = Genome(
+        signal=GeneChoice("MACD", {"fast": 12, "slow": 26, "signal": 9}),
+        bias=None,
+        filters=[],
+        execution=GeneChoice("MARKET2", {"confirm_bars": 1}),
+        management=None,
+        stop_atr_mult=1.0,
+        target_atr_mult=1.0,
+    )
+
+    def win_rate(cost_points: float) -> tuple[float, int]:
+        result = simulate_trades(
+            df, genome, pool, initial_balance=10_000.0, risk_pct=0.01,
+            point_size=0.0001, cost_points=cost_points, contract_size=100_000.0,
+        )
+        wins = sum(1 for t in result.trades if t.pnl > 0)
+        return (wins / len(result.trades) if result.trades else 0.0), len(result.trades)
+
+    # The effect is monotonic but small at realistic spreads - the point
+    # is that it exists at all. Under the old model the win rate was
+    # mathematically independent of cost, identical to the last decimal
+    # at every spread, so a wide one is used here to make the assertion
+    # robust rather than marginal.
+    rates = [win_rate(cost)[0] for cost in (0.0, 100.0, 200.0, 400.0)]
+    counts = [win_rate(cost)[1] for cost in (0.0, 400.0)]
+
+    assert all(count > 30 for count in counts), "need trades for this to mean anything"
+    assert rates == sorted(rates, reverse=True), f"win rate must fall as cost rises: {rates}"
+    assert rates[0] - rates[-1] > 0.02, f"and by more than rounding: {rates}"
+
+
+def test_a_stop_loss_costs_exactly_one_r():
+    """The spread is paid getting in, so it is already inside every
+    distance measured from the entry. Deducting it again at the exit
+    double-charged it."""
+    df = make_synthetic_ohlc(3_000, seed=22, drift=-0.002, volatility=0.006)
+    pool = GenePoolConfig()
+    genome = Genome(
+        signal=GeneChoice("MACD", {"fast": 12, "slow": 26, "signal": 9}),
+        bias=None,
+        filters=[],
+        execution=GeneChoice("MARKET2", {"confirm_bars": 1}),
+        management=None,
+        stop_atr_mult=1.5,
+        target_atr_mult=3.0,
+    )
+    result = simulate_trades(
+        df, genome, pool, initial_balance=10_000.0, risk_pct=0.01,
+        point_size=0.0001, cost_points=30.0, commission_per_lot=0.0, contract_size=100_000.0,
+    )
+
+    stopped = [t for t in result.trades if t.exit_reason == "stop"]
+    assert stopped, "this series is meant to produce stop-outs"
+    for trade in stopped:
+        assert abs(trade.r_multiple + 1.0) < 1e-9, trade.r_multiple
