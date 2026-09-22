@@ -260,3 +260,66 @@ async def test_backfill_commits_only_whole_blocks(tmp_path):
     assert synced == 0
     assert cache.get_first_synced_hour("XAUUSD") is None
     assert progress.error
+
+
+@pytest.mark.asyncio
+async def test_backfill_progress_moves_before_a_block_commits(tmp_path):
+    """A block is WRITE_BATCH_HOURS of hourly files.
+
+    Counting progress only when one commits left a seventeen-thousand-hour
+    backfill reading 0.0% for the first ten minutes and then stepping by
+    whole percent, which looks exactly like a sync that has hung.
+    """
+    import app.data.sync as sync_module
+
+    cache = make_cache(tmp_path)
+    runner = DeltaSyncRunner(cache=cache, client=FakeClient())
+    progress = sync_module.SyncProgress(symbol="XAUUSD", hours_total=10)
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    hours = [start + timedelta(hours=i) for i in range(10)]
+    seen: list[int] = []
+
+    async def fetch(hour):
+        seen.append(progress.hours_done)
+        return pd.DataFrame(
+            {"timestamp": [hour], "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0}
+        )
+
+    await runner._backfill("XAUUSD", "M1", hours, progress, fetch)
+
+    assert progress.hours_done == 10
+    # Some hour saw a count raised by an earlier hour in the same block,
+    # rather than every one of them seeing zero.
+    assert max(seen) > 0, f"progress never moved inside the block: {seen}"
+
+
+@pytest.mark.asyncio
+async def test_a_retried_block_does_not_count_its_hours_twice(tmp_path):
+    import app.data.sync as sync_module
+
+    cache = make_cache(tmp_path)
+    runner = DeltaSyncRunner(cache=cache, client=FakeClient())
+    progress = sync_module.SyncProgress(symbol="XAUUSD", hours_total=4)
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    hours = [start + timedelta(hours=i) for i in range(4)]
+    attempt = {"n": 0}
+
+    async def fetch(hour):
+        if hour == hours[2] and attempt["n"] == 0:
+            attempt["n"] += 1
+            raise RuntimeError("feed threw once")
+        return pd.DataFrame(
+            {"timestamp": [hour], "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0}
+        )
+
+    original = sync_module.RETRY_BACKOFF_SECONDS
+    sync_module.RETRY_BACKOFF_SECONDS = 0
+    try:
+        synced = await runner._backfill("XAUUSD", "M1", hours, progress, fetch)
+    finally:
+        sync_module.RETRY_BACKOFF_SECONDS = original
+
+    assert synced == 4
+    assert progress.hours_done == 4, "a retried block must not inflate the count"

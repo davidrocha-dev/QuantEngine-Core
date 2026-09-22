@@ -238,10 +238,31 @@ class DeltaSyncRunner:
         synced = 0
         attempts = 0
         end = len(hours)
+
+        # Progress counts hours as they are fetched, not as blocks commit.
+        # A block is WRITE_BATCH_HOURS of hourly files, so tying the two
+        # together left a seventeen-thousand-hour backfill reading 0.0%
+        # for the first ten minutes and then stepping by whole percent -
+        # which looks exactly like a sync that has hung. `committed` is
+        # what has actually landed; `fetched` is the current attempt, and
+        # it restarts with the attempt so a retried block cannot count its
+        # hours twice.
+        committed = progress.hours_done
+        fetched = 0
+
+        async def counting_fetch(hour: datetime):
+            nonlocal fetched
+            result = await fetch(hour)
+            fetched += 1
+            progress.hours_done = committed + fetched
+            return result
+
         while end > 0:
             start = max(0, end - WRITE_BATCH_HOURS)
             batch = hours[start:end]
-            results = await asyncio.gather(*(fetch(hour) for hour in batch), return_exceptions=True)
+            fetched = 0
+            progress.hours_done = committed
+            results = await asyncio.gather(*(counting_fetch(hour) for hour in batch), return_exceptions=True)
 
             failure = next((r for r in results if isinstance(r, Exception)), None)
             if failure is not None:
@@ -262,7 +283,8 @@ class DeltaSyncRunner:
                 )
             await asyncio.to_thread(self._cache.set_first_synced_hour, symbol, batch[0])
             synced += len(batch)
-            progress.hours_done += len(batch)
+            committed += len(batch)
+            progress.hours_done = committed
             end = start
             attempts = 0
         return synced
