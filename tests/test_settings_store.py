@@ -48,3 +48,25 @@ def test_update_section_unknown_section_raises(tmp_path):
         assert False, "expected KeyError"
     except KeyError:
         pass
+
+
+def test_manual_spread_falls_back_per_symbol():
+    """One spread figure cannot serve the catalogue.
+
+    A point is 1/point_divisor, and the divisors span two orders of
+    magnitude: 10 points is one pip on EURUSD (divisor 100,000) and one
+    cent on XAUUSD (divisor 1,000) — about a seventeenth of what gold
+    costs to cross. Campaigns bred with no terminal open charged that
+    cent.
+    """
+    from app.main import _manual_spread_points
+
+    costs = {
+        "manual_spread_points": 10.0,
+        "manual_spread_by_symbol": {"XAUUSD": 150.0},
+    }
+
+    assert _manual_spread_points(costs, "XAUUSD") == 150.0
+    assert _manual_spread_points(costs, "EURUSD") == 10.0
+    # A settings file written before the map existed still resolves.
+    assert _manual_spread_points({"manual_spread_points": 10.0}, "XAUUSD") == 10.0

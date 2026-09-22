@@ -38,6 +38,13 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
     "costs": {
         "spread_mode": "AUTO",  # AUTO | MANUAL
         "manual_spread_points": 10.0,
+        # Per-symbol overrides, because one figure cannot serve the whole
+        # catalogue: a point is 1/point_divisor, and the divisors differ by
+        # a factor of a hundred. Ten points is one pip on EURUSD (divisor
+        # 100,000) and one cent on XAUUSD (divisor 1,000) - roughly a
+        # seventeenth of gold's real spread. Symbols absent here fall back
+        # to `manual_spread_points`.
+        "manual_spread_by_symbol": {},
         "commission_per_lot": 7.0,
         "slippage_points": 2.0,
     },

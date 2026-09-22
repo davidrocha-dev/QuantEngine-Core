@@ -203,13 +203,29 @@ CONTRACT_SIZE_BY_CATEGORY = {
 }
 
 
+def _manual_spread_points(costs: dict, symbol: str) -> float:
+    """The configured manual spread for one symbol, in that symbol's points.
+
+    A single global figure cannot serve the catalogue. A point is
+    1/point_divisor, and the divisors span two orders of magnitude: ten
+    points is one pip on EURUSD (divisor 100,000) and one cent on XAUUSD
+    (divisor 1,000), about a seventeenth of what gold actually costs to
+    cross. Campaigns bred with no terminal open charged that cent, and a
+    cost that small is most of the distance between a backtest and a
+    broker statement.
+    """
+    per_symbol = costs.get("manual_spread_by_symbol") or {}
+    configured = per_symbol.get(symbol)
+    return float(configured if configured is not None else costs["manual_spread_points"])
+
+
 def _spread_points(costs: dict, symbol: str, instrument) -> float:
     """AUTO SPREAD reads the live broker spread (the one thing the MT5
     connection is for besides execution — REQ-DATA-1.3); MANUAL uses the
     configured value. AUTO with no terminal connected falls back to MANUAL
     rather than silently backtesting at zero spread."""
     if costs["spread_mode"] != "AUTO":
-        return float(costs["manual_spread_points"])
+        return _manual_spread_points(costs, symbol)
     # AUTO spread is the one thing that actually wants the terminal. It
     # attaches to a running one if it has not already - never launches,
     # because a campaign starting is not a reason to open a broker
@@ -218,7 +234,7 @@ def _spread_points(costs: dict, symbol: str, instrument) -> float:
         _mt5_bridge.connect()
     quote = _mt5_bridge.get_live_quote(symbol) if _mt5_bridge.is_connected() else None
     if quote is None:
-        return float(costs["manual_spread_points"])
+        return _manual_spread_points(costs, symbol)
     return float(quote.spread_points * instrument.point_divisor)
 
 
