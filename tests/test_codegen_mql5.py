@@ -128,3 +128,26 @@ def test_random_genomes_either_export_or_say_which_gene_stopped_them():
         source.encode("ascii")
         exported += 1
     assert exported > 0
+
+
+def test_a_waiting_pending_order_blocks_another_entry():
+    """The exported EA used to check only for open positions.
+
+    A LIMIT/LIMIT2/STOP entry sits unfilled for up to
+    PENDING_ORDER_WINDOW_BARS bars. While one waited, HasOpenPosition()
+    was false, so every further bar whose signal still held placed
+    another order on top of it. Several then filled, giving simultaneous
+    positions at full risk each — the backtester has exactly one order in
+    flight, ever. Exported from the Vault and run in the MetaTrader
+    tester over the same year, that was 2,247 trades against the
+    backtester's 638, with a 28.6% drawdown against 9.0%.
+    """
+    for execution in ("LIMIT", "LIMIT2", "STOP"):
+        genome = make_genome(
+            execution=GeneChoice(execution, dict(ALL_GENES[("execution", execution)].default_params))
+        )
+        source = generate_ea(genome, "#PENDING", "XAUUSD", "M15").source
+
+        assert "bool HasPendingOrder()" in source, execution
+        assert "OrdersTotal()" in source, execution
+        assert "if(HasOpenPosition() || HasPendingOrder()) return;" in source, execution

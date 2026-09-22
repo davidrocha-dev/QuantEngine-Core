@@ -215,6 +215,30 @@ bool HasOpenPosition()
 }
 
 //+------------------------------------------------------------------+
+//| A pending order is not yet a position, and checking only for      |
+//| positions is how this EA came to trade a multiple of what was     |
+//| backtested. LIMIT/LIMIT2/STOP entries sit unfilled for up to      |
+//| PENDING_ORDER_WINDOW_BARS bars. While one waited, HasOpenPosition |
+//| stayed false, so every further bar whose signal still held placed |
+//| another order on top - several then filled, giving simultaneous   |
+//| positions at full risk each.                                      |
+//|                                                                   |
+//| The backtester has exactly one order in flight: after a fill it   |
+//| resumes at the bar following the exit, and after an expiry it     |
+//| moves on one bar (app/engine/backtest.py, `i = exit_idx + 1`).    |
+//+------------------------------------------------------------------+
+bool HasPendingOrder()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderGetTicket(i) == 0) continue;
+      if(OrderGetInteger(ORDER_MAGIC) == MagicNumber && OrderGetString(ORDER_SYMBOL) == _Symbol)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
 //| REQ-PORT-3 - the Incubation ladder's share of target risk, read   |
 //| from a file QuantEngine writes (magic,share per line). Read at    |
 //| entry time only, so a promotion applies to NEW trades and never   |
@@ -417,6 +441,7 @@ void OnTick()
    if(currentBar == LastBarTime) return;
    LastBarTime = currentBar;
 
-   if(HasOpenPosition()) return;     // single position at a time, as backtested
+   // One position or one waiting order at a time, as backtested.
+   if(HasOpenPosition() || HasPendingOrder()) return;
    TryEnter();
 }
