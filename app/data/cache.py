@@ -8,12 +8,19 @@ manifest tracking the last fully-synced UTC hour per symbol so startup sync
 from __future__ import annotations
 
 import json
+import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 
 from app.config import EngineConfig, get_config
+
+# A reader holding the file open makes the rename fail on Windows; it is
+# only ever open for a fraction of a second, so waiting beats failing.
+WRITE_REPLACE_RETRIES = 10
+WRITE_REPLACE_BACKOFF_SECONDS = 0.2
 
 
 class LocalCache:
@@ -36,7 +43,34 @@ class LocalCache:
         existing = self.read_bars(symbol, timeframe)
         combined = pd.concat([existing, bars], ignore_index=True)
         combined = combined.drop_duplicates(subset="timestamp").sort_values("timestamp")
-        combined.to_parquet(self._bar_path(symbol, timeframe), index=False)
+        self._write_bars(symbol, timeframe, combined)
+
+    def _write_bars(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> None:
+        """Writes to a temporary file and renames it over the target.
+
+        A sync rewrites the whole Parquet file every time a block lands,
+        and the app reads that same file continuously - /data/coverage
+        polls it, and a campaign loads it at launch. Writing in place
+        leaves a couple of hundred milliseconds where what is on disk is
+        half a file, and a reader landing in that window gets an
+        exception rather than a short frame. Across a backfill that runs
+        for hours, the window comes round a hundred times.
+        """
+        path = self._bar_path(symbol, timeframe)
+        tmp = path.with_name(path.name + ".tmp")
+        frame.to_parquet(tmp, index=False)
+        for attempt in range(WRITE_REPLACE_RETRIES):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                # Windows refuses to replace a file another process still
+                # has open. The reader is milliseconds from finishing, so
+                # wait for it rather than throw the block away.
+                if attempt == WRITE_REPLACE_RETRIES - 1:
+                    tmp.unlink(missing_ok=True)
+                    raise
+                time.sleep(WRITE_REPLACE_BACKOFF_SECONDS)
 
     def read_manifest(self) -> dict[str, dict | str]:
         if not self._config.manifest_path.exists():
