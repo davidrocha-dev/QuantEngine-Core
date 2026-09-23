@@ -1034,3 +1034,47 @@ def test_a_running_sync_can_be_stopped():
 
             # Nothing to stop is a 409, not a silent success.
             assert client.post("/data/sync/stop").status_code == 409
+
+
+def test_status_keeps_the_last_campaign_once_it_finishes(tmp_path, monkeypatch):
+    """BREED lost every detail of a campaign the moment it ended.
+
+    /status returned campaign: null once nothing was running, so the
+    screen's asset went blank and the live feed — which filters the Vault
+    by the campaign's started_at — had nothing to filter by and showed
+    "no strategies yet" over a campaign that had just written three.
+    """
+    import uuid
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy.orm import Session
+
+    from app.db import make_engine
+    from app.models import Campaign
+
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    run_migrations(fake_config.vault_db_path)
+    monkeypatch.setattr(main_module, "_active_campaign_id", None)
+
+    started = datetime.now(timezone.utc) - timedelta(minutes=5)
+    with Session(make_engine(fake_config.vault_db_path)) as session:
+        session.add(
+            Campaign(
+                id=uuid.uuid4().hex,
+                started_at=started,
+                finished_at=datetime.now(timezone.utc),
+                asset="XAUUSD",
+                timeframe="M15",
+                phase=4,
+                status="completed",
+            )
+        )
+        session.commit()
+
+    body = client.get("/status").json()
+
+    assert body["state"] == "idle", "a finished campaign is not a running one"
+    assert body["campaign"] is not None, "the last campaign has to survive its own completion"
+    assert body["campaign"]["asset"] == "XAUUSD"
+    assert body["campaign"]["started_at"] is not None, "the live feed filters the Vault by this"

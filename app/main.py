@@ -616,8 +616,17 @@ def get_status() -> dict:
             campaign = session.get(Campaign, _active_campaign_id)
         if campaign is None:
             campaign = session.scalar(select(Campaign).where(Campaign.status == "running"))
+        running = campaign is not None
+        if campaign is None:
+            # Nothing is running, so report the most recent one rather
+            # than nothing at all. BREED lost every detail of a campaign
+            # the moment it finished otherwise - its asset, its timeframe,
+            # and the start time the live feed filters the Vault by, so
+            # the feed went empty and the panel showed a blank asset at
+            # precisely the moment you want to see what was produced.
+            campaign = session.scalar(select(Campaign).order_by(Campaign.started_at.desc()))
         return {
-            "state": "running" if campaign else "idle",
+            "state": "running" if running else "idle",
             "campaign": _serialize_campaign(campaign) if campaign else None,
         }
 
