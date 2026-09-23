@@ -24,7 +24,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import LiveTrade, Strategy
+from app.models import LiveTrade, Strategy, StrategyTrade
 
 # Below this many live trades, live numbers say more about luck than edge.
 MIN_TRADES_FOR_VERDICT = 10
@@ -33,10 +33,25 @@ MIN_TRADES_FOR_VERDICT = 10
 # Win rate rather than profit: live results are money and the Vault stores
 # percentages, and converting between them needs an account balance this
 # server never sees. A ratio is comparable on both sides without inventing
-# a conversion. What it will not catch on its own is a strategy that keeps
-# winning as often but earns less when it does - the sign check below is
-# what catches that, once the losses add up.
+# a conversion.
+#
+# 50% is kept as the floor for strategies whose trade log is gone, but it
+# is not the test that does the work, and on its own it did none. Measured
+# across this Vault, the win rate at which a 50% relative shortfall fires
+# sits 11 to 27 points BELOW the win rate at which the strategy stops
+# making money - so by the time it triggers, live profit per trade has
+# long been negative and the sign check above has already called the bot
+# degraded. A magnitude test that only fires after the cheaper test has
+# fired is not a second opinion.
 DEGRADATION_THRESHOLD_PCT = 50.0
+
+# The real magnitude test: the win rate below which this strategy's own
+# geometry stops paying. A strategy risking 1R to make 0.38R needs to win
+# 72% of the time to break even, and one risking 1R to make 2R needs 33%;
+# a single relative shortfall cannot serve both. Falling below it is worth
+# saying *before* the cumulative P&L turns, which is the only thing an
+# early warning is for.
+MIN_TRADES_FOR_BREAKEVEN = 20
 
 # REQ-PORT-3.1-3.3 — stages, and what it takes to leave each one.
 STAGES = ("INCUBATION", "PROVING", "FULL RISK")
@@ -106,6 +121,33 @@ def _expected_profit_per_trade(strategy: Strategy, live_profit_total: float, liv
     return strategy.return_pct / strategy.trades
 
 
+def breakeven_win_rate_pct(session: Session, strategy_id: str) -> float | None:
+    """The win rate at which this strategy's backtested trades break even.
+
+    Read from its own stored trade log (migration v8): with an average
+    win of W and an average loss of L, expectancy is zero at
+    L / (W + L). Returns None when too few trades are on record for the
+    two averages to mean anything, in which case the caller falls back to
+    the fixed relative shortfall.
+    """
+    rows = list(
+        session.scalars(
+            select(StrategyTrade.pnl).where(StrategyTrade.strategy_id == strategy_id)
+        )
+    )
+    if len(rows) < MIN_TRADES_FOR_BREAKEVEN:
+        return None
+    wins = [pnl for pnl in rows if pnl > 0]
+    losses = [-pnl for pnl in rows if pnl < 0]
+    if not wins or not losses:
+        return None
+    avg_win = sum(wins) / len(wins)
+    avg_loss = sum(losses) / len(losses)
+    if avg_win + avg_loss <= 0:
+        return None
+    return avg_loss / (avg_win + avg_loss) * 100
+
+
 def check_strategy(session: Session, strategy: Strategy) -> HealthVerdict:
     trades = _live_trades(session, strategy.id)
     if not trades:
@@ -144,9 +186,24 @@ def check_strategy(session: Session, strategy: Strategy) -> HealthVerdict:
     live_win_rate_pct = sum(1 for trade in trades if trade.profit > 0) / len(trades) * 100
 
     # The magnitude check. A bot can be net positive and still be a shadow
-    # of the thing that was approved - winning a third as often as the
-    # backtest did is decay, even while the balance creeps up.
+    # of the thing that was approved, and the point where that stops being
+    # survivable is set by its own geometry, not by a fixed percentage.
     expected_win_rate_pct = strategy.win_rate_pct
+    breakeven_pct = breakeven_win_rate_pct(session, strategy.id)
+    if expected_win_rate_pct and breakeven_pct is not None and live_win_rate_pct < breakeven_pct:
+        shortfall_pct = (expected_win_rate_pct - live_win_rate_pct) / expected_win_rate_pct * 100
+        return HealthVerdict(
+            strategy_id=strategy.id, live_trades=len(trades), live_profit=round(live_profit, 2),
+            live_profit_per_trade=round(per_trade, 2),
+            expected_profit_per_trade=_expected_profit_per_trade(strategy, live_profit, len(trades)),
+            deviation_pct=round(shortfall_pct, 1), status="degraded",
+            detail=(
+                f"Winning {round(live_win_rate_pct)}% of live trades. This strategy needs "
+                f"{round(breakeven_pct)}% to break even on its own win/loss sizes, and its "
+                f"backtest won {round(expected_win_rate_pct)}%."
+            ),
+        )
+
     if expected_win_rate_pct:
         shortfall_pct = (expected_win_rate_pct - live_win_rate_pct) / expected_win_rate_pct * 100
         if shortfall_pct >= DEGRADATION_THRESHOLD_PCT:

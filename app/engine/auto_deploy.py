@@ -26,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.broker.mt5_install import install_ea, uninstall_ea
-from app.codegen.mql5 import UnsupportedGeneError, generate_ea
+from app.codegen.mql5 import _safe_name, UnsupportedGeneError, generate_ea
 from app.engine.health import run_health_check
 from app.genome.genome import Genome
 from app.models import Strategy
@@ -41,9 +41,24 @@ class Replacement:
     retired_id: str
     installed_id: str | None
     detail: str
+    # Deleting an EA's files does not stop a chart that is already running
+    # it (broker/mt5_install.uninstall_ea says so in as many words). Until
+    # the user removes it from the chart, the retired bot is still
+    # trading - beside its replacement, on the same market, at its own
+    # risk - and nothing in this app is counting it any more.
+    needs_manual_removal: bool = False
 
     def to_dict(self) -> dict:
         return {k: v for k, v in vars(self).items()}
+
+
+def _ea_filename(strategy_id: str) -> str:
+    """The same name the generator wrote.
+
+    Built by the generator's own rule rather than a second spelling of it:
+    a divergence here deletes nothing and reports success.
+    """
+    return f"{_safe_name(strategy_id)}.mq5"
 
 
 def find_replacement(session: Session, degraded: Strategy) -> Strategy | None:
@@ -105,8 +120,11 @@ def replace_degraded(session: Session, risk_pct: float = 0.01, max_spread_points
             )
             continue
 
-        # Retire only once the replacement is actually in place.
-        uninstall_ea(f"QE_{degraded.id.lstrip('#').upper()}.mq5")
+        # Retire only once the replacement is actually in place. This
+        # removes the files so the EA cannot be loaded again; it does not
+        # reach into a chart that is already running it, and there is no
+        # code path in this app that can.
+        uninstall_ea(_ea_filename(degraded.id))
         degraded.deployed = False
         replacement.deployed = True
         replacement.incubation_stage = None  # REQ-PORT-3.1 — a new bot starts in INCUBATION
@@ -116,10 +134,13 @@ def replace_degraded(session: Session, risk_pct: float = 0.01, max_spread_points
             Replacement(
                 retired_id=degraded.id,
                 installed_id=replacement.id,
+                needs_manual_removal=True,
                 detail=(
-                    f"Retired {degraded.id} and installed {replacement.id} "
-                    f"(score {replacement.score}) on {replacement.asset} {replacement.timeframe}. "
-                    "It starts at a quarter of target risk, like any new deploy."
+                    f"Installed {replacement.id} (score {replacement.score}) on {replacement.asset} "
+                    f"{replacement.timeframe}, starting at a quarter of target risk like any new deploy. "
+                    f"{degraded.id} is no longer installed, but removing its files does not stop a chart "
+                    "already running it: open MetaTrader and remove it from its chart, or the two will "
+                    "trade the same market side by side."
                 ),
             )
         )

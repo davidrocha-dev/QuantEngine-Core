@@ -15,7 +15,7 @@ from app.engine.health import (
     ladder,
     run_health_check,
 )
-from app.models import LiveTrade, Strategy
+from app.models import LiveTrade, Strategy, StrategyTrade
 
 
 @pytest.fixture
@@ -368,3 +368,74 @@ def test_the_win_rate_check_still_needs_enough_live_trades(session):
     add_live_trades(session, strategy.id, [-20.0] * (MIN_TRADES_FOR_VERDICT - 1))
 
     assert check_strategy(session, strategy).status == "too_early"
+
+
+# --- The magnitude test has to fire before the money is gone ------------
+
+
+def test_degradation_is_measured_against_the_strategys_own_breakeven():
+    """A fixed relative shortfall cannot serve every geometry.
+
+    Measured across a real Vault, the win rate at which a 50% shortfall
+    fires sits 11 to 27 points below the win rate at which the strategy
+    stops making money — so it only ever triggered after live profit per
+    trade had already turned negative and the sign check had called the
+    bot degraded. A magnitude test that fires only after the cheaper test
+    has fired is not a second opinion.
+    """
+    from app.engine.health import breakeven_win_rate_pct, check_strategy
+
+    engine = make_engine(":memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        # Backtest: wins average 60, losses average 100, so the edge dies
+        # below 100 / 160 = 62.5% — and the backtest won 75%.
+        strategy = Strategy(
+            id="#DECAY", data_source="dukascopy", asset="XAUUSD", timeframe="M15",
+            score=70, grade="GOOD", deployed=True, trades=40, return_pct=20.0, win_rate_pct=75.0,
+            genome_json="{}",
+        )
+        session.add(strategy)
+        for i in range(40):
+            session.add(
+                StrategyTrade(
+                    strategy_id="#DECAY", sequence=i, direction=1,
+                    entry_price=1.0, exit_price=1.0, stop_price=0.9, target_price=1.1,
+                    r_multiple=1.0, pnl=60.0 if i < 30 else -100.0, exit_reason="target",
+                )
+            )
+        # Live: winning 55% — under the 62.5% it needs, but still showing a
+        # positive balance, and nowhere near a 50% shortfall off 75%.
+        add_live_trades(session, "#DECAY", [60.0] * 11 + [-55.0] * 9)
+
+        breakeven = breakeven_win_rate_pct(session, "#DECAY")
+        assert breakeven is not None
+        assert 62.0 < breakeven < 63.0, breakeven
+
+        verdict = check_strategy(session, strategy)
+
+        assert verdict.live_profit > 0, "this fixture is meant to still look profitable"
+        shortfall = (75.0 - 55.0) / 75.0 * 100
+        assert shortfall < 50.0, "and nowhere near the old fixed threshold"
+        assert verdict.status == "degraded", verdict.detail
+        assert "break even" in verdict.detail
+
+
+def test_breakeven_is_unknown_on_too_few_recorded_trades():
+    from app.engine.health import MIN_TRADES_FOR_BREAKEVEN, breakeven_win_rate_pct
+
+    engine = make_engine(":memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(Strategy(id="#THIN", data_source="dukascopy", asset="EURUSD", timeframe="H1", genome_json="{}"))
+        for i in range(MIN_TRADES_FOR_BREAKEVEN - 1):
+            session.add(
+                StrategyTrade(
+                    strategy_id="#THIN", sequence=i, direction=1,
+                    entry_price=1.0, exit_price=1.0, stop_price=0.9, target_price=1.1,
+                    r_multiple=1.0, pnl=10.0 if i % 2 else -5.0, exit_reason="target",
+                )
+            )
+        session.commit()
+
+        assert breakeven_win_rate_pct(session, "#THIN") is None

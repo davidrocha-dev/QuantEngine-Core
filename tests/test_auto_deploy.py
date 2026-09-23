@@ -190,3 +190,32 @@ def test_nothing_is_retired_when_the_replacement_cannot_be_installed(session, mo
     assert actions[0].installed_id is None
     assert session.get(Strategy, "#OLD").deployed is True
     assert session.get(Strategy, "#NEW").deployed is False
+
+
+def test_a_replacement_says_the_old_bot_is_still_on_its_chart(session):
+    """Deleting an EA's files does not stop a chart already running it —
+    uninstall_ea documents exactly that, and nothing in this app can reach
+    into a chart. The action used to report "Retired X and installed Y",
+    so nobody had a reason to go and stop X: two bots on the same market,
+    with the Vault counting one."""
+    degraded = make_strategy(session, "#OLD", score=60, deployed=True)
+    make_strategy(session, "#BETTER", score=88)
+    make_degraded(session, degraded)
+
+    actions = replace_degraded(session)
+
+    assert len(actions) == 1
+    action = actions[0]
+    assert action.installed_id == "#BETTER"
+    assert action.needs_manual_removal is True
+    assert "remove it from its chart" in action.detail
+
+
+def test_the_uninstall_filename_comes_from_the_generator():
+    """A second spelling of the generator's naming rule deletes nothing
+    and still reports success."""
+    from app.codegen.mql5 import _safe_name
+    from app.engine.auto_deploy import _ea_filename
+
+    for strategy_id in ("#C8B8C5", "#abc123", "#0E6C97"):
+        assert _ea_filename(strategy_id) == f"{_safe_name(strategy_id)}.mq5"
