@@ -18,6 +18,7 @@ more than 25% relative to the clean OOS baseline (REQ-ENGINE-3.10).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -43,6 +44,17 @@ class RobustnessResult:
     noise_degradation_pct: float
     passed: bool
     fail_reason: str | None = None
+    # The noise test draws a random perturbation, and one draw is a
+    # sample, not a measurement: `entry_delay_bars` alone is a coin flip
+    # that moves every entry by one bar or two - half an hour a trade on
+    # M15. Judging on a single draw made the same strategy, on the same
+    # data, score anywhere from 64 to 80 between clicks, with robustness
+    # from 36.6% to 100% and the pass/fail verdict flipping. These are
+    # the 10th and 90th percentiles of the sampled degradations, so the
+    # number can be shown with the range it came from.
+    noise_degradation_p10_pct: float | None = None
+    noise_degradation_p90_pct: float | None = None
+    noise_samples: int = 1
 
 
 def _return_pct_from_sequence(pnls: list[float], initial_balance: float) -> float:
@@ -96,6 +108,14 @@ class NoiseParams:
 
     extra_cost_points: float
     entry_delay_bars: int
+
+
+# Draws taken per robustness evaluation. One is a coin flip; the median
+# of five is an estimate of the distribution, which is what the gate is
+# actually trying to ask about. Five re-simulations instead of one is
+# affordable: REASSESS is a manual action on one strategy, and Phase 4
+# runs on the handful of candidates that already cleared three phases.
+NOISE_SAMPLES = 5
 
 
 def draw_noise_params(rng: np.random.Generator | None = None) -> NoiseParams:
@@ -200,6 +220,37 @@ def _r_sequence_return(trades: list[Trade], risk_pct: float) -> float:
     return _compound_r_sequence(r_multiples, risk_pct)[0]
 
 
+def robustness_band(result: RobustnessResult) -> tuple[float, float | None, float | None]:
+    """robust_pct and the range it came from, as percentages.
+
+    Robustness is 100 minus the worst degradation, so the *pessimistic*
+    end of the band uses the p90 degradation and the optimistic end uses
+    p10. Returns (value, low, high); low and high are None when the
+    result came from a single draw and there is no range to report.
+    """
+    worst = max(result.monte_carlo_degradation_pct, result.noise_degradation_pct)
+    value = 100 - worst
+    if result.noise_degradation_p10_pct is None or result.noise_degradation_p90_pct is None:
+        return value, None, None
+    low = 100 - max(result.monte_carlo_degradation_pct, result.noise_degradation_p90_pct)
+    high = 100 - max(result.monte_carlo_degradation_pct, result.noise_degradation_p10_pct)
+    return value, low, high
+
+
+def sample_noise_runs(
+    run: Callable[[NoiseParams], list[Trade]],
+    rng: np.random.Generator,
+    samples: int = NOISE_SAMPLES,
+) -> list[list[Trade]]:
+    """Re-simulates the genome under `samples` independent perturbations.
+
+    `run` takes one draw and returns the trades it produced; the caller
+    owns the genome and the backtest arguments, this module owns the
+    distribution being sampled.
+    """
+    return [run(draw_noise_params(rng)) for _ in range(samples)]
+
+
 def evaluate_robustness(
     oos_trades: list[Trade],
     df: pd.DataFrame,
@@ -208,6 +259,7 @@ def evaluate_robustness(
     rng: np.random.Generator | None = None,
     risk_pct: float = 0.01,
     noisy_trades: list[Trade] | None = None,
+    noisy_runs: list[list[Trade]] | None = None,
 ) -> RobustnessResult:
     """Baseline and both perturbations are expressed the same way — a
     compounded R-multiple sequence at the campaign's risk fraction — so the
@@ -224,24 +276,49 @@ def evaluate_robustness(
     # trade-level variance, which is every real strategy.
     mc_degradation = compute_degradation_pct(baseline_return, mc_median)
 
-    # `noisy_trades` comes from a re-simulation of the same genome under the
-    # perturbation (the caller has the genome; this module does not).
-    if noisy_trades is None:
-        noisy_trades = inject_noise(oos_trades, df, point_size, rng=rng)
-    noise_return = _r_sequence_return(noisy_trades, risk_pct)
-    noise_degradation = compute_degradation_pct(baseline_return, noise_return)
+    # `noisy_runs` are re-simulations of the same genome under independent
+    # perturbations (the caller has the genome; this module does not).
+    # `noisy_trades` is the single-draw form, kept for callers that have
+    # one — it is a sample of one and reads as such in the result.
+    noise_p10 = noise_p90 = None
+    if noisy_runs:
+        returns = [_r_sequence_return(trades, risk_pct) for trades in noisy_runs]
+        degradations = [compute_degradation_pct(baseline_return, value) for value in returns]
+        noise_return = float(np.median(returns))
+        noise_degradation = float(np.median(degradations))
+        noise_p10 = float(np.percentile(degradations, 10))
+        noise_p90 = float(np.percentile(degradations, 90))
+        noise_sample_count = len(noisy_runs)
+    else:
+        if noisy_trades is None:
+            noisy_trades = inject_noise(oos_trades, df, point_size, rng=rng)
+        noise_return = _r_sequence_return(noisy_trades, risk_pct)
+        noise_degradation = compute_degradation_pct(baseline_return, noise_return)
+        noise_sample_count = 1
 
+    # The gate reads the pessimistic end of the sampled noise, not the
+    # middle of it. Measured on a real strategy, the degradation is not a
+    # spread around a centre - it is bimodal, and decided almost entirely
+    # by one integer: a 1-bar entry displacement cost 0.0% across 13
+    # draws, a 2-bar displacement cost 63.6% across 17, with the extra
+    # spread contributing nothing measurable either way. A median over
+    # such a distribution is itself close to a coin toss, so gating on it
+    # would still let through a strategy that collapses whenever the fill
+    # lands one bar later than hoped. The reported figure stays the
+    # median, because that is the representative one; the decision uses
+    # p90, because a gate is a safety question.
+    gating_noise_degradation = noise_p90 if noise_p90 is not None else noise_degradation
     passed = (
         baseline_return > 0
         and mc_degradation <= DEGRADATION_DISCARD_THRESHOLD_PCT
-        and noise_degradation <= DEGRADATION_DISCARD_THRESHOLD_PCT
+        and gating_noise_degradation <= DEGRADATION_DISCARD_THRESHOLD_PCT
     )
     fail_reason = None
     if not passed:
         if baseline_return <= 0:
             fail_reason = "no out-of-sample edge (baseline OOS return is not positive)"
         else:
-            worst = "Monte Carlo" if mc_degradation > noise_degradation else "noise injection"
+            worst = "Monte Carlo" if mc_degradation > gating_noise_degradation else "noise injection"
             fail_reason = f"{worst} degradation exceeds {DEGRADATION_DISCARD_THRESHOLD_PCT}% threshold"
 
     return RobustnessResult(
@@ -252,6 +329,9 @@ def evaluate_robustness(
         monte_carlo_worst_drawdown_pct=mc_worst_dd,
         noise_return_pct=noise_return,
         noise_degradation_pct=noise_degradation,
+        noise_degradation_p10_pct=noise_p10,
+        noise_degradation_p90_pct=noise_p90,
+        noise_samples=noise_sample_count,
         passed=passed,
         fail_reason=fail_reason,
     )

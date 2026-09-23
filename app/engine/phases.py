@@ -21,7 +21,7 @@ from app.engine.backtest import BacktestResult, simulate_trades
 from app.engine.fitness import fitness_f1_stability, fitness_f2_expansion, passes_phase_0_screening
 from app.engine.hash_id import assign_hash_id
 from app.engine.metrics import TradeStats, compute_trade_stats
-from app.engine.monte_carlo import RobustnessResult, draw_noise_params, evaluate_robustness
+from app.engine.monte_carlo import RobustnessResult, evaluate_robustness, sample_noise_runs
 from app.engine.news_filter import EconomicEvent, NewsMode
 from app.engine.control import CampaignControl  # noqa: F401 - used in annotations
 from app.engine.resources import limit_worker_threads, max_parallel_workers
@@ -417,22 +417,28 @@ def run_phase_4_robustness(
         # REQ-ENGINE-3.8 — the perturbed run is a real re-simulation of the
         # same genome with extra spread/slippage and a delayed fill, so the
         # stop and target respond to the perturbation as they would live.
-        noise = draw_noise_params(rng)
-        noisy_result = simulate_trades(
-            oos_df, candidate.genome, gene_pool,
-            initial_balance=initial_balance,
-            point_size=point_size,
-            entry_delay_bars=noise.entry_delay_bars,
-            **{
-                **{k: v for k, v in eval_kwargs.items() if k not in ("timeframe", "initial_balance", "point_size", "cost_points")},
-                "cost_points": eval_kwargs.get("cost_points", 0.0) + noise.extra_cost_points,
-            },
-        )
+        def run_noisy(noise, candidate=candidate) -> list:
+            return simulate_trades(
+                oos_df, candidate.genome, gene_pool,
+                initial_balance=initial_balance,
+                point_size=point_size,
+                entry_delay_bars=noise.entry_delay_bars,
+                **{
+                    **{k: v for k, v in eval_kwargs.items() if k not in ("timeframe", "initial_balance", "point_size", "cost_points")},
+                    "cost_points": eval_kwargs.get("cost_points", 0.0) + noise.extra_cost_points,
+                },
+            ).trades
 
+        # One draw decided both whether a candidate entered the Vault and
+        # what robust_pct it entered with. That draw includes a coin flip
+        # displacing every entry by a bar or two, so the same genome could
+        # pass or fail on the toss. The median of NOISE_SAMPLES draws is a
+        # statement about the distribution instead of a report of one
+        # point in it.
         robustness = evaluate_robustness(
             oos_result.trades, oos_df, initial_balance, point_size,
             risk_pct=eval_kwargs.get("risk_pct", DEFAULT_RISK_PCT),
-            noisy_trades=noisy_result.trades,
+            noisy_runs=sample_noise_runs(run_noisy, rng),
             rng=rng,
         )
         if not robustness.passed:

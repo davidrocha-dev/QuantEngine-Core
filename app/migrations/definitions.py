@@ -137,6 +137,14 @@ MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX IF NOT EXISTS idx_strategy_trades ON strategy_trades (strategy_id, sequence)",
         ),
     ),
+    Migration(
+        version=9,
+        description="The range behind robust_pct, because one noise draw is a sample and not a measurement",
+        statements=(
+            "ALTER TABLE strategies ADD COLUMN robust_low_pct REAL",
+            "ALTER TABLE strategies ADD COLUMN robust_high_pct REAL",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = max(m.version for m in MIGRATIONS)

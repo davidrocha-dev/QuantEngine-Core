@@ -26,6 +26,12 @@ class Strategy(Base):
     max_dd_pct: Mapped[float | None]
     archetype: Mapped[str | None] = mapped_column(String)
     robust_pct: Mapped[float | None]
+    # The 10th/90th percentile of the sampled noise degradations, expressed
+    # as robustness percentages. robust_pct on its own is a point estimate
+    # of a distribution that is measurably bimodal — "72%" and "72% (25–73)"
+    # are very different claims about the same strategy.
+    robust_low_pct: Mapped[float | None]
+    robust_high_pct: Mapped[float | None]
     icir: Mapped[float | None]
     # REQ-AUTO-2 - the out-of-sample win rate, kept so a live health check
     # has something to compare against that needs no currency conversion.

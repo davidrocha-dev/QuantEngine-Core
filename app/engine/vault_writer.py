@@ -9,10 +9,15 @@ from sqlalchemy.orm import Session
 import pandas as pd
 
 from app.engine.hash_id import assign_hash_id
+from app.engine.monte_carlo import robustness_band
 from app.engine.trade_log import replace_trades
 from app.engine.phases import VaultCandidate
 from app.engine.scoring import classify_archetype, compute_grade, compute_score
 from app.models import Strategy
+
+
+def _band(candidate: VaultCandidate):
+    return robustness_band(candidate.robustness)
 
 
 def vault_candidate_to_row(candidate: VaultCandidate, asset: str, timeframe: str, data_source: str = "dukascopy") -> Strategy:
@@ -29,7 +34,9 @@ def vault_candidate_to_row(candidate: VaultCandidate, asset: str, timeframe: str
         cagr_pct=candidate.stats_oos.cagr_pct,
         max_dd_pct=candidate.stats_oos.max_dd_pct,
         archetype=classify_archetype(candidate.genome),
-        robust_pct=100 - max(candidate.robustness.monte_carlo_degradation_pct, candidate.robustness.noise_degradation_pct),
+        robust_pct=_band(candidate)[0],
+        robust_low_pct=_band(candidate)[1],
+        robust_high_pct=_band(candidate)[2],
         icir=candidate.stats_oos.icir,
         win_rate_pct=candidate.stats_oos.win_rate * 100,
         avg_hold_hours=candidate.stats_oos.avg_hold_hours,

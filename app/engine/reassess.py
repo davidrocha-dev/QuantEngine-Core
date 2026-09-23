@@ -16,14 +16,17 @@ that have only ever been fitted.
 
 from __future__ import annotations
 
+import hashlib
+
 from dataclasses import dataclass
 
+import numpy as np
 import pandas as pd
 from sqlalchemy.orm import object_session
 
 from app.engine.backtest import simulate_trades
 from app.engine.metrics import compute_trade_stats
-from app.engine.monte_carlo import draw_noise_params, evaluate_robustness
+from app.engine.monte_carlo import evaluate_robustness, robustness_band, sample_noise_runs
 from app.engine.phases import (
     IS_FRACTION,
     MIN_OOS_TRADES,
@@ -56,6 +59,18 @@ class ReassessResult:
 
     def to_dict(self) -> dict:
         return {k: v for k, v in vars(self).items()}
+
+
+def _seed_for(strategy_id: str) -> int:
+    """A stable seed per strategy.
+
+    Not to remove the randomness - the noise test has to be random to
+    mean anything - but so that re-running the same assessment gives the
+    same answer. Deriving it from the id rather than fixing one constant
+    keeps different strategies on different draws, so no single lucky
+    perturbation flatters the whole Vault.
+    """
+    return int(hashlib.sha256(strategy_id.encode()).hexdigest()[:16], 16)
 
 
 def _backtest_kwargs(config) -> dict:
@@ -130,15 +145,28 @@ def reassess_strategy(
         result.failed_gate = "no longer profitable out of sample"
         return result
 
-    noise = draw_noise_params()
-    noisy_result = simulate_trades(
-        oos_df, genome, gene_pool, initial_balance=config.initial_balance,
-        entry_delay_bars=noise.entry_delay_bars,
-        **{**kwargs, "cost_points": kwargs["cost_points"] + noise.extra_cost_points},
-    )
+    # Two sources of randomness used to run unseeded from here: the noise
+    # draw and the bootstrap. Measured on a real strategy, six identical
+    # REASSESS runs gave scores of 64 to 80, robustness of 36.6% to 100%,
+    # and a pass/fail verdict that flipped - on the same strategy, the
+    # same bars and the same settings. The randomness is the point of the
+    # test, so it stays; what changes is that the answer now comes from
+    # the distribution rather than from one draw of it, and that the seed
+    # is derived from the strategy so pressing the button twice cannot
+    # give two answers.
+    rng = np.random.default_rng(_seed_for(strategy.id))
+
+    def run_noisy(noise) -> list:
+        return simulate_trades(
+            oos_df, genome, gene_pool, initial_balance=config.initial_balance,
+            entry_delay_bars=noise.entry_delay_bars,
+            **{**kwargs, "cost_points": kwargs["cost_points"] + noise.extra_cost_points},
+        ).trades
+
     robustness = evaluate_robustness(
         oos_result.trades, oos_df, config.initial_balance, config.point_size,
-        risk_pct=config.risk_pct, noisy_trades=noisy_result.trades,
+        risk_pct=config.risk_pct, rng=rng,
+        noisy_runs=sample_noise_runs(run_noisy, rng),
     )
 
     walk_forward = run_walk_forward(
@@ -149,7 +177,10 @@ def reassess_strategy(
     score = compute_score(oos_stats, robustness)
     strategy.score = score
     strategy.grade = compute_grade(score, oos_stats.trade_count)
-    strategy.robust_pct = 100 - max(robustness.monte_carlo_degradation_pct, robustness.noise_degradation_pct)
+    robust_value, robust_low, robust_high = robustness_band(robustness)
+    strategy.robust_pct = robust_value
+    strategy.robust_low_pct = robust_low
+    strategy.robust_high_pct = robust_high
     if walk_forward is not None:
         strategy.persistence_pct = walk_forward.persistence_pct
         strategy.walk_forward = _json(walk_forward.to_dict())

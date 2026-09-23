@@ -104,3 +104,78 @@ def test_evaluate_robustness_wipeout_fails():
     assert result.baseline_return_pct > 0
     # Not asserting pass/fail (depends on RNG draw) — just that the fields are populated sanely.
     assert result.fail_reason is None or "degradation" in result.fail_reason
+
+
+# --- Sampling the noise distribution instead of one point ---------------
+
+
+def _run(r_multiple: float, count: int = 40) -> list[Trade]:
+    """A run of identical trades at a given R, so a fixture can state a
+    degradation directly instead of hoping a simulation produces one."""
+    return [make_trade(i, i + 1, r_multiple * 100.0) for i in range(count)]
+
+
+def test_the_noise_gate_reads_the_pessimistic_end_not_the_middle():
+    """Measured on a real strategy, noise degradation is bimodal and
+    decided almost entirely by one integer: a 1-bar entry displacement
+    cost 0.0% across 13 draws, a 2-bar displacement 63.6% across 17. A
+    median over that is itself close to a coin toss, so the gate reads
+    p90 while the reported figure stays the median."""
+    df = make_synthetic_ohlc(2_000, seed=5)
+    baseline = _run(1.0)
+    # Three draws that barely hurt and two that are ruinous: the median
+    # clears the threshold, the p90 does not.
+    runs = [_run(0.98), _run(0.97), _run(0.96), _run(-0.5), _run(-0.6)]
+
+    result = evaluate_robustness(baseline, df, 10_000.0, 0.0001, risk_pct=0.01, noisy_runs=runs)
+
+    assert result.noise_samples == 5
+    assert result.noise_degradation_p90_pct is not None
+    assert result.noise_degradation_p90_pct > result.noise_degradation_pct, (
+        "p90 must sit above the median or this fixture tests nothing"
+    )
+    assert result.noise_degradation_pct <= DEGRADATION_DISCARD_THRESHOLD_PCT, (
+        "the median alone would have passed this"
+    )
+    assert result.noise_degradation_p90_pct > DEGRADATION_DISCARD_THRESHOLD_PCT
+    assert not result.passed, "a strategy that collapses on two draws in five is not robust"
+
+
+def test_a_single_draw_reports_no_range():
+    df = make_synthetic_ohlc(2_000, seed=6)
+
+    result = evaluate_robustness(
+        _run(1.0), df, 10_000.0, 0.0001, risk_pct=0.01, noisy_trades=_run(0.9)
+    )
+
+    assert result.noise_samples == 1
+    assert result.noise_degradation_p10_pct is None
+    assert result.noise_degradation_p90_pct is None
+
+
+def test_robustness_band_brackets_the_reported_value():
+    from app.engine.monte_carlo import robustness_band
+
+    df = make_synthetic_ohlc(2_000, seed=7)
+    runs = [_run(r) for r in (1.0, 0.9, 0.7, 0.5, 0.2)]
+
+    result = evaluate_robustness(_run(1.0), df, 10_000.0, 0.0001, risk_pct=0.01, noisy_runs=runs)
+    value, low, high = robustness_band(result)
+
+    assert low is not None and high is not None
+    assert low <= value <= high, f"{low} <= {value} <= {high}"
+
+
+def test_sample_noise_runs_draws_the_requested_number():
+    from app.engine.monte_carlo import NOISE_SAMPLES, sample_noise_runs
+
+    seen = []
+
+    def run(noise):
+        seen.append(noise)
+        return _run(1.0, count=3)
+
+    runs = sample_noise_runs(run, np.random.default_rng(1))
+
+    assert len(runs) == NOISE_SAMPLES == len(seen)
+    assert all(1 <= n.entry_delay_bars <= 2 for n in seen)

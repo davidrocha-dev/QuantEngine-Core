@@ -888,6 +888,8 @@ def _serialize_strategy(row: Strategy, *, full: bool) -> dict:
         "archetype": row.archetype,
         "mechanism": _mechanism(row.genome_json),
         "robust_pct": row.robust_pct,
+        "robust_low_pct": row.robust_low_pct,
+        "robust_high_pct": row.robust_high_pct,
         # REQ-VAULT-1.1 PERSISTENCE — real walk-forward result, not a
         # placeholder: the share of test windows the strategy was
         # profitable in (null when the history was too short to fold).
