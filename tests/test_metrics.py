@@ -130,3 +130,27 @@ def test_phase_2_fitness_survives_an_unannualisable_window():
     )
 
     assert fitness_f2_expansion(stats) > 0
+
+
+def test_a_blown_account_is_not_reported_as_flat():
+    """`equity_curve[-1] <= 0` sat in the same guard as "no data" and
+    returned 0.0 — the figure a strategy that never traded gets, and a
+    better one than a strategy that lost half. It also made the -100.0
+    branch below it unreachable, since nothing else drives final equity to
+    zero."""
+    import numpy as np
+
+    from app.engine.metrics import cagr_pct
+
+    two_years = 252 * 24 * 2
+
+    assert cagr_pct(np.array([10_000.0, 0.0]), 10_000.0, two_years, "H1") == -100.0
+    assert cagr_pct(np.array([10_000.0, -50.0]), 10_000.0, two_years, "H1") == -100.0
+
+    # And it still sorts below a survivable loss, which was the point.
+    halved = cagr_pct(np.array([10_000.0, 5_000.0]), 10_000.0, two_years, "H1")
+    assert halved is not None and -100.0 < halved < 0.0
+
+    # A window too short to annualise still reports the total loss: losing
+    # everything is a fact, not an extrapolation.
+    assert cagr_pct(np.array([10_000.0, 0.0]), 10_000.0, 100, "H1") == -100.0

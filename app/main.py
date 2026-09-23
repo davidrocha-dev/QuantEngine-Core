@@ -238,6 +238,28 @@ def _spread_points(costs: dict, symbol: str, instrument) -> float:
     return float(quote.spread_points * instrument.point_divisor)
 
 
+def _gene_pool_for_campaign(config: CampaignConfig) -> GenePoolConfig:
+    """The enabled genes, minus any the campaign cannot actually use.
+
+    EVENT is the one case today. With no economic calendar on disk it
+    vetoes nothing, so a genome that draws it backtests exactly like one
+    that does not and scores the same - and then cannot be exported at
+    all, because the EA has no calendar feed and the generator refuses to
+    emit a strategy that would trade without a filter its backtest had.
+    Measured: 7.8% of randomly drawn genomes take EVENT, so roughly one
+    candidate in thirteen was being bred towards a Vault row that no
+    amount of work could deploy.
+
+    Disabling it changes no backtest result - an empty calendar already
+    vetoes nothing - it only stops the search spending itself on
+    strategies that cannot leave the building.
+    """
+    gene_pool = GenePoolConfig.load(get_config().gene_pool_path)
+    if not config.news_events:
+        gene_pool.set_enabled("filter", "EVENT", False)
+    return gene_pool
+
+
 def _learned_gene_weights() -> dict[str, float]:
     """Smart Mode's weights, tempered by what keeps failing screening.
 
@@ -730,7 +752,7 @@ def start_campaign() -> dict:
         config = build_campaign_config(settings, symbol, timeframe)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    gene_pool = GenePoolConfig.load(get_config().gene_pool_path)
+    gene_pool = _gene_pool_for_campaign(config)
 
     campaign_id = uuid.uuid4().hex
     engine = make_engine(get_config().vault_db_path)
@@ -1537,7 +1559,15 @@ def post_true_sim(portfolio_id: str, body: TrueSimRequest) -> dict:
     for symbol, timeframe in markets:
         bars = _load_bars(symbol, timeframe, depth_years)
         if not bars.empty:
-            bars_by_market[(symbol, timeframe)] = bars
+            # Out-of-sample only. TRUE SIM exists to be read against the
+            # HEALTH tab's combined curve - its own docstring calls the
+            # gap between them "exactly what the guardrails cost" - and
+            # that curve is built from stored OOS equity. Replaying the
+            # full history here put the two numbers on different periods,
+            # and the extra 70% is the stretch every member was fitted
+            # on, so TRUE SIM came out flattered by the comparison it
+            # exists to lose.
+            bars_by_market[(symbol, timeframe)] = split_is_oos(bars, IS_FRACTION)[1]
     if not bars_by_market:
         raise HTTPException(status_code=409, detail="No cached history for these members' markets.")
 
@@ -1566,6 +1596,12 @@ def delete_portfolio(portfolio_id: str) -> dict:
             select(PortfolioStrategy).where(PortfolioStrategy.portfolio_id == portfolio_id)
         ):
             session.delete(membership)
+        # Flush the memberships before removing what they point at. These
+        # models carry no ORM relationship, so SQLAlchemy has no dependency
+        # to sort the DELETEs by and issues them in mapper order - which
+        # puts the portfolio first. Silent while SQLite was ignoring the
+        # foreign keys it had been given; an error the moment it stopped.
+        session.flush()
         session.delete(portfolio)
         session.commit()
     return {"deleted": portfolio_id}

@@ -139,3 +139,55 @@ def test_recycle_bin_expires_after_the_retention_window(session):
     assert removed == 1
     assert session.get(Strategy, "#OLD") is None
     assert session.get(Strategy, "#RECENT") is not None
+
+
+def test_emptying_the_bin_takes_the_trade_log_with_it():
+    """SQLite ignores every FOREIGN KEY it is given unless asked not to.
+
+    The pragma is off by default, per connection, so the ON DELETE
+    CASCADE declared on strategy_trades was decoration. Demonstrated
+    before the fix: a strategy past its recycle-bin window is deleted and
+    its 25 trade rows stay behind, unreachable and permanent. Nothing had
+    noticed because nothing had been hard-deleted yet — the bin holds
+    rows for thirty days.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import func, select
+    from sqlalchemy.orm import Session
+
+    from app.db import Base, make_engine
+    from app.engine.purge import empty_expired_recycle_bin
+    from app.models import Strategy, StrategyTrade
+
+    engine = make_engine(":memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(
+            Strategy(
+                id="#GONE", data_source="dukascopy", asset="EURUSD", timeframe="H1", genome_json="{}",
+                deleted_at=datetime.now(timezone.utc) - timedelta(days=60),
+            )
+        )
+        session.flush()
+        for index in range(25):
+            session.add(
+                StrategyTrade(
+                    strategy_id="#GONE", sequence=index, direction=1, entry_price=1.0, exit_price=1.0,
+                    stop_price=1.0, target_price=1.0, r_multiple=1.0, pnl=1.0, exit_reason="target",
+                )
+            )
+        session.commit()
+
+        assert session.scalar(select(func.count()).select_from(StrategyTrade)) == 25
+        assert empty_expired_recycle_bin(session) == 1
+        assert session.scalar(select(func.count()).select_from(Strategy)) == 0
+        assert session.scalar(select(func.count()).select_from(StrategyTrade)) == 0, "orphaned trade rows"
+
+
+def test_foreign_keys_are_actually_enforced():
+    from sqlalchemy import text
+    from app.db import make_engine
+
+    with make_engine(":memory:").connect() as connection:
+        assert connection.execute(text("PRAGMA foreign_keys")).scalar() == 1

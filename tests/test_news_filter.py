@@ -79,3 +79,48 @@ def test_overlapping_event_windows_merge_correctly():
     # merge into continuous coverage between them.
     assert veto.iloc[20] == True
     assert veto.iloc[21] == True
+
+
+def test_event_is_not_bred_when_there_is_no_calendar_to_feed_it():
+    """EVENT is enabled by default, vetoes nothing without a calendar on
+    disk, and then cannot be exported at all — the generator refuses it
+    because the EA has no calendar feed.
+
+    Measured: 7.8% of randomly drawn genomes take EVENT, so about one
+    candidate in thirteen was being bred towards a Vault row no amount of
+    work could deploy.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import app.main as main_module
+    from app.genome.gene_pool import GenePoolConfig
+
+    with patch.object(GenePoolConfig, "load", staticmethod(lambda _path: GenePoolConfig())):
+        without_calendar = main_module._gene_pool_for_campaign(SimpleNamespace(news_events=[]))
+        with_calendar = main_module._gene_pool_for_campaign(
+            SimpleNamespace(news_events=[object()])
+        )
+
+    assert without_calendar.is_enabled("filter", "EVENT") is False
+    assert with_calendar.is_enabled("filter", "EVENT") is True
+    # Nothing else is touched.
+    assert without_calendar.is_enabled("filter", "RSI") is True
+
+
+def test_the_currency_on_an_event_is_parsed_and_never_used():
+    """Documented rather than fixed: apply_news_filter blocks on every
+    event regardless of which currency it concerns, so a JPY release
+    would veto XAUUSD entries. The field is parsed by both readers and
+    read by nothing. Left as-is because no calendar ships with the app
+    and changing the blocking rule is a behaviour change, not a fix — but
+    it is a live trap for the first user who supplies one.
+    """
+    import inspect
+
+    from app.engine import news_filter
+
+    source = inspect.getsource(news_filter.apply_news_filter)
+    assert "currency" not in source, (
+        "if apply_news_filter has started reading the currency, this note is stale"
+    )

@@ -8,6 +8,16 @@ from app.engine.metrics import TradeStats
 PHASE_0_MIN_PROFIT_FACTOR = 1.1
 PHASE_0_MIN_TRADES = 100
 
+# A candidate with no losing trades has no profit factor and no payoff
+# ratio - both are divisions by zero, and both arrive here as values that
+# sort it last: profit_factor as inf, payoff_ratio as 0.0. F2 is a
+# product, so its terms have to be finite, and "unbounded" has to sort
+# somewhere. It sorts at the top, which is also what compute_score
+# already does with an infinite profit factor (scoring.pf_component
+# gives it full marks). These are ranking caps, not measurements.
+FITNESS_MAX_PROFIT_FACTOR = 10.0
+FITNESS_MAX_PAYOFF_RATIO = 10.0
+
 
 def passes_phase_0_screening(stats: TradeStats, result: BacktestResult) -> tuple[bool, str | None]:
     """REQ-ENGINE-3.2: discard PF < 1.1, fewer than 100 trades, or a margin breach."""
@@ -41,6 +51,15 @@ def fitness_f2_expansion(stats: TradeStats) -> float:
     would flatten every candidate in the tribe to the same score and turn
     the ranking into a coin toss.
     """
-    profit_factor = stats.profit_factor if stats.profit_factor != float("inf") else 0.0
+    # Measured: 120 trades, no losers, passes Phase 0 screening because
+    # `inf < 1.1` is False - and then scored 0.0 in F2 against a mediocre
+    # rival's 11.44, because inf was mapped to zero and payoff_ratio was
+    # already zero for the same reason. The flawless case was ranked as
+    # the worthless one.
+    flawless = stats.profit_factor == float("inf")
+    profit_factor = FITNESS_MAX_PROFIT_FACTOR if flawless else stats.profit_factor
+    payoff_ratio = (
+        FITNESS_MAX_PAYOFF_RATIO if flawless and stats.payoff_ratio == 0.0 else stats.payoff_ratio
+    )
     growth = stats.cagr_pct if stats.cagr_pct is not None else stats.net_profit_pct
-    return growth * profit_factor * stats.payoff_ratio
+    return growth * profit_factor * payoff_ratio

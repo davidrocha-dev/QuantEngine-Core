@@ -237,7 +237,20 @@ def combined_equity_curve(strategies: list[Strategy], initial_balance: float = 1
     if not series:
         return {"curve": [], "return_pct": None, "max_dd_pct": None, "sharpe": None}
 
-    frame = pd.concat(series, axis=1, join="outer").sort_index().fillna(0.0)
+    # A day a member did not exist is not a day it returned zero. This
+    # used to fillna(0.0) and then divide by the full member count, so a
+    # member bred on a different window dragged every other member's day
+    # towards zero. Measured: two strategies each returning +81.50% over
+    # their own 200 days, run back to back, combined to +81.58% - the
+    # second one's entire contribution erased, because on each of its days
+    # the first contributed a fabricated 0.00%. The correlation path in
+    # this same module already refuses to make that substitution, and says
+    # why in the module docstring.
+    #
+    # Averaging across the members that were actually live that day is
+    # what an equal-weight portfolio does. It does mean the composition
+    # changes over the curve, which is true of the portfolio itself.
+    frame = pd.concat(series, axis=1, join="outer").sort_index()
     portfolio_returns = frame.mean(axis=1)
     equity = initial_balance * (1 + portfolio_returns).cumprod()
 

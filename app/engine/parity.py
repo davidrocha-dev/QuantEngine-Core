@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import LiveTrade, Strategy
+from app.models import LiveTrade, Strategy, StrategyTrade
 
 # Below this many live trades, a rate computed from them is noise.
 MIN_TRADES_FOR_PARITY = 8
@@ -56,26 +56,43 @@ def _aware(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
-def _expected_rate(strategy: Strategy) -> float | None:
-    """Backtest trades per day, from the window the Vault row describes.
+def _expected_rate(session: Session, strategy: Strategy) -> float | None:
+    """Backtest trades per day, measured over the window they happened in.
 
-    The equity curve carries the out-of-sample span, but the row itself
-    only carries a trade count - so this uses the walk-forward window
-    when it is there and gives up honestly when it is not, rather than
-    inventing a denominator.
+    Taken from the stored trade log (migration v8), which carries the
+    opening and closing timestamp of every backtested trade, so the
+    denominator is the span those trades actually covered.
+
+    It used to be derived from the row's aggregates:
+
+        busy_days = trades * avg_hold_hours / 24
+        rate      = trades / busy_days
+
+    which cancels to 24 / avg_hold_hours - the trade count drops out
+    entirely. What is left assumes the strategy is in a position every
+    hour of every day, back to back with no gaps, which is the
+    theoretical maximum rather than anything it did. Measured across this
+    Vault it inflated the expectation by 1.4x to 3.8x, and six of eight
+    strategies would have been reported as "trading less" while executing
+    at exactly their backtested rate - each one telling the user to go
+    and check a terminal that was working. The comment justifying it had
+    the direction backwards: raising the expectation makes the
+    trading-less branch fire more eagerly, not less.
     """
-    if not strategy.trades or strategy.avg_hold_hours is None:
+    rows = list(
+        session.execute(
+            select(StrategyTrade.opened_at, StrategyTrade.closed_at).where(
+                StrategyTrade.strategy_id == strategy.id
+            )
+        )
+    )
+    stamps = [value for row in rows for value in row if value is not None]
+    if len(stamps) < 2 or len(rows) < MIN_TRADES_FOR_PARITY:
         return None
-    # A strategy holds one position at a time (see backtest.simulate_trades:
-    # `i = exit_idx + 1`), so the time it spends in trades is a lower bound
-    # on the window those trades came from. Using it as the denominator
-    # gives the *most* frequent the strategy could possibly be, which makes
-    # "trading less than expected" a conservative claim rather than an
-    # eager one.
-    busy_days = strategy.trades * strategy.avg_hold_hours / 24
-    if busy_days <= 0:
+    span_days = (max(stamps) - min(stamps)) / timedelta(days=1)
+    if span_days <= 0:
         return None
-    return strategy.trades / busy_days
+    return len(rows) / span_days
 
 
 def check_parity(session: Session, strategy: Strategy, now: datetime | None = None) -> ParityVerdict:
@@ -102,13 +119,13 @@ def check_parity(session: Session, strategy: Strategy, now: datetime | None = No
     live_days = max((last - first) / timedelta(days=1), 1 / 24)
     live_rate = len(trades) / live_days
 
-    expected = _expected_rate(strategy)
+    expected = _expected_rate(session, strategy)
     if expected is None:
         return ParityVerdict(
             strategy.id, "unknown_expectation", len(trades), round(live_days, 2), round(live_rate, 2), None, None,
             (
-                f"Trading {live_rate:.1f} times a day live. The backtest on this strategy did not record enough "
-                "to compare against — run REFRESH on it and the comparison becomes available."
+                f"Trading {live_rate:.1f} times a day live. This strategy has no stored backtest trade log to "
+                "compare against — run REFRESH on it and the comparison becomes available."
             ),
         )
 

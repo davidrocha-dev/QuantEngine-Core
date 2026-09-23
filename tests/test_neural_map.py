@@ -1,3 +1,4 @@
+from pytest import approx
 import json
 
 from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
@@ -92,3 +93,28 @@ def test_a_cluster_with_one_score_is_bright_not_invisible():
                 f"cluster {cluster_id} shares one score, so nothing in it is the dim end: "
                 f"{[n.brightness for n in nodes]}"
             )
+
+
+def test_profitable_means_made_money_not_graded_well():
+    """The cluster panel labels this field "Profitable". It counted GOOD
+    grades — a composite score of 57+ blending robustness, persistence,
+    sample size and drawdown — while /analytics computes the same-named
+    field from return_pct > 0. Two answers behind one word."""
+    pool = GenePoolConfig()
+    strategies = []
+    for i in range(MIN_STRATEGIES_FOR_MAP):
+        row = make_strategy(i, random_genome(pool), score=70)
+        # Every one grades GOOD; only the first two actually made money.
+        row.return_pct = 12.0 if i < 2 else -4.0
+        strategies.append(row)
+
+    result = compute_neural_map(strategies)
+
+    assert result is not None
+    assert all(s.grade == "GOOD" for s in strategies), "fixture must be uniformly GOOD"
+    # Two of five made money, so whatever the clustering does, the
+    # count-weighted share has to be 40% — not the 100% that counting
+    # GOOD grades would give on this uniformly-GOOD fixture.
+    total = sum(c.strategy_count for c in result.clusters)
+    weighted = sum(c.profitable_pct * c.strategy_count for c in result.clusters) / total
+    assert weighted == approx(40.0), weighted

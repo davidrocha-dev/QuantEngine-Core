@@ -604,7 +604,13 @@ def _seed_portfolio_with_members(config, member_count: int = 2) -> str:
                     trades=80, return_pct=5.0, max_dd_pct=6.0, equity_oos=curve(index),
                 )
             )
-            session.add(PortfolioStrategy(portfolio_id=portfolio_id, strategy_id=strategy_id))
+        # Flush the parents first: these models carry no ORM relationship,
+        # so SQLAlchemy has no dependency to sort by and would otherwise
+        # insert the membership rows before the strategies they point at.
+        # Harmless until foreign keys were actually enforced.
+        session.flush()
+        for index in range(member_count):
+            session.add(PortfolioStrategy(portfolio_id=portfolio_id, strategy_id=f"#MEM{index}"))
         session.commit()
     return portfolio_id
 
@@ -1078,3 +1084,45 @@ def test_status_keeps_the_last_campaign_once_it_finishes(tmp_path, monkeypatch):
     assert body["campaign"] is not None, "the last campaign has to survive its own completion"
     assert body["campaign"]["asset"] == "XAUUSD"
     assert body["campaign"]["started_at"] is not None, "the live feed filters the Vault by this"
+
+
+def test_true_sim_replays_the_same_window_the_combined_curve_describes(tmp_path, monkeypatch):
+    """TRUE SIM exists to be read against the HEALTH tab's combined curve
+    — its docstring calls the gap between them "exactly what the
+    guardrails cost". That curve is built from stored out-of-sample
+    equity, while this replayed the full cached history, so the two
+    numbers described different periods and the extra 70% was the stretch
+    every member had been fitted on.
+    """
+    import pandas as pd
+
+    from app.engine.phases import IS_FRACTION
+    from app.engine.true_sim import TrueSimResult
+    from tests.helpers import make_synthetic_ohlc
+
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    portfolio_id = _seed_portfolio_with_members(fake_config, member_count=2)
+
+    full = make_synthetic_ohlc(4_000, seed=5)
+    captured: dict = {}
+
+    def capture(members, bars_by_market, gene_pool, config, **kwargs):
+        captured["bars"] = bars_by_market
+        return TrueSimResult(
+            strategy_count=len(members), sizing="COMPOUNDING", initial_balance=10_000.0,
+            final_balance=10_000.0, return_pct=0.0, max_drawdown_pct=0.0,
+            peak_simultaneous_risk_pct=0.0, peak_risk_at=None, trades_taken=0, trades_blocked=0,
+            blocked_by_symbol_lock=0, blocked_by_aggregate_risk=0,
+        )
+
+    monkeypatch.setattr(main_module, "_load_bars", lambda *a, **k: full)
+    monkeypatch.setattr(main_module, "run_true_sim", capture)
+
+    response = client.post(f"/portfolios/{portfolio_id}/true-sim", json={})
+    assert response.status_code == 200, response.text
+
+    replayed = next(iter(captured["bars"].values()))
+    expected_oos = len(full) - int(len(full) * IS_FRACTION)
+    assert len(replayed) == expected_oos, f"{len(replayed)} bars replayed, expected the {expected_oos}-bar OOS slice"
+    assert pd.Timestamp(replayed["timestamp"].iloc[0]) > pd.Timestamp(full["timestamp"].iloc[0])

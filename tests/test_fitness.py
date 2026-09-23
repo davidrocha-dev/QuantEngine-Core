@@ -72,6 +72,25 @@ def test_fitness_f2_formula():
     assert fitness_f2_expansion(stats) == 20.0 * 1.5 * 2.0
 
 
-def test_fitness_f2_infinite_profit_factor_treated_as_zero():
-    stats = make_stats(cagr_pct=20.0, profit_factor=float("inf"), payoff_ratio=2.0)
-    assert fitness_f2_expansion(stats) == 0.0
+def test_a_candidate_with_no_losing_trades_ranks_at_the_top_not_the_bottom():
+    """Both terms are divisions by zero when nothing lost, and both used
+    to arrive as values that sorted the candidate last: profit_factor as
+    inf, mapped to 0, and payoff_ratio already 0 for the same reason.
+
+    Measured: 120 trades with no losers passes Phase 0 screening, because
+     is False, and then scored 0.0 in F2 against a mediocre
+    rival's 11.44. compute_score already gives an infinite profit factor
+    full marks (scoring.pf_component); F2 did the opposite.
+    """
+    from app.engine.fitness import FITNESS_MAX_PAYOFF_RATIO, FITNESS_MAX_PROFIT_FACTOR
+
+    flawless = make_stats(cagr_pct=20.0, profit_factor=float("inf"), payoff_ratio=0.0)
+    mediocre = make_stats(cagr_pct=8.0, profit_factor=1.3, payoff_ratio=1.1)
+
+    assert fitness_f2_expansion(flawless) == 20.0 * FITNESS_MAX_PROFIT_FACTOR * FITNESS_MAX_PAYOFF_RATIO
+    assert fitness_f2_expansion(flawless) > fitness_f2_expansion(mediocre)
+
+
+def test_a_finite_profit_factor_is_used_as_measured():
+    stats = make_stats(cagr_pct=20.0, profit_factor=1.5, payoff_ratio=2.0)
+    assert fitness_f2_expansion(stats) == 20.0 * 1.5 * 2.0

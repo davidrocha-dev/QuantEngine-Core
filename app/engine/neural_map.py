@@ -183,7 +183,16 @@ def compute_neural_map(strategies: list[Strategy]) -> NeuralMapResult | None:
                 worst_id=ranked[0].id if ranked else None,
                 avg_return_pct=sum(returns) / len(returns) if returns else None,
                 avg_drawdown_pct=sum(drawdowns) / len(drawdowns) if drawdowns else None,
-                profitable_pct=100.0 * sum(1 for m in members if m.grade == "GOOD") / len(members),
+                # Profitable means it made money, not that it graded well.
+                # This counted GOOD grades - a composite score of 57+,
+                # which blends robustness, persistence, sample size and
+                # drawdown - and showed the result under a label reading
+                # "Profitable". /analytics computes the same-named field
+                # from return_pct > 0 (main.py), so the app had two
+                # different answers behind one word.
+                profitable_pct=(
+                    100.0 * sum(1 for m in members if (m.return_pct or 0) > 0) / len(members)
+                ),
                 top_symbol=_mode([m.asset for m in members]),
                 top_timeframe=_mode([m.timeframe for m in members]),
             )

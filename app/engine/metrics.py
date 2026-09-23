@@ -88,8 +88,16 @@ def cagr_pct(
     So a window under `MIN_YEARS_TO_ANNUALISE` reports nothing at all.
     "We cannot say" is a fact; "+27,929,074,494,351%/yr" is not.
     """
-    if len(equity_curve) == 0 or equity_curve[-1] <= 0 or bar_count == 0:
+    if len(equity_curve) == 0 or bar_count == 0:
         return 0.0
+    # A blown account used to land in the guard above and report 0.0% -
+    # the same figure as a strategy that did nothing, and a better one
+    # than a strategy that lost half. It also made the -100.0 branch
+    # further down unreachable, because nothing else can drive the final
+    # equity to zero or below. Losing everything is not an extrapolation,
+    # so it is reported whatever the window length.
+    if equity_curve[-1] <= 0:
+        return -100.0
     bars_per_year = BARS_PER_YEAR_BY_TIMEFRAME.get(timeframe, TRADING_DAYS_PER_YEAR)
     years = bar_count / bars_per_year
     if years <= 0:

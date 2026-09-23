@@ -125,3 +125,43 @@ def test_combined_equity_is_the_equal_weighted_blend():
 def test_combined_equity_is_empty_without_member_curves():
     combined = combined_equity_curve([make_strategy("#A")])
     assert combined == {"curve": [], "return_pct": None, "max_dd_pct": None, "sharpe": None}
+
+
+def test_a_member_that_did_not_exist_yet_is_not_counted_as_a_flat_day():
+    """The combined curve used to fill missing days with 0.0 and divide by
+    the full member count, so a member bred on a different window dragged
+    every other member's day towards zero.
+
+    Measured: two strategies each returning +81.50% over their own 200
+    days, run back to back, combined to +81.58% — the second one's whole
+    contribution erased. The correlation path in this same module already
+    refuses that substitution, and the module docstring says why.
+    """
+    import json
+
+    import pandas as pd
+
+    from app.engine.portfolio import combined_equity_curve
+
+    def member(strategy_id: str, start: str, daily_pct: float, days: int = 200) -> Strategy:
+        equity, value = [], 10_000.0
+        for stamp in pd.date_range(start, periods=days, freq="1D", tz="UTC"):
+            value *= 1 + daily_pct
+            equity.append({"t": stamp.isoformat(), "equity": round(value, 2)})
+        return Strategy(
+            id=strategy_id, data_source="dukascopy", asset="XAUUSD", timeframe="M15",
+            genome_json="{}", equity_oos=json.dumps(equity),
+        )
+
+    alone = combined_equity_curve([member("#A", "2026-01-01", 0.003)])
+    back_to_back = combined_equity_curve(
+        [member("#A", "2026-01-01", 0.003), member("#B", "2026-07-20", 0.003)]
+    )
+    overlapping = combined_equity_curve(
+        [member("#A", "2026-01-01", 0.003), member("#B", "2026-01-01", 0.003)]
+    )
+
+    # Two good runs one after the other compound; they do not average away.
+    assert back_to_back["return_pct"] > alone["return_pct"] * 2
+    # Two identical members held at the same time are still equal weight.
+    assert overlapping["return_pct"] == approx(alone["return_pct"], rel=1e-6)
