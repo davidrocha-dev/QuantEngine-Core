@@ -987,3 +987,50 @@ def test_sync_now_accepts_the_body_the_app_actually_sends():
             response = client.post("/data/sync", json={"symbols": ["XAUUSD"]})
             assert response.status_code == 200, response.text
             assert response.json()["symbols"] == ["XAUUSD"]
+
+
+def test_a_running_sync_can_be_stopped():
+    """A multi-year backfill is tens of thousands of hourly files and runs
+    for hours. `create_task` used to be called and its result dropped, so
+    there was no handle to reach it by — and the startup sync relaunches
+    on every open, so closing the app restarted it rather than stopping
+    it."""
+    import asyncio
+    import time
+
+    from unittest.mock import patch
+
+    import app.main as main_module
+
+    class SlowRunner:
+        def __init__(self, **kwargs):
+            pass
+
+        async def sync_all(self, symbols):
+            main_module._sync_state.running = True
+            try:
+                await asyncio.sleep(3600)
+            finally:
+                main_module._sync_state.running = False
+
+    with patch.object(main_module, "DeltaSyncRunner", SlowRunner):
+        with TestClient(main_module.app) as client:
+            main_module._sync_state.running = False
+            assert client.post("/data/sync", json={"symbols": ["XAUUSD"]}).status_code == 200
+
+            # The task starts on the app's own loop, so wait for it to be
+            # running before stopping it - otherwise this passes by
+            # stopping nothing.
+            for _ in range(100):
+                if client.get("/data/sync/status").json()["running"]:
+                    break
+                time.sleep(0.05)
+            assert client.get("/data/sync/status").json()["running"] is True, "sync never started"
+
+            response = client.post("/data/sync/stop")
+            assert response.status_code == 200, response.text
+            assert response.json()["stopped"] is True
+            assert client.get("/data/sync/status").json()["running"] is False
+
+            # Nothing to stop is a 409, not a silent success.
+            assert client.post("/data/sync/stop").status_code == 409

@@ -413,6 +413,11 @@ def _run_campaign_background(
 _campaign_control = CampaignControl()
 
 _sync_state = SyncState()
+# The running sync, so it can be stopped. `create_task` used to be called
+# and its result dropped, which left no way to reach a download that runs
+# for hours - and the startup sync relaunches on every open, so closing
+# the app did not stop it either, it restarted it.
+_sync_task: asyncio.Task | None = None
 
 
 async def _startup_delta_sync() -> None:
@@ -422,6 +427,8 @@ async def _startup_delta_sync() -> None:
     settings = load_settings(config.settings_path)
     symbols = settings["target_markets"]["enabled_symbols"] or list(BUNDLED_SYMBOLS)
     runner = DeltaSyncRunner(history_years=settings["campaign"]["history_depth_years"], state=_sync_state)
+    global _sync_task
+    _sync_task = asyncio.current_task()
     try:
         await runner.sync_all(symbols)
     except asyncio.CancelledError:
@@ -431,6 +438,9 @@ async def _startup_delta_sync() -> None:
 
         traceback.print_exc()
 
+
+# Long enough for a Parquet write on a worker thread to finish unwinding.
+SYNC_STOP_TIMEOUT_SECONDS = 15
 
 SCHEDULER_TICK_SECONDS = 60
 # How often auto-deploy re-checks. Hourly is deliberate: a degraded
@@ -1713,8 +1723,35 @@ async def sync_data(request: SyncRequest | None = None) -> dict:
     settings = load_settings(get_config().settings_path)
     target_symbols = symbols or settings["target_markets"]["enabled_symbols"] or list(BUNDLED_SYMBOLS)
     runner = DeltaSyncRunner(history_years=settings["campaign"]["history_depth_years"], state=_sync_state)
-    asyncio.create_task(runner.sync_all(target_symbols))
+    global _sync_task
+    _sync_task = asyncio.create_task(runner.sync_all(target_symbols))
     return {"started": True, "symbols": target_symbols}
+
+
+@app.post("/data/sync/stop")
+async def stop_sync() -> dict:
+    """Stops a running sync, keeping everything already downloaded.
+
+    A multi-year backfill is tens of thousands of hourly files and can
+    run overnight; a user who wants to breed in the meantime needs to be
+    able to call it off. Nothing is lost: whole blocks are committed as
+    they land and the watermarks record how far back the cache reaches,
+    so the next sync resumes from there rather than starting again.
+
+    It resumes on the next app launch, because the startup sync runs
+    unconditionally (REQ-DATA-1.5).
+    """
+    global _sync_task
+    if not _sync_state.running or _sync_task is None or _sync_task.done():
+        raise HTTPException(status_code=409, detail="No data sync is running")
+
+    _sync_task.cancel()
+    # A block being written lives in a worker thread, which cancellation
+    # does not interrupt, so give it a moment to unwind rather than
+    # reporting a stop that has not happened yet.
+    await asyncio.wait({_sync_task}, timeout=SYNC_STOP_TIMEOUT_SECONDS)
+    _sync_task = None
+    return {"stopped": True, **_sync_state.snapshot()}
 
 
 @app.get("/data/sync/status")
