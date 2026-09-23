@@ -62,3 +62,33 @@ def test_skips_unparseable_genome_json_without_crashing():
     result = compute_neural_map(good + [broken])
     assert result is not None
     assert "broken" not in {n.id for n in result.nodes}
+
+
+def test_a_cluster_with_one_score_is_bright_not_invisible():
+    """Brightness is a node's score relative to its cluster's own range.
+
+    A cluster of one — which is most of them until a Vault has grown —
+    has no range, and reading that undefined ratio as zero put every node
+    at the dim end of its hue. The screen came out blank: seventeen
+    strategies on it, every one at a lightness the background swallows.
+    """
+    pool = GenePoolConfig()
+    strategies = [
+        make_strategy(i, random_genome(pool), score=60 + i) for i in range(MIN_STRATEGIES_FOR_MAP)
+    ]
+
+    result = compute_neural_map(strategies)
+
+    assert result is not None and result.nodes
+    by_cluster: dict[int, list] = {}
+    for node in result.nodes:
+        by_cluster.setdefault(node.cluster_id, []).append(node)
+
+    for cluster_id, nodes in by_cluster.items():
+        brightest = max(node.brightness for node in nodes)
+        assert brightest == 1.0, f"cluster {cluster_id} has no bright node"
+        if len({node.score for node in nodes}) == 1:
+            assert all(node.brightness == 1.0 for node in nodes), (
+                f"cluster {cluster_id} shares one score, so nothing in it is the dim end: "
+                f"{[n.brightness for n in nodes]}"
+            )

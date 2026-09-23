@@ -144,6 +144,13 @@ def compute_neural_map(strategies: list[Strategy]) -> NeuralMapResult | None:
         members = [valid_strategies[i] for i in indices]
         scores = [m.score for m in members if m.score is not None]
         score_min, score_max = (min(scores), max(scores)) if scores else (0, 0)
+        # A cluster whose members all share one score - and every cluster
+        # of one, which is most of them until a Vault has grown - has no
+        # range to be relative to. That is not a brightness of zero, it is
+        # an undefined ratio, and reading it as zero rendered every node
+        # at the dim end of its hue: a Neural Map that was simply blank.
+        # A lone member is the best in its own cluster, so it reads as it.
+        degenerate = score_max == score_min
         score_span = score_max - score_min or 1
 
         for i, member in zip(indices, members):
@@ -160,7 +167,7 @@ def compute_neural_map(strategies: list[Strategy]) -> NeuralMapResult | None:
                     max_dd_pct=member.max_dd_pct,
                     symbol=member.asset,
                     timeframe=member.timeframe,
-                    brightness=(score - score_min) / score_span,
+                    brightness=1.0 if degenerate else (score - score_min) / score_span,
                 )
             )
 
