@@ -7,9 +7,12 @@ the first time in Phase 4 (REQ-ENGINE-3.6).
 
 from __future__ import annotations
 
+import logging
+
 import os
 import random
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Callable
@@ -28,6 +31,8 @@ from app.engine.resources import limit_worker_threads, max_parallel_workers
 from app.engine.walk_forward import WalkForwardResult, run_walk_forward
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genome import Genome, crossover, mutate
+
+logger = logging.getLogger(__name__)
 
 IS_FRACTION = 0.7
 DEFAULT_INITIAL_BALANCE = 10_000.0
@@ -272,9 +277,29 @@ def run_generational_phase(
                 parent_a, parent_b = random.sample(elites, 2) if len(elites) >= 2 else (elites[0], elites[0])
                 child_genomes.append(mutate(crossover(parent_a.genome, parent_b.genome), gene_pool, mutation_rate))
 
-            children = evaluate_population(
-                child_genomes, df, gene_pool, max_workers=workers, executor=executor, **eval_kwargs
-            )
+            try:
+                children = evaluate_population(
+                    child_genomes, df, gene_pool, max_workers=workers, executor=executor, **eval_kwargs
+                )
+            except (MemoryError, BrokenProcessPool) as exc:
+                # Observed on a real campaign: MemoryError inside the pool
+                # during Phase 2, and the whole campaign was marked
+                # crashed after four minutes of work. The pool is sized
+                # once, when the phase starts, against the memory free at
+                # that instant - and a phase runs for minutes while the
+                # parent grows and every other application on the machine
+                # takes what it wants. Nothing can make that estimate
+                # exact, so the campaign has to survive being wrong about
+                # it: drop the pool and finish this phase in-process. Much
+                # slower, and it produces the same strategies rather than
+                # none.
+                logger.warning("Parallel evaluation failed (%s) — finishing this phase serially", type(exc).__name__)
+                if executor is not None:
+                    stack.close()
+                    executor = None
+                children = evaluate_population(
+                    child_genomes, df, gene_pool, max_workers=1, **eval_kwargs
+                )
             for candidate in children:
                 candidate.fitness = fitness_fn(candidate.stats)
                 candidate.tribe = tribe_label

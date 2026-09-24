@@ -119,3 +119,49 @@ def test_phase_4_never_approves_the_same_genome_twice():
     assert len(approved) <= 1
     for vault_candidate in approved:
         assert vault_candidate.stats_oos.net_profit_pct > 0
+
+
+def test_a_phase_finishes_serially_when_the_pool_runs_out_of_memory():
+    """Observed on a real campaign: MemoryError inside the process pool
+    during Phase 2, and the whole run was marked crashed after four
+    minutes of work.
+
+    The pool is sized once, when the phase starts, against the memory
+    free at that instant — and a phase runs for minutes while the parent
+    grows and every other application on the machine takes what it wants.
+    Nothing makes that estimate exact, so the campaign has to survive
+    being wrong about it.
+    """
+    from unittest.mock import patch
+
+    import app.engine.phases as phases
+
+    df = make_synthetic_ohlc(3_000, seed=11)
+    pool = GenePoolConfig()
+    seeds = [
+        phases.evaluate_candidate(genome, df, pool, point_size=0.0001)
+        for genome in random_population(pool, 12)
+    ]
+    for candidate in seeds:
+        candidate.fitness = 1.0
+
+    calls = {"n": 0}
+    real = phases.evaluate_population
+
+    def flaky(genomes, bars, gene_pool, max_workers=None, executor=None, **kwargs):
+        # Fail exactly once, on the pooled path, as a real pool does.
+        if executor is not None and calls["n"] == 0:
+            calls["n"] += 1
+            raise MemoryError("simulated")
+        return real(genomes, bars, gene_pool, max_workers=max_workers, executor=executor, **kwargs)
+
+    with patch.object(phases, "evaluate_population", flaky):
+        with patch.object(phases, "_MIN_POPULATION_FOR_PARALLEL_SCREENING", 1):
+            outcome = phases.run_generational_phase(
+                seeds, lambda stats: stats.net_profit_pct, "A", pool, df,
+                generations=2, top_n=5, max_workers=2, point_size=0.0001,
+            )
+
+    assert calls["n"] == 1, "the fixture has to actually exercise the pooled path"
+    assert outcome.passed
+    assert outcome.survivors, "the phase produced nothing after falling back"
