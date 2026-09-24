@@ -422,6 +422,8 @@ def run_phase_4_robustness(
     is_fraction: float = IS_FRACTION,
     initial_balance: float = DEFAULT_INITIAL_BALANCE,
     rng: np.random.Generator | None = None,
+    max_drawdown_pct: float = 0.0,
+    rejections: dict[str, int] | None = None,
     **eval_kwargs,
 ) -> list[VaultCandidate]:
     """REQ-ENGINE-3.6-3.11 — 70/30 IS/OOS split (OOS seen for the first
@@ -429,6 +431,16 @@ def run_phase_4_robustness(
     injection, ICIR/AVG HOLD, Hash ID assignment on pass."""
     is_df, oos_df = split_is_oos(full_df, is_fraction)
     approved: list[VaultCandidate] = []
+    # Why the ones that did not make it did not make it. A campaign that
+    # approves nothing used to say nothing at all - it reported
+    # "completed" over an empty Vault, and the only way to find out what
+    # had happened was to read the engine's source.
+    rejected: dict[str, int] = {}
+
+    def reject(reason: str) -> None:
+        rejected[reason] = rejected.get(reason, 0) + 1
+        if rejections is not None:
+            rejections[reason] = rejections.get(reason, 0) + 1
     seen: set[str] = set()
 
     for candidate in tribe_c:
@@ -451,11 +463,26 @@ def run_phase_4_robustness(
         )
         timeframe = eval_kwargs.get("timeframe", "H1")
         oos_stats = compute_trade_stats(oos_result, oos_df, initial_balance, timeframe)
-        if oos_stats.trade_count < MIN_OOS_TRADES or oos_stats.net_profit_pct <= 0:
-            # Two gates, both about evidence: a strategy that loses money on
-            # the locked 30% has no out-of-sample edge, and one that made a
-            # handful of trades has no evidence either way — a 2-trade,
-            # +0.4% sample would otherwise enter the Vault scoring 94.
+        # Settings -> Risk -> MAX DRAWDOWN. The user sets a drawdown they
+        # are prepared to live through, and until now nothing read it:
+        # `settings["risk"]["max_drawdown_pct"]` appeared in no engine
+        # code path at all, while 24 of 25 strategies in a real Vault
+        # exceeded the 20% that had been configured, median 31.2%. A risk
+        # limit that nothing enforces is decoration on the one screen
+        # where decoration is dangerous.
+        if max_drawdown_pct > 0 and oos_stats.max_dd_pct > max_drawdown_pct:
+            reject(f"drawdown above the {max_drawdown_pct:g}% limit in Settings -> Risk")
+            continue
+
+        # Two gates, both about evidence: a strategy that loses money on
+        # the locked 30% has no out-of-sample edge, and one that made a
+        # handful of trades has no evidence either way — a 2-trade,
+        # +0.4% sample would otherwise enter the Vault scoring 94.
+        if oos_stats.trade_count < MIN_OOS_TRADES:
+            reject(f"fewer than {MIN_OOS_TRADES} out-of-sample trades")
+            continue
+        if oos_stats.net_profit_pct <= 0:
+            reject("no out-of-sample edge")
             continue
 
         # REQ-ENGINE-3.8 — the perturbed run is a real re-simulation of the
@@ -486,6 +513,7 @@ def run_phase_4_robustness(
             rng=rng,
         )
         if not robustness.passed:
+            reject(robustness.fail_reason or "failed the robustness test")
             continue
 
         # Walk-forward: the 70/30 split tests one period, which a strategy
@@ -509,6 +537,7 @@ def run_phase_4_robustness(
         )
         persistence = walk_forward.persistence_pct if walk_forward else None
         if persistence is not None and persistence < MIN_PERSISTENCE_PCT:
+            reject(f"profitable in under {MIN_PERSISTENCE_PCT:g}% of the windows after training")
             continue
 
         approved.append(

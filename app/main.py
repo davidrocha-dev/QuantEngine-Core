@@ -330,6 +330,7 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
         timeframe=timeframe,
         # Settings → Risk (REQ-SET-1.2) is a percentage; the backtester takes a fraction.
         risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
+        max_drawdown_pct=float(settings["risk"]["max_drawdown_pct"]),
         # Costs are in the instrument's own points (0.00001 on EURUSD,
         # 0.001 on USDJPY/XAUUSD), not a fixed pip.
         point_size=1 / instrument.point_divisor,

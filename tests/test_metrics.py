@@ -154,3 +154,34 @@ def test_a_blown_account_is_not_reported_as_flat():
     # A window too short to annualise still reports the total loss: losing
     # everything is a fact, not an extrapolation.
     assert cagr_pct(np.array([10_000.0, 0.0]), 10_000.0, 100, "H1") == -100.0
+
+
+def test_icir_is_positive_for_a_profitable_low_win_rate_strategy():
+    """ICIR reduced each trade to the *sign* of its R before averaging,
+    which makes the statistic (2 x win_rate - 1) / spread — a number that
+    cannot be positive unless the strategy wins more often than it loses.
+
+    Measured across a real Vault: 25 strategies, 25 negative ICIRs, a
+    perfect monotone in win rate (15.8% -> -4.56, 40.1% -> -0.94) and no
+    relation to whether the strategy made money. One returning +123.9%
+    was reported at -4.56, under a Promotion Verdict line reading "ICIR
+    computed", which is true and is not a test.
+    """
+    from app.engine.backtest import Trade
+    from app.engine.metrics import information_coefficient_information_ratio as icir
+
+    def run(r_multiples):
+        return [Trade(i, i + 1, 1, 1.0, 1.0, 0.9, 1.2, r, r * 100, "target") for i, r in enumerate(r_multiples)]
+
+    # One winner in five, paying 6R: loses four times as often as it wins
+    # and makes money doing it.
+    high_payoff = run([6.0 if i % 5 == 0 else -1.0 for i in range(60)])
+    # Wins four times in five and gives it all back on the fifth.
+    losing_but_frequent = run([0.2 if i % 5 else -1.5 for i in range(60)])
+
+    assert sum(t.r_multiple for t in high_payoff) > 0
+    assert sum(t.r_multiple for t in losing_but_frequent) < 0
+
+    assert icir(high_payoff) > 0, "a profitable strategy cannot have a negative edge per trade"
+    assert icir(losing_but_frequent) < 0, "and a losing one cannot have a positive one"
+    assert icir(high_payoff) > icir(losing_but_frequent)

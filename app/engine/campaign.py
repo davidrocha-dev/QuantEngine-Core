@@ -70,6 +70,8 @@ class CampaignConfig:
     phase3_children: int = 80
     initial_balance: float = 10_000.0
     risk_pct: float = 0.01
+    # Settings -> Risk -> MAX DRAWDOWN, as a Phase 4 gate. 0 disables it.
+    max_drawdown_pct: float = 0.0
     timeframe: str = "H1"
     point_size: float = 0.0001
     max_workers: int | None = None  # None = all detected cores
@@ -358,8 +360,10 @@ def run_campaign(
 
     campaign.phase = PHASE_ROBUSTNESS
     session.commit()
+    rejections: dict[str, int] = {}
     vault_candidates = run_phase_4_robustness(
-        phase_3.survivors, df, gene_pool, **eval_kwargs,
+        phase_3.survivors, df, gene_pool, max_drawdown_pct=config.max_drawdown_pct,
+        rejections=rejections, **eval_kwargs,
     )
     _set_survivors_per_phase(session, campaign_id, PHASE_ROBUSTNESS, len(vault_candidates))
 
@@ -377,5 +381,19 @@ def run_campaign(
     campaign.status = "completed"
     campaign.finished_at = datetime.now(timezone.utc)
     session.commit()
+
+    # A campaign that approves nothing used to report "completed" over an
+    # empty Vault and leave the user to guess. Phase 4 counts why it said
+    # no, and the two commonest reasons are worth more than silence -
+    # especially when one of them is a limit the user set in Settings and
+    # can change.
+    if not vault_candidates and rejections:
+        ranked = sorted(rejections.items(), key=lambda item: item[1], reverse=True)
+        detail = ", ".join(f"{count} for {reason}" for reason, count in ranked[:2])
+        return PhaseOutcome(
+            passed=True,
+            survivors=[],
+            fail_reason=f"No candidate cleared Phase 4: {detail}.",
+        )
 
     return PhaseOutcome(passed=True, survivors=[])

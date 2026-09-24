@@ -157,10 +157,14 @@ def test_a_phase_finishes_serially_when_the_pool_runs_out_of_memory():
 
     with patch.object(phases, "evaluate_population", flaky):
         with patch.object(phases, "_MIN_POPULATION_FOR_PARALLEL_SCREENING", 1):
-            outcome = phases.run_generational_phase(
-                seeds, lambda stats: stats.net_profit_pct, "A", pool, df,
-                generations=2, top_n=5, max_workers=2, point_size=0.0001,
-            )
+            # Force the pooled path: the real guard is a function of how
+            # much memory this machine happens to have free right now, and
+            # a test that only runs when it is roomy is not a test.
+            with patch.object(phases, "max_parallel_workers", lambda requested, bars=None: 2):
+                outcome = phases.run_generational_phase(
+                    seeds, lambda stats: stats.net_profit_pct, "A", pool, df,
+                    generations=2, top_n=5, max_workers=2, point_size=0.0001,
+                )
 
     assert calls["n"] == 1, "the fixture has to actually exercise the pooled path"
     assert outcome.passed
@@ -197,3 +201,37 @@ def test_a_lost_worker_pool_does_not_take_the_campaign_with_it():
                 fallback = phases.evaluate_population(genomes, df, pool, max_workers=4, point_size=0.0001)
 
     assert len(fallback) == len(genomes)
+
+
+def test_phase_4_honours_the_configured_drawdown_limit():
+    """Settings → Risk → MAX DRAWDOWN read nothing at all.
+
+    `settings["risk"]["max_drawdown_pct"]` appeared in no engine code
+    path, while 24 of 25 strategies in a real Vault exceeded the 20% that
+    had been configured, median 31.2%. A risk limit nothing enforces is
+    decoration on the one screen where decoration is dangerous.
+    """
+    from unittest.mock import patch
+
+    import app.engine.phases as phases
+
+    df = make_synthetic_ohlc(8_000, seed=3, drift=0.0003, volatility=0.004)
+    pool = GenePoolConfig()
+    survivors = [
+        phases.evaluate_candidate(genome, df, pool, point_size=0.0001)
+        for genome in random_population(pool, 25)
+    ]
+    for candidate in survivors:
+        candidate.fitness = 1.0
+
+    generous = phases.run_phase_4_robustness(
+        survivors, df, pool, point_size=0.0001, max_drawdown_pct=0.0
+    )
+    strict = phases.run_phase_4_robustness(
+        survivors, df, pool, point_size=0.0001, max_drawdown_pct=1.0
+    )
+
+    assert len(strict) <= len(generous)
+    assert not strict, "a 1% drawdown limit has to reject everything this produces"
+    for candidate in generous:
+        assert candidate.stats_oos.max_dd_pct >= 0

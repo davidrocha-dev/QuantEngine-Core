@@ -4,6 +4,7 @@ formulas (REQ-ENGINE-3), plus ICIR/AVG HOLD (REQ-ENGINE-3.9).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -16,6 +17,11 @@ MAX_REPORTED_CAGR_PCT = 1000.0
 # Below this much history, annualising is extrapolation dressed as a
 # measurement. Half a year is already generous for the claim "per year".
 MIN_YEARS_TO_ANNUALISE = 0.5
+# A perfectly steady edge divides by a spread of zero. The ratio is
+# unbounded, not absent, and "unbounded" has to sort somewhere: at the
+# end it belongs, which is the top for a winner and the bottom for a
+# loser. Same treatment an infinite profit factor gets in fitness.py.
+MAX_REPORTED_ICIR = 10.0
 BARS_PER_YEAR_BY_TIMEFRAME = {
     "M1": 252 * 24 * 60, "M5": 252 * 24 * 12, "M15": 252 * 24 * 4, "M30": 252 * 24 * 2,
     "H1": 252 * 24, "H2": 252 * 12, "H4": 252 * 6, "D1": 252,
@@ -148,19 +154,41 @@ def sharpe_ratio(equity_curve: np.ndarray, timestamps: pd.DatetimeIndex | None =
 
 
 def information_coefficient_information_ratio(trades: list[Trade]) -> float:
-    """ICIR — Information Coefficient Information Ratio: the mean of the
-    per-trade information coefficient (correlation proxy: sign match between
-    predicted direction and realized R-multiple) divided by its stdev
-    across a rolling window of trades. A standard robustness-of-edge stat:
-    high & stable IC across trades beats a lucky few big winners."""
+    """ICIR — how much edge per trade, and how steadily.
+
+    The mean of a rolling window of realised R divided by the standard
+    deviation of those windows: positive when the average trade makes
+    money, and larger when it does so consistently rather than through a
+    lucky few. That is what "high and stable across trades beats a lucky
+    few big winners" was always meant to say.
+
+    It used to reduce each trade to the *sign* of its R before averaging,
+    which makes the statistic (2 x win_rate - 1) / spread - a number that
+    cannot be positive unless the strategy wins more often than it loses.
+    Measured across a real Vault: 25 strategies, 25 negative ICIRs, a
+    perfect monotone in win rate (15.8% -> -4.56, 40.1% -> -0.94) and no
+    relation to whether the strategy made money. These are high-payoff,
+    low-frequency-of-winning strategies; one returning +123.9% was
+    reported at -4.56 and the Promotion Verdict said "ICIR computed",
+    which is true and is not a test.
+    """
     if len(trades) < 5:
         return 0.0
-    ic_series = np.array([1.0 if t.r_multiple > 0 else (-1.0 if t.r_multiple < 0 else 0.0) for t in trades])
-    window = min(20, len(ic_series))
-    rolling_ic = pd.Series(ic_series).rolling(window).mean().dropna()
-    if len(rolling_ic) < 2 or rolling_ic.std() == 0:
+    r_multiples = np.array([t.r_multiple for t in trades], dtype=float)
+    r_multiples = r_multiples[np.isfinite(r_multiples)]
+    if len(r_multiples) < 5:
         return 0.0
-    return float(rolling_ic.mean() / rolling_ic.std())
+    window = min(20, len(r_multiples))
+    rolling = pd.Series(r_multiples).rolling(window).mean().dropna()
+    if len(rolling) < 2:
+        return 0.0
+    spread = float(rolling.std())
+    mean = float(rolling.mean())
+    if spread == 0:
+        # Every window identical: no variability to divide by. Zero would
+        # rank the steadiest edge alongside no edge at all.
+        return 0.0 if mean == 0 else math.copysign(MAX_REPORTED_ICIR, mean)
+    return float(max(-MAX_REPORTED_ICIR, min(MAX_REPORTED_ICIR, mean / spread)))
 
 
 def avg_hold_hours(trades: list[Trade], df: pd.DataFrame) -> float:

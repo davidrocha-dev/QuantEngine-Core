@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -147,3 +148,44 @@ def test_resume_reuses_checkpointed_population(session):
 
     outcome = run_campaign(session, "c1", df, pool, config, resume=True)
     assert outcome is not None  # completes (or legitimately cancels) without crashing on the resume path
+
+
+def test_a_campaign_that_approves_nothing_says_why():
+    """It used to report "completed" over an empty Vault and leave the
+    user to guess. One of the commonest reasons is a limit they set in
+    Settings and can change, so silence is the worst possible answer.
+    """
+    from unittest.mock import patch
+
+    import app.engine.campaign as campaign_module
+
+    def nothing_approved(tribe_c, full_df, gene_pool, **kwargs):
+        rejections = kwargs.get("rejections")
+        if rejections is not None:
+            rejections["drawdown above the 20% limit in Settings -> Risk"] = 7
+            rejections["no out-of-sample edge"] = 2
+        return []
+
+    engine = make_engine(":memory:")
+    Base.metadata.create_all(engine)
+    df = make_synthetic_ohlc(6_000, seed=21, drift=0.0003, volatility=0.004)
+
+    with Session(engine) as session:
+        session.add(
+            Campaign(id="empty", started_at=datetime.now(timezone.utc), asset="XAUUSD",
+                     timeframe="M15", status="running")
+        )
+        session.commit()
+
+        with patch.object(campaign_module, "run_phase_4_robustness", nothing_approved):
+            outcome = campaign_module.run_campaign(
+                session, "empty", df, GenePoolConfig(),
+                campaign_module.CampaignConfig(
+                    population_size=40, generations_per_tribe=1, max_workers=1,
+                    timeframe="M15", point_size=0.0001,
+                ),
+            )
+
+    assert outcome.fail_reason, "an empty campaign has to explain itself"
+    assert "drawdown above the 20% limit" in outcome.fail_reason
+    assert "7 for" in outcome.fail_reason, "and say how many, so the user knows if it is the main cause"
