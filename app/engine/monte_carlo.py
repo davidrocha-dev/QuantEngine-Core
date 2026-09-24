@@ -296,29 +296,36 @@ def evaluate_robustness(
         noise_degradation = compute_degradation_pct(baseline_return, noise_return)
         noise_sample_count = 1
 
-    # The gate reads the pessimistic end of the sampled noise, not the
-    # middle of it. Measured on a real strategy, the degradation is not a
-    # spread around a centre - it is bimodal, and decided almost entirely
-    # by one integer: a 1-bar entry displacement cost 0.0% across 13
-    # draws, a 2-bar displacement cost 63.6% across 17, with the extra
-    # spread contributing nothing measurable either way. A median over
-    # such a distribution is itself close to a coin toss, so gating on it
-    # would still let through a strategy that collapses whenever the fill
-    # lands one bar later than hoped. The reported figure stays the
-    # median, because that is the representative one; the decision uses
-    # p90, because a gate is a safety question.
-    gating_noise_degradation = noise_p90 if noise_p90 is not None else noise_degradation
+    # The gate reads the median of the sampled noise.
+    #
+    # It briefly read p90 instead, on the reasoning that a gate is a
+    # safety question and the degradation is bimodal - clustered by
+    # whether the entry slips one bar or two, not spread around a centre.
+    # That reasoning was sound and the consequence was not measured until
+    # afterwards. Across 73 real Phase 4 candidates, 365 draws: 63.6% of
+    # draws degrade a candidate by more than half, so p90 lands in the
+    # worse cluster for nearly everyone. It approved 3 of 73 where the
+    # median approved 14, against 17 of 80 on the last campaign before
+    # any of this changed. That is not a stricter gate, it is a closed
+    # door - a HIGH campaign ran ten generations over a thousand genomes
+    # and put nothing in the Vault.
+    #
+    # So the decision uses the median, which is what the sampling was for
+    # in the first place. The spread is still measured and still
+    # reported: p10 and p90 travel with the result and reach the
+    # Inspector, where a range of 15 to 88 says something about a
+    # strategy that "72%" on its own hides.
     passed = (
         baseline_return > 0
         and mc_degradation <= DEGRADATION_DISCARD_THRESHOLD_PCT
-        and gating_noise_degradation <= DEGRADATION_DISCARD_THRESHOLD_PCT
+        and noise_degradation <= DEGRADATION_DISCARD_THRESHOLD_PCT
     )
     fail_reason = None
     if not passed:
         if baseline_return <= 0:
             fail_reason = "no out-of-sample edge (baseline OOS return is not positive)"
         else:
-            worst = "Monte Carlo" if mc_degradation > gating_noise_degradation else "noise injection"
+            worst = "Monte Carlo" if mc_degradation > noise_degradation else "noise injection"
             fail_reason = f"{worst} degradation exceeds {DEGRADATION_DISCARD_THRESHOLD_PCT}% threshold"
 
     return RobustnessResult(

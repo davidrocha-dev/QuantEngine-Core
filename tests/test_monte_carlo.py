@@ -115,30 +115,37 @@ def _run(r_multiple: float, count: int = 40) -> list[Trade]:
     return [make_trade(i, i + 1, r_multiple * 100.0) for i in range(count)]
 
 
-def test_the_noise_gate_reads_the_pessimistic_end_not_the_middle():
-    """Measured on a real strategy, noise degradation is bimodal and
-    decided almost entirely by one integer: a 1-bar entry displacement
-    cost 0.0% across 13 draws, a 2-bar displacement 63.6% across 17. A
-    median over that is itself close to a coin toss, so the gate reads
-    p90 while the reported figure stays the median."""
+def test_the_gate_reads_the_median_and_still_reports_the_spread():
+    """The gate briefly read p90 instead, reasoning that a gate is a
+    safety question and the degradation is bimodal rather than spread
+    around a centre. The reasoning was sound; the consequence was not
+    measured until afterwards.
+
+    Across 73 real Phase 4 candidates and 365 draws, 63.6% of draws
+    degrade a candidate by more than half, so p90 lands in the worse
+    cluster for nearly everyone: it approved 3 of 73 where the median
+    approved 14, against 17 of 80 on the last campaign before any of
+    this changed. A HIGH campaign ran ten generations over a thousand
+    genomes and put nothing in the Vault.
+
+    The spread is still measured and still travels with the result.
+    """
     df = make_synthetic_ohlc(2_000, seed=5)
     baseline = _run(1.0)
     # Three draws that barely hurt and two that are ruinous: the median
-    # clears the threshold, the p90 does not.
+    # survives, which is the decision, and the range says what the median
+    # cannot.
     runs = [_run(0.98), _run(0.97), _run(0.96), _run(-0.5), _run(-0.6)]
 
     result = evaluate_robustness(baseline, df, 10_000.0, 0.0001, risk_pct=0.01, noisy_runs=runs)
 
     assert result.noise_samples == 5
-    assert result.noise_degradation_p90_pct is not None
-    assert result.noise_degradation_p90_pct > result.noise_degradation_pct, (
-        "p90 must sit above the median or this fixture tests nothing"
+    assert result.noise_degradation_pct <= DEGRADATION_DISCARD_THRESHOLD_PCT
+    assert result.passed, "the median clears the threshold, so this passes"
+    assert result.noise_degradation_p90_pct > DEGRADATION_DISCARD_THRESHOLD_PCT, (
+        "and the range has to show the draws that did not"
     )
-    assert result.noise_degradation_pct <= DEGRADATION_DISCARD_THRESHOLD_PCT, (
-        "the median alone would have passed this"
-    )
-    assert result.noise_degradation_p90_pct > DEGRADATION_DISCARD_THRESHOLD_PCT
-    assert not result.passed, "a strategy that collapses on two draws in five is not robust"
+    assert result.noise_degradation_p10_pct < result.noise_degradation_pct
 
 
 def test_a_single_draw_reports_no_range():
