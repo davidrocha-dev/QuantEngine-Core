@@ -165,3 +165,35 @@ def test_a_phase_finishes_serially_when_the_pool_runs_out_of_memory():
     assert calls["n"] == 1, "the fixture has to actually exercise the pooled path"
     assert outcome.passed
     assert outcome.survivors, "the phase produced nothing after falling back"
+
+
+def test_a_lost_worker_pool_does_not_take_the_campaign_with_it():
+    """The worker dies inside `import socket` during the spawn, before any
+    of our code runs, so what comes back is a broken pool or a bare
+    MemoryError. A campaign that has spent four minutes getting this far
+    must not die of it."""
+    from concurrent.futures.process import BrokenProcessPool
+    from unittest.mock import patch
+
+    import app.engine.phases as phases
+
+    df = make_synthetic_ohlc(1_500, seed=13)
+    pool = GenePoolConfig()
+    genomes = random_population(pool, 6)
+
+    class DeadPool:
+        def map(self, *args, **kwargs):
+            raise BrokenProcessPool("a process in the process pool was terminated abruptly")
+
+    results = phases.evaluate_population(genomes, df, pool, max_workers=4, executor=DeadPool(), point_size=0.0001)
+
+    assert len(results) == len(genomes), "every genome still has to be evaluated"
+    assert all(r.stats is not None for r in results)
+
+    # And the path that builds its own pool, where the spawn itself fails.
+    with patch.object(phases, "ProcessPoolExecutor", side_effect=MemoryError("cannot spawn")):
+        with patch.object(phases, "_MIN_POPULATION_FOR_PARALLEL_SCREENING", 1):
+            with patch.object(phases, "max_parallel_workers", lambda requested, bars=None: 4):
+                fallback = phases.evaluate_population(genomes, df, pool, max_workers=4, point_size=0.0001)
+
+    assert len(fallback) == len(genomes)

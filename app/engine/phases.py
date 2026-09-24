@@ -178,20 +178,39 @@ def evaluate_population(
     every generation instead of paying pool startup per generation."""
     workers = max_workers if max_workers is not None else (os.cpu_count() or 1)
 
+    def serially() -> list[CandidateResult]:
+        return [evaluate_candidate(genome, df, gene_pool, **eval_kwargs) for genome in genomes]
+
+    # Every parallel path here can lose its workers to the host running
+    # out of memory, and the worker dies inside `import socket` during the
+    # spawn - before any of this code runs, so the only thing that comes
+    # back is a broken pool or a MemoryError. A campaign that has spent
+    # four minutes getting this far must not die of it: one slow phase
+    # beats no strategies.
     if executor is not None:
         chunksize = max(1, len(genomes) // (max(workers, 1) * 4))
-        return list(executor.map(_evaluate_in_worker, genomes, chunksize=chunksize))
+        try:
+            return list(executor.map(_evaluate_in_worker, genomes, chunksize=chunksize))
+        except (MemoryError, BrokenProcessPool):
+            logger.warning("Shared worker pool lost — evaluating %d genomes in-process", len(genomes))
+            return serially()
 
     # Cores are not the only budget — see app/engine/resources.py.
     workers = max_parallel_workers(workers, df)
     if workers <= 1 or len(genomes) < _MIN_POPULATION_FOR_PARALLEL_SCREENING:
-        return [evaluate_candidate(genome, df, gene_pool, **eval_kwargs) for genome in genomes]
+        return serially()
 
-    with ProcessPoolExecutor(
-        max_workers=workers, initializer=_init_phase_0_worker, initargs=(df, gene_pool, eval_kwargs)
-    ) as pool:
-        chunksize = max(1, len(genomes) // (workers * 4))
-        return list(pool.map(_evaluate_in_worker, genomes, chunksize=chunksize))
+    try:
+        with ProcessPoolExecutor(
+            max_workers=workers, initializer=_init_phase_0_worker, initargs=(df, gene_pool, eval_kwargs)
+        ) as pool:
+            chunksize = max(1, len(genomes) // (workers * 4))
+            return list(pool.map(_evaluate_in_worker, genomes, chunksize=chunksize))
+    except (MemoryError, BrokenProcessPool, OSError):
+        # OSError covers the spawn failing outright, which is how Windows
+        # reports it when it cannot start the process at all.
+        logger.warning("Could not run %d workers — evaluating %d genomes in-process", workers, len(genomes))
+        return serially()
 
 
 def run_phase_0_screening(

@@ -638,7 +638,13 @@ def get_status() -> dict:
             campaign = session.get(Campaign, _active_campaign_id)
         if campaign is None:
             campaign = session.scalar(select(Campaign).where(Campaign.status == "running"))
-        running = campaign is not None
+        # Derived from the campaign's own status, not from the module
+        # global being set. `_active_campaign_id` is cleared when a run
+        # finishes, and a crash that skips that cleanup used to leave
+        # /status reporting a phantom running campaign for the rest of the
+        # process - which disables the Launch button against a campaign
+        # that ended minutes ago.
+        running = campaign is not None and campaign.status == "running"
         if campaign is None:
             # Nothing is running, so report the most recent one rather
             # than nothing at all. BREED lost every detail of a campaign

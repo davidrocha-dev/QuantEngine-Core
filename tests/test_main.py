@@ -1126,3 +1126,43 @@ def test_true_sim_replays_the_same_window_the_combined_curve_describes(tmp_path,
     expected_oos = len(full) - int(len(full) * IS_FRACTION)
     assert len(replayed) == expected_oos, f"{len(replayed)} bars replayed, expected the {expected_oos}-bar OOS slice"
     assert pd.Timestamp(replayed["timestamp"].iloc[0]) > pd.Timestamp(full["timestamp"].iloc[0])
+
+
+def test_a_stale_campaign_id_does_not_report_a_phantom_run(tmp_path, monkeypatch):
+    """`state` was derived from the module global being set, not from the
+    campaign's own status. `_active_campaign_id` is cleared when a run
+    finishes, and a crash that skips that cleanup left /status reporting
+    a running campaign for the rest of the process — which disables the
+    Launch button against a campaign that ended minutes ago.
+    """
+    import uuid
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy.orm import Session
+
+    from app.db import make_engine
+    from app.models import Campaign
+
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    run_migrations(fake_config.vault_db_path)
+
+    campaign_id = uuid.uuid4().hex
+    with Session(make_engine(fake_config.vault_db_path)) as session:
+        session.add(
+            Campaign(
+                id=campaign_id,
+                started_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+                asset="XAUUSD", timeframe="M15", phase=2, status="crashed",
+            )
+        )
+        session.commit()
+
+    # The global still points at it, as it would after a crash.
+    monkeypatch.setattr(main_module, "_active_campaign_id", campaign_id)
+
+    body = client.get("/status").json()
+
+    assert body["state"] == "idle", "a crashed campaign is not a running one"
+    assert body["campaign"] is not None, "but it is still the last one, and worth showing"
+    assert body["campaign"]["status"] == "crashed"
