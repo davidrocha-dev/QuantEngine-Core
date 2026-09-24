@@ -19,6 +19,13 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
         "broker_suffix": "",
     },
     "risk": {
+        # The account every backtest is run on. It was hard-wired to 10,000
+        # and it is not a cosmetic number: fixed-fractional sizing asks for
+        # a fraction of a lot, and whether that fraction clears the broker's
+        # minimum depends entirely on how big the account is. 1% of 10,000
+        # on XAUUSD is about 0.034 lots and loses a seventh of itself to
+        # rounding; 1% of 100,000 is 0.34 and loses a seventieth.
+        "account_balance": 10_000.0,
         "max_drawdown_pct": 20.0,
         # Prop firms enforce two limits, not one: a total drawdown and a
         # daily one, typically 10% and 5%. A strategy can pass the first

@@ -329,6 +329,7 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
         population_size=preset["population_size"],
         generations_per_tribe=preset["generations_per_tribe"],
         timeframe=timeframe,
+        initial_balance=float(settings["risk"].get("account_balance", 10_000.0)),
         # Settings → Risk (REQ-SET-1.2) is a percentage; the backtester takes a fraction.
         risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
         max_drawdown_pct=float(settings["risk"]["max_drawdown_pct"]),
@@ -1393,6 +1394,9 @@ async def tick_verify_strategy(strategy_id: str, max_trades: int = TICK_VERIFY_M
         commission_per_lot=config.commission_per_lot,
         contract_size=config.contract_size,
         risk_pct=config.risk_pct,
+        lot_step=config.lot_step,
+        min_lot=config.min_lot,
+        max_lot=config.max_lot,
     )
     trades = result.trades[-max(1, min(max_trades, TICK_VERIFY_MAX_TRADES)):]
     if not trades:

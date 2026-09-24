@@ -70,3 +70,19 @@ def test_manual_spread_falls_back_per_symbol():
     assert _manual_spread_points(costs, "EURUSD") == 10.0
     # A settings file written before the map existed still resolves.
     assert _manual_spread_points({"manual_spread_points": 10.0}, "XAUUSD") == 10.0
+
+
+def test_the_account_size_and_the_volume_ladder_reach_the_engine():
+    """Both were declared and never read.
+
+    initial_balance was hard-wired to 10,000 whatever Settings said, and
+    broker_caps held a max_lot_size nothing consumed. Neither is cosmetic:
+    fixed-fractional sizing asks for a fraction of a lot, and whether that
+    clears the broker's minimum depends entirely on the account. 1% of
+    10,000 on XAUUSD is about 0.034 lots and loses a seventh of itself to
+    rounding; 1% of 100,000 is 0.34 and loses a seventieth.
+    """
+    defaults = DEFAULT_APP_SETTINGS
+    assert defaults["risk"]["account_balance"] == 10_000.0
+    assert defaults["broker_caps"]["min_lot_size"] == 0.01
+    assert defaults["broker_caps"]["lot_step"] == 0.01
