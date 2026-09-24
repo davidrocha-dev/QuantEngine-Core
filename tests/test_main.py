@@ -1166,3 +1166,66 @@ def test_a_stale_campaign_id_does_not_report_a_phantom_run(tmp_path, monkeypatch
     assert body["state"] == "idle", "a crashed campaign is not a running one"
     assert body["campaign"] is not None, "but it is still the last one, and worth showing"
     assert body["campaign"]["status"] == "crashed"
+
+
+def test_emptying_the_vault_is_recoverable_and_guarded(tmp_path, monkeypatch):
+    """There was no way to clear a Vault at all: a Vault poisoned by a bad
+    campaign meant deleting rows one at a time, or reaching into the
+    database by hand.
+
+    It goes to the Recycle Bin like every other delete in this app, it
+    refuses while a campaign is writing to the same table, and it refuses
+    a count that no longer matches — which is what a stale confirmation
+    dialog looks like.
+    """
+    import uuid
+    from datetime import datetime, timezone
+
+    from sqlalchemy import func, select
+    from sqlalchemy.orm import Session
+
+    from app.db import make_engine
+    from app.models import Campaign, Strategy
+
+    fake_config = _FakeConfig(tmp_path)
+    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    run_migrations(fake_config.vault_db_path)
+    monkeypatch.setattr(main_module, "_active_campaign_id", None)
+
+    engine = make_engine(fake_config.vault_db_path)
+    with Session(engine) as session:
+        for index in range(3):
+            session.add(
+                Strategy(
+                    id=f"#EMPTY{index}", data_source="dukascopy", asset="XAUUSD", timeframe="M15",
+                    genome_json="{}", score=70, grade="GOOD", deployed=index == 0,
+                )
+            )
+        session.commit()
+
+    assert len(client.get("/vault").json()) == 3
+
+    # A stale count is refused rather than guessed at.
+    assert client.post("/vault/empty", json={"expected_count": 2}).status_code == 409
+    assert len(client.get("/vault").json()) == 3
+
+    response = client.post("/vault/empty", json={"expected_count": 3})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["deleted"] == 3
+    assert body["recoverable"] is True
+    assert body["still_deployed"] == ["#EMPTY0"], "a deployed bot is still on its chart and has to be named"
+    assert client.get("/vault").json() == []
+
+    # And the rows are in the bin, not gone.
+    with Session(engine) as session:
+        assert session.scalar(select(func.count()).select_from(Strategy)) == 3
+
+    # A running campaign is writing to this table.
+    with Session(engine) as session:
+        session.add(
+            Campaign(id=uuid.uuid4().hex, started_at=datetime.now(timezone.utc), asset="XAUUSD",
+                     timeframe="M15", status="running")
+        )
+        session.commit()
+    assert client.post("/vault/empty", json={"expected_count": 0}).status_code == 409

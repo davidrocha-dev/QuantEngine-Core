@@ -1028,6 +1028,60 @@ def get_neural_map() -> dict:
         }
 
 
+class EmptyVaultRequest(BaseModel):
+    """Typed so the confirmation cannot be sent by accident.
+
+    The caller has to say how many strategies it believes it is removing.
+    A number that no longer matches means the Vault changed between the
+    dialog opening and the button being pressed - a campaign finished, or
+    another window did something - and the safest thing is to stop and
+    let the user look again.
+    """
+
+    expected_count: int
+
+
+@app.post("/vault/empty")
+def empty_vault(request: EmptyVaultRequest) -> dict:
+    """Sends every strategy to the Recycle Bin — REQ-VAULT-2.2, in bulk.
+
+    Recoverable for RECYCLE_BIN_RETENTION_DAYS, like every other delete
+    in this app. There was no way to do this at all: clearing a Vault
+    poisoned by a bad campaign meant deleting rows one at a time, or
+    reaching into the database by hand, which is how it had been done
+    twice.
+
+    A running campaign is writing into this table, so this refuses while
+    one is going, the same way PURGE does (REQ-SET-4.4).
+    """
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        if session.scalar(select(Campaign).where(Campaign.status == "running")) is not None:
+            raise HTTPException(status_code=409, detail="A campaign is running — stop it first.")
+
+        rows = list(session.scalars(select(Strategy).where(Strategy.deleted_at.is_(None))))
+        if len(rows) != request.expected_count:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"The Vault holds {len(rows)} strategies, not the {request.expected_count} this was "
+                    "asked to remove. Take another look before emptying it."
+                ),
+            )
+
+        # Named, because the caller has to tell the user which bots are
+        # still attached to a chart: removing a strategy from the Vault
+        # does not stop an EA that MetaTrader is already running.
+        deployed = [row.id for row in rows if row.deployed]
+        now = datetime.now(timezone.utc)
+        for row in rows:
+            row.deleted_at = now
+            row.delete_reason = "Vault emptied by hand"
+        session.commit()
+
+    return {"deleted": len(rows), "recoverable": True, "still_deployed": deployed}
+
+
 @app.delete("/vault/{strategy_id}")
 def delete_strategy(strategy_id: str) -> dict:
     """REQ-VAULT-2.2 — DELETE, into the Recycle Bin.
