@@ -111,7 +111,11 @@ def net_profit_pct(equity_curve: np.ndarray, initial_balance: float) -> float:
 
 
 def cagr_pct(
-    equity_curve: np.ndarray, initial_balance: float, bar_count: int, timeframe: str
+    equity_curve: np.ndarray,
+    initial_balance: float,
+    bar_count: int,
+    timeframe: str,
+    timestamps: pd.DatetimeIndex | None = None,
 ) -> float | None:
     """Annualised growth rate, or None when the window is too short to
     annualise honestly.
@@ -135,8 +139,19 @@ def cagr_pct(
     # so it is reported whatever the window length.
     if equity_curve[-1] <= 0:
         return -100.0
-    bars_per_year = BARS_PER_YEAR_BY_TIMEFRAME.get(timeframe, TRADING_DAYS_PER_YEAR)
-    years = bar_count / bars_per_year
+    # Elapsed calendar time, because a year is 365 days however many of
+    # them the market was open. The bar-count fallback below assumes
+    # 252 x 24 hours of trading a year, which on a market that closes at
+    # weekends undercounts the span it is standing in for - measured on a
+    # real out-of-sample window of 183 days, 2026-03-25 to 2026-09-24, it
+    # reported 0.4939 years against the calendar's 0.5014 and hid a CAGR
+    # that had earned the right to be shown by six days.
+    if timestamps is not None and len(timestamps) >= 2:
+        elapsed_days = (timestamps.max() - timestamps.min()).total_seconds() / 86_400
+        years = elapsed_days / 365.0
+    else:
+        bars_per_year = BARS_PER_YEAR_BY_TIMEFRAME.get(timeframe, TRADING_DAYS_PER_YEAR)
+        years = bar_count / bars_per_year
     if years <= 0:
         return 0.0
     if years < MIN_YEARS_TO_ANNUALISE:
@@ -246,7 +261,10 @@ def compute_trade_stats(result: BacktestResult, df: pd.DataFrame, initial_balanc
             result.equity_curve, pd.DatetimeIndex(df["timestamp"]) if "timestamp" in df else None
         ),
         net_profit_pct=net_profit_pct(result.equity_curve, initial_balance),
-        cagr_pct=cagr_pct(result.equity_curve, initial_balance, len(df), timeframe),
+        cagr_pct=cagr_pct(
+            result.equity_curve, initial_balance, len(df), timeframe,
+            pd.DatetimeIndex(df["timestamp"]) if "timestamp" in df else None,
+        ),
         payoff_ratio=payoff_ratio(result.trades),
         icir=information_coefficient_information_ratio(result.trades),
         avg_hold_hours=avg_hold_hours(result.trades, df),

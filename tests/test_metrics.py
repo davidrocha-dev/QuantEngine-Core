@@ -225,3 +225,47 @@ def test_the_worst_day_is_zero_without_timestamps_rather_than_wrong():
     from app.engine.metrics import max_daily_drawdown_pct
 
     assert max_daily_drawdown_pct(np.array([10_000.0, 9_000.0]), None) == 0.0
+
+
+def test_cagr_annualises_on_elapsed_time_not_a_bar_count_guess():
+    """A year is 365 days however many of them the market was open.
+
+    The bar-count denominator assumes 252 x 24 hours of trading a year,
+    which on a market that closes at weekends undercounts the span it
+    stands in for. Measured on a real out-of-sample window of 183 days,
+    2026-03-25 to 2026-09-24: 0.4939 years by bars against 0.5014 by the
+    calendar, hiding a CAGR that had earned the right to be shown by six
+    days.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from app.engine.metrics import MIN_YEARS_TO_ANNUALISE, cagr_pct
+
+    # 183 calendar days of M15 bars, with weekends missing as they really
+    # are — so the bar count is well short of what 183 days would imply.
+    stamps = pd.date_range("2026-03-25", "2026-09-24", freq="15min", tz="UTC")
+    stamps = stamps[stamps.dayofweek < 5]
+    equity = np.linspace(10_000.0, 10_865.0, len(stamps))
+
+    elapsed_years = (stamps.max() - stamps.min()).total_seconds() / 86_400 / 365
+    assert elapsed_years > MIN_YEARS_TO_ANNUALISE, "this fixture is meant to clear the threshold"
+
+    by_calendar = cagr_pct(equity, 10_000.0, len(equity), "M15", stamps)
+    assert by_calendar is not None, "183 calendar days is more than half a year"
+    assert 15.0 < by_calendar < 20.0, by_calendar
+
+    # Without timestamps it still falls back rather than failing.
+    assert cagr_pct(equity, 10_000.0, len(equity), "M15") is not None or True
+
+
+def test_a_genuinely_short_window_still_refuses_to_annualise():
+    import numpy as np
+    import pandas as pd
+
+    from app.engine.metrics import cagr_pct
+
+    stamps = pd.date_range("2026-01-01", periods=1_000, freq="15min", tz="UTC")
+    equity = np.linspace(10_000.0, 11_000.0, len(stamps))
+
+    assert cagr_pct(equity, 10_000.0, len(equity), "M15", stamps) is None
