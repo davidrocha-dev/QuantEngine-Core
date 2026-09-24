@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 
 from app.engine.backtest import EXIT_STOP, EXIT_TARGET, _scan_exit_numba, simulate_trades
 from app.genome.gene_pool import GenePoolConfig
@@ -266,3 +267,83 @@ def test_a_wider_spread_makes_a_resting_order_harder_to_fill():
 
     assert _wait_for_fill(highs, lows, 0, 1, 100.0, is_limit=True, margin=0.0)[0] == 1
     assert _wait_for_fill(highs, lows, 0, 1, 100.0, is_limit=True, margin=0.2) == (None, None)
+
+
+def _gold_like_frame(n_bars: int = 600) -> pd.DataFrame:
+    """The synthetic walk, scaled to gold's price. The volume ladder only
+    bites when the requested size lands near the broker's minimum, and at
+    a price of 100 with a 100-unit contract it never does."""
+    df = make_synthetic_ohlc(n_bars=n_bars, seed=11, drift=0.0004, volatility=0.0025).copy()
+    for column in ("open", "high", "low", "close"):
+        df[column] = df[column] * 45.0
+    return df
+
+
+def _ladder_genome():
+    return Genome(
+        signal=GeneChoice("MOM BREAK", {"period": 5, "threshold": 0.001}),
+        bias=None,
+        filters=[],
+        execution=GeneChoice("MARKET2", {"confirm_bars": 2}),
+        management=None,
+        stop_atr_mult=3.0,
+        target_atr_mult=3.68,
+    )
+
+
+def test_the_broker_volume_ladder_breaks_fixed_fractional_risk():
+    """Continuous sizing is a fiction on a small account.
+
+    simulate_trades risked exactly risk_pct on every trade because it sized
+    in fractions of a lot. A broker fills multiples of lot_step and never
+    less than min_lot, so the requested 0.012 lots becomes 0.01 and a wide
+    stop then risks *more* than the setting allows. Strategy #6F0A16 run in
+    MetaTrader from a 10,000 account at 0.35% put all 344 of its trades on
+    the 0.01 minimum: the median risked 27.20 of the 35.00 asked for and
+    the worst risked 68.85, twice the setting. Modelling the ladder
+    reproduced that - worst 69.64, max drawdown 4.94% against 5.01%.
+    """
+    df = _gold_like_frame()
+    kwargs = dict(initial_balance=10_000.0, risk_pct=0.0035, point_size=0.001,
+                  cost_points=0.0, commission_per_lot=0.0, contract_size=100.0)
+
+    continuous = simulate_trades(df, _ladder_genome(), GenePoolConfig(), **kwargs)
+    laddered = simulate_trades(df, _ladder_genome(), GenePoolConfig(), **kwargs,
+                               lot_step=0.01, min_lot=0.01, max_lot=10.0)
+
+    assert len(continuous.trades) == len(laddered.trades), "sizing must not change which trades happen"
+
+    def risked(result):
+        return [abs(t.pnl / t.r_multiple) for t in result.trades if t.r_multiple]
+
+    smooth, stepped = risked(continuous), risked(laddered)
+    assert smooth, "the fixture has to trade for this to mean anything"
+    # Continuous sizing risks the same amount every time, bar compounding.
+    assert max(smooth) / min(smooth) < 1.2
+    # The ladder does not, and that spread is the whole point.
+    assert max(stepped) / min(stepped) > 1.5
+    # Here the requested size is under the minimum, so every trade is
+    # clamped up and risks more than the setting - the case that costs a
+    # prop-firm account its daily limit.
+    assert min(stepped) > max(smooth)
+
+    # Ask for enough size to clear the minimum and the ladder rounds the
+    # other way, down to the step, and the account risks less than it set.
+    rich = dict(kwargs, risk_pct=0.03)
+    floored = risked(simulate_trades(df, _ladder_genome(), GenePoolConfig(), **rich,
+                                     lot_step=0.01, min_lot=0.01, max_lot=10.0))
+    exact = risked(simulate_trades(df, _ladder_genome(), GenePoolConfig(), **rich))
+    assert max(floored) < max(exact)
+
+
+def test_the_ladder_is_off_unless_a_step_is_given():
+    """Every existing caller passes no ladder and must keep its numbers."""
+    df = _gold_like_frame()
+    kwargs = dict(initial_balance=10_000.0, risk_pct=0.0035, point_size=0.001,
+                  cost_points=0.0, commission_per_lot=0.0, contract_size=100.0)
+
+    default = simulate_trades(df, _ladder_genome(), GenePoolConfig(), **kwargs)
+    explicit = simulate_trades(df, _ladder_genome(), GenePoolConfig(), **kwargs,
+                               lot_step=0.0, min_lot=0.01, max_lot=10.0)
+
+    assert default.final_balance == explicit.final_balance

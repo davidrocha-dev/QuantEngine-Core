@@ -309,6 +309,7 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
     engine here, or the Settings screen is decoration."""
     campaign_settings = settings["campaign"]
     costs = settings["costs"]
+    caps = settings.get("broker_caps", {})
     preset = POWER_PRESETS.get(campaign_settings["power"], POWER_PRESETS["MEDIUM"])
     instrument = get_instrument(symbol)
 
@@ -338,6 +339,12 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
         cost_points=_spread_points(costs, symbol, instrument) + float(costs["slippage_points"]),
         commission_per_lot=float(costs["commission_per_lot"]),
         contract_size=CONTRACT_SIZE_BY_CATEGORY.get(instrument.category, 100_000.0),
+        # Settings → Broker caps. Without these the Vault reports a return
+        # no small account can reach: fixed-fractional sizing asks for a
+        # fraction of a lot and the broker fills whole steps of one.
+        lot_step=float(caps.get("lot_step", 0.0)),
+        min_lot=float(caps.get("min_lot_size", 0.0)),
+        max_lot=float(caps.get("max_lot_size", 0.0)),
         max_workers=campaign_settings["cores"] or None,  # 0 = auto
         data_source="bundled" if get_config().built_in_data_only else "dukascopy",
         # SMART MODE (Settings → Campaign) biases which genes get drawn,

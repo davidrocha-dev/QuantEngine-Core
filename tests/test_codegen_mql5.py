@@ -221,12 +221,23 @@ def test_time_of_day_rules_read_utc_not_the_broker_clock():
     UTC bars and asked the broker what time it was. A UTC+3 server begins
     its Friday on Thursday at 21:00 UTC and reaches lock_hour three hours
     early: replaying #6F0A16 with that offset moved its Friday entries
-    from 64 to 96 and its trade count from 368 to 394."""
+    from 64 to 96 and its trade count from 368 to 394.
+
+    TimeGMT() alone does not fix it. The exported EA was run on an
+    IC Markets EU server and fired FRIDAY PROFIT 45 times against the
+    engine's 12 — the behaviour of a clock three hours ahead, which is
+    that server's summer time. The offset has to be resolvable by hand,
+    because the tester will not tell the EA what it is.
+    """
     genome = make_genome(
         management=GeneChoice("FRIDAY PROFIT", {"lock_hour": 19}),
         execution=GeneChoice("MARKET2", {"confirm_bars": 2}),
     )
     source = generate_ea(genome, "#UTC", "XAUUSD", "M15").source
 
-    assert "TimeToStruct(TimeGMT(), now)" in source
+    assert "input int    ServerGmtOffsetHours" in source
+    assert "datetime UtcNow() { return TimeCurrent() - GmtOffsetSeconds; }" in source
+    # Nothing reads a weekday or an hour off the broker's clock directly.
     assert "TimeToStruct(TimeCurrent(), now)" not in source
+    assert "TimeToStruct(TimeGMT(), now)" not in source
+    assert source.count("TimeToStruct(UtcNow(), now)") == 2  # FRIDAY PROFIT, IsFridayAfter

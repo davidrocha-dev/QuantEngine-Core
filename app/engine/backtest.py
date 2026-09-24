@@ -2,7 +2,9 @@
 
 Single-position-at-a-time, fixed-fractional risk sizing: each trade risks
 `risk_pct` of current balance, sized off the distance to its stop-loss, so
-a full stop-out always costs exactly `risk_pct` of balance at entry. The
+a full stop-out costs `risk_pct` of balance at entry — exactly, unless a
+broker volume ladder is given, and then only as exactly as that ladder
+allows. The
 baseline stop/target (DEFAULT_STOP_ATR_MULT / DEFAULT_TARGET_ATR_MULT) is
 what makes a genome with no Management gene still backtestable — see
 app/genome/genome.py for why Management is optional per-genome.
@@ -15,6 +17,8 @@ JIT-compiled (`_scan_exit_numba`) since it is the dominant cost for a
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+import math
 
 import numba
 import numpy as np
@@ -178,6 +182,9 @@ def simulate_trades(
     contract_size: float = 100_000.0,
     entry_delay_bars: int = 0,
     max_leverage_breach_balance: float = 0.0,
+    lot_step: float = 0.0,
+    min_lot: float = 0.0,
+    max_lot: float = 0.0,
 ) -> BacktestResult:
     """Runs one genome against one OHLC series end to end.
 
@@ -187,7 +194,18 @@ def simulate_trades(
     is the round-turn commission, charged against the position size that
     fixed-fractional sizing implies (risk / (stop distance x contract size)).
     Without them the GA optimises towards high-frequency strategies whose
-    edge is smaller than their cost."""
+    edge is smaller than their cost.
+
+    `lot_step`, `min_lot` and `max_lot` are the broker's volume ladder.
+    Left at zero the sizing is continuous, which is what this did and
+    which is a fiction on a small account: the requested size is rounded
+    down to the step and then floored at the minimum, so a trade whose
+    stop is wide enough risks *more* than the setting allows and there is
+    nothing the strategy can do about it. Exported to MetaTrader and run
+    on XAUUSD from a 10,000 account at 0.35%, every one of 344 trades was
+    the 0.01 minimum: the median trade risked 27.20 of the 35.00 asked
+    for, and the worst risked 68.85, twice the setting. On a prop-firm
+    account that is the difference between a rule and a hope."""
     _validate_genome_against_pool(genome, gene_pool)
 
     signal_spec = ALL_GENES[("signal", genome.signal.name)]
@@ -306,16 +324,26 @@ def simulate_trades(
             exit_idx, exit_reason = management_hit
             exit_price = closes[exit_idx]
 
-        gross_pnl, r_multiple = _blend_partial_tp(
-            genome, direction, effective_entry, stop_price, exit_price, risk_amount, partial_r
-        )
-        stop_distance = abs(effective_entry - stop_price)
         # Spread and slippage are already in `effective_entry`, and so
         # in every distance measured from it. Commission is not a price:
         # it is cash, charged against the position that fixed-fractional
         # sizing implies. Phase 4's noise injection perturbs the entry on
         # top of this baseline (REQ-ENGINE-3.8).
+        stop_distance = abs(effective_entry - stop_price)
         lots = risk_amount / (stop_distance * contract_size) if stop_distance > 0 else 0.0
+        traded_risk = risk_amount
+        if lot_step > 0.0 and lots > 0.0:
+            # Down to the step, never up: a broker fills 0.01 or 0.02, not
+            # the 0.017 the risk model asked for.
+            lots = math.floor(lots / lot_step + 1e-9) * lot_step
+            lots = max(lots, min_lot)
+            if max_lot > 0.0:
+                lots = min(lots, max_lot)
+            traded_risk = lots * stop_distance * contract_size
+
+        gross_pnl, r_multiple = _blend_partial_tp(
+            genome, direction, effective_entry, stop_price, exit_price, traded_risk, partial_r
+        )
         commission = commission_per_lot * lots
         pnl_amount = gross_pnl - commission
 
@@ -323,7 +351,7 @@ def simulate_trades(
         # drawdown actually lived through, not only closed-trade equity.
         if exit_idx > entry_idx and stop_distance > 0:
             unrealized_r = (closes[entry_idx:exit_idx] - effective_entry) * direction / stop_distance
-            equity_curve[entry_idx:exit_idx] = balance + risk_amount * unrealized_r
+            equity_curve[entry_idx:exit_idx] = balance + traded_risk * unrealized_r
             if max_leverage_breach_balance > 0 and float(equity_curve[entry_idx:exit_idx].min()) < max_leverage_breach_balance:
                 margin_breach = True
 

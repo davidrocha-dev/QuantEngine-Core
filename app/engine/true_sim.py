@@ -92,6 +92,9 @@ def _member_candidates(strategy: Strategy, df: pd.DataFrame, gene_pool: GenePool
         cost_points=config.cost_points,
         commission_per_lot=config.commission_per_lot,
         contract_size=config.contract_size,
+        lot_step=getattr(config, "lot_step", 0.0),
+        min_lot=getattr(config, "min_lot", 0.0),
+        max_lot=getattr(config, "max_lot", 0.0),
     )
 
     timestamps = pd.DatetimeIndex(df["timestamp"])

@@ -80,6 +80,9 @@ def _backtest_kwargs(config) -> dict:
         "commission_per_lot": config.commission_per_lot,
         "contract_size": config.contract_size,
         "risk_pct": config.risk_pct,
+        "lot_step": getattr(config, "lot_step", 0.0),
+        "min_lot": getattr(config, "min_lot", 0.0),
+        "max_lot": getattr(config, "max_lot", 0.0),
     }
 
 

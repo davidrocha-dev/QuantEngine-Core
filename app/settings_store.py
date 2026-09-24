@@ -53,6 +53,14 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
         "slippage_points": 2.0,
     },
     "broker_caps": {
+        # The volume ladder. Fixed-fractional sizing asks for a fraction of
+        # a lot and a broker fills a multiple of `lot_step`, never less than
+        # `min_lot_size` - so on a small account the risk per trade is not
+        # the risk setting, it is whatever the minimum happens to cost. A
+        # 10,000 account on XAUUSD at 0.35% asks for around 0.012 lots: every
+        # trade fills at 0.01, and a wide stop then risks twice the setting.
+        "min_lot_size": 0.01,
+        "lot_step": 0.01,
         "max_lot_size": 10.0,
         "max_open_positions": 20,
         "margin_call_pct": 100.0,

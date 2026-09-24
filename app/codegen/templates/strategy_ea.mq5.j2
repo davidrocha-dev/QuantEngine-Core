@@ -21,9 +21,20 @@ input double MaxSpreadPoints  = {{ max_spread_points }};  // skip entries above 
 input long   MagicNumber      = {{ magic }};
 input bool   AllowLong        = true;
 input bool   AllowShort       = true;
+// The hours and weekdays this strategy was bred on are UTC. TimeCurrent()
+// is the broker's clock, and TimeGMT() is not reliable in the Strategy
+// Tester - a run on an IC Markets EU server (UTC+3 in summer) behaved
+// exactly as if this were three hours off, firing FRIDAY PROFIT 45 times
+// where the engine fires it 12. AUTO reads the terminal, which is right
+// live and can be wrong in the tester: set it by hand when you backtest.
+input int    ServerGmtOffsetHours = 99;   // 99 = auto; else the server's offset from UTC
 
 CTrade   Trade;
 datetime LastBarTime = 0;
+int GmtOffsetSeconds = 0;   // resolved in OnInit
+
+// Every rule that reads an hour or a weekday goes through this.
+datetime UtcNow() { return TimeCurrent() - GmtOffsetSeconds; }
 {% if execution == "MARKET2" %}
 int    PendingDirection      = 0;   // a MARKET2 signal waiting out confirm_bars
 int    BarsUntilEntry        = 0;
@@ -184,13 +195,14 @@ double AverageAtr(int handle, int period)
    return total / period;
 }
 
-// TimeGMT, not TimeCurrent, in every rule that reads a weekday or an
+// UtcNow, not TimeCurrent, in every rule that reads a weekday or an
 // hour: the bars these genes were bred against are UTC and the broker's
 // clock is not. A UTC+3 server starts Friday on Thursday evening and
-// reaches lock_hour three hours early.
+// reaches lock_hour three hours early: replaying this strategy that way
+// moved its Friday entries from 64 to 96.
 bool IsFridayAfter(int cutoffHour)
 {
-   MqlDateTime now; TimeToStruct(TimeGMT(), now);
+   MqlDateTime now; TimeToStruct(UtcNow(), now);
    return now.day_of_week == 5 && now.hour >= cutoffHour;
 }
 
@@ -327,7 +339,7 @@ void ManageOpenPosition(bool newBar)
 {
 {% if management == "EOD CLOSE" %}
    if(!newBar) return;   // a bar-close decision in the backtester
-   MqlDateTime now; TimeToStruct(TimeGMT(), now);
+   MqlDateTime now; TimeToStruct(UtcNow(), now);
    if(now.hour >= {{ management_params.close_hour | default(21) }})
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
@@ -343,7 +355,7 @@ void ManageOpenPosition(bool newBar)
    // weekday; the backtest, which only evaluates this gene when a bar
    // closes, put 55 there.
    if(!newBar) return;
-   MqlDateTime now; TimeToStruct(TimeGMT(), now);
+   MqlDateTime now; TimeToStruct(UtcNow(), now);
    if(now.day_of_week == 5 && now.hour >= {{ management_params.lock_hour | default(18) }})
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
@@ -450,6 +462,13 @@ void TryEnter()
 int OnInit()
 {
    Trade.SetExpertMagicNumber(MagicNumber);
+   GmtOffsetSeconds = ServerGmtOffsetHours == 99
+      ? (int)(TimeCurrent() - TimeGMT())
+      : ServerGmtOffsetHours * 3600;
+   if(MQLInfoInteger(MQL_TESTER) && ServerGmtOffsetHours == 99 && GmtOffsetSeconds == 0)
+      Print("QuantEngine: the terminal reports no GMT offset, which is usual in the tester. ",
+            "If this broker's server is not on UTC, set ServerGmtOffsetHours or every ",
+            "hour-of-day and day-of-week rule in this strategy will fire at the wrong time.");
    h_entry_atr = iATR(_Symbol, PERIOD_CURRENT, 14);
    if(h_entry_atr == INVALID_HANDLE) return INIT_FAILED;
 {% for name, ctor in handles.items() %}

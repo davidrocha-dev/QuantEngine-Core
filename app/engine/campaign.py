@@ -82,6 +82,11 @@ class CampaignConfig:
     cost_points: float = 0.0
     commission_per_lot: float = 0.0
     contract_size: float = 100_000.0
+    # Settings → Broker caps. Zero means continuous sizing, which flatters
+    # every small account; see simulate_trades.
+    lot_step: float = 0.0
+    min_lot: float = 0.0
+    max_lot: float = 0.0
     data_source: str = "dukascopy"
     # Smart Mode sampling weights (app/engine/smart_mode.py). Empty means
     # uniform sampling, which is what every campaign did before Smart Mode.
@@ -271,6 +276,9 @@ def run_campaign(
         "cost_points": config.cost_points,
         "commission_per_lot": config.commission_per_lot,
         "contract_size": config.contract_size,
+        "lot_step": config.lot_step,
+        "min_lot": config.min_lot,
+        "max_lot": config.max_lot,
         "htf_df": config.htf_df,
         "news_events": config.news_events or None,
         "news_mode": config.news_mode,
