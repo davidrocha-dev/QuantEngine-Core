@@ -106,6 +106,10 @@ def build_context(genome: Genome, hash_id: str, symbol: str, timeframe: str, ris
             "offset_atr", (execution_params.get("offset_atr_1", 0.5) + execution_params.get("offset_atr_2", 1.0)) / 2
         ),
         "stop_offset_atr": execution_params.get("offset_atr", 0.3),
+        # MARKET2 waits this many bars after the signal before it buys.
+        # The backtester fills at the open of signal_idx + confirm_bars;
+        # the EA used to fill on the very next bar whatever this said.
+        "confirm_bars": int(execution_params.get("confirm_bars", 2)),
         "pending_expiry_seconds": PENDING_ORDER_WINDOW_BARS * TIMEFRAME_SECONDS.get(timeframe, 3600),
         "management": management,
         "management_params": genome.management.params if genome.management else {},

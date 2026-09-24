@@ -151,3 +151,82 @@ def test_a_waiting_pending_order_blocks_another_entry():
         assert "bool HasPendingOrder()" in source, execution
         assert "OrdersTotal()" in source, execution
         assert "if(HasOpenPosition() || HasPendingOrder()) return;" in source, execution
+
+
+def test_time_based_management_waits_for_a_closed_bar():
+    """The EA ran its MANAGEMENT gene on every tick.
+
+    FRIDAY PROFIT closes any position in profit after lock_hour. Per
+    tick, that closes at the first profitable price after the hour, which
+    clears HasOpenPosition() and lets the next bar enter again — all
+    Friday evening. Strategy #6F0A16 exported from the Vault and run over
+    its own out-of-sample window put ~150 entries on Fridays against ~70
+    on every other weekday, where the backtester, which evaluates this
+    gene only when a bar closes, put 55 there. 433 trades against 315,
+    at a win rate 9 points higher on much smaller average wins.
+
+    PARTIAL TP is deliberately not gated: _run_partial_tp scans the bar's
+    high and low, so the backtester really does act on it intrabar.
+    """
+    for management in ("FRIDAY PROFIT", "EOD CLOSE"):
+        genome = make_genome(
+            management=GeneChoice(management, dict(ALL_GENES[("management", management)].default_params))
+        )
+        source = generate_ea(genome, "#FRIDAY", "XAUUSD", "M15").source
+
+        assert "void ManageOpenPosition(bool newBar)" in source, management
+        body = source.split("void ManageOpenPosition(bool newBar)")[1].split("void TryEnter()")[0]
+        assert "if(!newBar) return;" in body, management
+
+    partial = generate_ea(
+        make_genome(management=GeneChoice("PARTIAL TP", {"r_multiple": 1.0, "close_fraction": 0.5})),
+        "#PARTIAL", "XAUUSD", "M15",
+    ).source
+    body = partial.split("void ManageOpenPosition(bool newBar)")[1].split("void TryEnter()")[0]
+    assert "if(!newBar) return;" not in body
+
+    # And management is still reached on every tick, ahead of the guard
+    # that returns until a bar closes.
+    assert "ManageOpenPosition(newBar);" in partial
+    assert partial.index("ManageOpenPosition(newBar);") < partial.index("LastBarTime = currentBar;")
+
+
+def test_market2_waits_out_its_confirmation_bars():
+    """The EA ignored confirm_bars and entered on the bar after the signal.
+
+    `_resolve_entry` fills MARKET2 at the open of signal_idx +
+    confirm_bars and does not re-test the signal while it waits. The EA's
+    MARKET2 branch bought at the next tick after the signal bar closed,
+    whatever the gene said. On strategy #6F0A16 (confirm_bars 4) over its
+    own out-of-sample window that alone was 368 trades against the
+    engine's 313, and it is most of the 433 MetaTrader reported.
+    """
+    for confirm in (1, 4):
+        genome = make_genome(execution=GeneChoice("MARKET2", {"confirm_bars": confirm}))
+        source = generate_ea(genome, "#CONFIRM", "XAUUSD", "M15").source
+
+        assert f"BarsUntilEntry = {confirm} - 1;" in source, confirm
+        # One bar of confirmation is what entering immediately already
+        # meant, so it needs no countdown in OnTick.
+        assert ("if(BarsUntilEntry > 0)" in source) == (confirm > 1), confirm
+
+    stop = generate_ea(
+        make_genome(execution=GeneChoice("STOP", {"offset_atr": 0.25})), "#NOCONFIRM", "XAUUSD", "M15"
+    ).source
+    assert "BarsUntilEntry" not in stop
+
+
+def test_time_of_day_rules_read_utc_not_the_broker_clock():
+    """FRIDAY PROFIT, EOD CLOSE and the SESSION filter were bred against
+    UTC bars and asked the broker what time it was. A UTC+3 server begins
+    its Friday on Thursday at 21:00 UTC and reaches lock_hour three hours
+    early: replaying #6F0A16 with that offset moved its Friday entries
+    from 64 to 96 and its trade count from 368 to 394."""
+    genome = make_genome(
+        management=GeneChoice("FRIDAY PROFIT", {"lock_hour": 19}),
+        execution=GeneChoice("MARKET2", {"confirm_bars": 2}),
+    )
+    source = generate_ea(genome, "#UTC", "XAUUSD", "M15").source
+
+    assert "TimeToStruct(TimeGMT(), now)" in source
+    assert "TimeToStruct(TimeCurrent(), now)" not in source

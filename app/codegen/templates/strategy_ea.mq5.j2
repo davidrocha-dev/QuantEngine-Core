@@ -24,6 +24,12 @@ input bool   AllowShort       = true;
 
 CTrade   Trade;
 datetime LastBarTime = 0;
+{% if execution == "MARKET2" %}
+int    PendingDirection      = 0;   // a MARKET2 signal waiting out confirm_bars
+int    BarsUntilEntry        = 0;
+double PendingStopDistance   = 0.0;
+double PendingTargetDistance = 0.0;
+{% endif %}
 
 // ATR of the signal bar sizes every stop and target, exactly as the
 // backtester does (DEFAULT_STOP/TARGET_ATR_MULT are genome fields now).
@@ -178,9 +184,13 @@ double AverageAtr(int handle, int period)
    return total / period;
 }
 
+// TimeGMT, not TimeCurrent, in every rule that reads a weekday or an
+// hour: the bars these genes were bred against are UTC and the broker's
+// clock is not. A UTC+3 server starts Friday on Thursday evening and
+// reaches lock_hour three hours early.
 bool IsFridayAfter(int cutoffHour)
 {
-   MqlDateTime now; TimeToStruct(TimeCurrent(), now);
+   MqlDateTime now; TimeToStruct(TimeGMT(), now);
    return now.day_of_week == 5 && now.hour >= cutoffHour;
 }
 
@@ -313,10 +323,11 @@ bool Vetoed()
 {% endfor %}   return false;
 }
 
-void ManageOpenPosition()
+void ManageOpenPosition(bool newBar)
 {
 {% if management == "EOD CLOSE" %}
-   MqlDateTime now; TimeToStruct(TimeCurrent(), now);
+   if(!newBar) return;   // a bar-close decision in the backtester
+   MqlDateTime now; TimeToStruct(TimeGMT(), now);
    if(now.hour >= {{ management_params.close_hour | default(21) }})
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
@@ -326,7 +337,13 @@ void ManageOpenPosition()
             Trade.PositionClose(ticket);
       }
 {% elif management == "FRIDAY PROFIT" %}
-   MqlDateTime now; TimeToStruct(TimeCurrent(), now);
+   // Without this guard the EA closes at the first profitable tick after
+   // lock_hour and is then free to re-enter on the next bar, over and over.
+   // A real MT5 run put ~150 entries on Fridays against ~70 on every other
+   // weekday; the backtest, which only evaluates this gene when a bar
+   // closes, put 55 there.
+   if(!newBar) return;
+   MqlDateTime now; TimeToStruct(TimeGMT(), now);
    if(now.day_of_week == 5 && now.hour >= {{ management_params.lock_hour | default(18) }})
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
@@ -367,6 +384,17 @@ void ManageOpenPosition()
    // This genome has no MANAGEMENT gene: stop and target alone close it.
 {% endif %}}
 
+void PlaceMarketOrder(int direction, double stopDistance, double targetDistance)
+{
+   double lots = LotsForRisk(stopDistance);
+   if(lots <= 0.0) return;
+   double price = direction > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double stop   = price - direction * stopDistance;
+   double target = price + direction * targetDistance;
+   if(direction > 0) Trade.Buy(lots, _Symbol, price, stop, target);
+   else              Trade.Sell(lots, _Symbol, price, stop, target);
+}
+
 void TryEnter()
 {
    int direction = Signal();
@@ -390,12 +418,17 @@ void TryEnter()
    if(lots <= 0.0) return;
 
 {% if execution == "MARKET2" %}
-   // MARKET2 - market order on the confirmation bar.
-   double price = direction > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double stop   = price - direction * stopDistance;
-   double target = price + direction * targetDistance;
-   if(direction > 0) Trade.Buy(lots, _Symbol, price, stop, target);
-   else              Trade.Sell(lots, _Symbol, price, stop, target);
+   // MARKET2 - the genome asks for {{ confirm_bars }} bar(s) between the
+   // signal and the fill, and the backtester fills at the open of the bar
+   // that many later, sizing the stop and target from the signal bar's ATR.
+   // Latch them and let OnTick count the bars down. Entering on the next
+   // bar regardless, which is what this did, was 368 trades against the
+   // engine's 313 over one out-of-sample window.
+   PendingDirection = direction;
+   PendingStopDistance = stopDistance;
+   PendingTargetDistance = targetDistance;
+   BarsUntilEntry = {{ confirm_bars }} - 1;
+   if(BarsUntilEntry <= 0) PlaceMarketOrder(direction, stopDistance, targetDistance);
 {% elif execution in ("LIMIT", "LIMIT2") %}
    // {{ execution }} - pullback entry {{ limit_offset_atr }} ATR behind the signal price.
    double entryPrice = signalPrice - direction * {{ limit_offset_atr }} * atr;
@@ -434,14 +467,29 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
-   ManageOpenPosition();
-
-   // One evaluation per closed bar - the backtester never acts intrabar.
+   // The backtester evaluates the time-based management genes once per
+   // closed bar and scans the bar's high and low for the price-based one.
+   // ManageOpenPosition needs to know which of the two it is in.
    datetime currentBar = iTime(_Symbol, PERIOD_CURRENT, 0);
-   if(currentBar == LastBarTime) return;
+   bool newBar = currentBar != LastBarTime;
+
+   ManageOpenPosition(newBar);
+
+   if(!newBar) return;
    LastBarTime = currentBar;
 
    // One position or one waiting order at a time, as backtested.
    if(HasOpenPosition() || HasPendingOrder()) return;
+{% if execution == "MARKET2" and confirm_bars > 1 %}
+   // A latched signal is not re-tested while it waits out its confirmation
+   // bars, exactly as _resolve_entry does not re-test it.
+   if(BarsUntilEntry > 0)
+   {
+      BarsUntilEntry--;
+      if(BarsUntilEntry == 0)
+         PlaceMarketOrder(PendingDirection, PendingStopDistance, PendingTargetDistance);
+      return;
+   }
+{% endif %}
    TryEnter();
 }
