@@ -235,7 +235,26 @@ def _spread_points(costs: dict, symbol: str, instrument) -> float:
     quote = _mt5_bridge.get_live_quote(symbol) if _mt5_bridge.is_connected() else None
     if quote is None:
         return _manual_spread_points(costs, symbol)
-    return float(quote.spread_points * instrument.point_divisor)
+    live = float(quote.spread_points * instrument.point_divisor)
+    # One quote, taken whenever a campaign happens to start, then charged
+    # against years of history. Campaigns get started in calm moments, and
+    # the spread in a calm moment is not the spread over a news release or
+    # a rollover - so AUTO is optimistic by construction, and silently so.
+    # A campaign bred on 150 points of gold, where the figure configured by
+    # hand for that symbol was 600, produced three strategies whose costs
+    # were a quarter of what the broker charged.
+    manual = _manual_spread_points(costs, symbol)
+    log = logging.getLogger("quantengine")
+    if live < manual:
+        log.warning(
+            "AUTO SPREAD: %s quoted %.0f points live, below the %.0f configured for it. "
+            "Charging %.0f. A single live quote is not what this instrument costs over "
+            "a night or a news release; switch Settings -> Costs to MANUAL to charge %.0f.",
+            symbol, live, manual, live, manual,
+        )
+    else:
+        log.info("AUTO SPREAD: charging %s %.0f points, read live.", symbol, live)
+    return live
 
 
 def _gene_pool_for_campaign(config: CampaignConfig) -> GenePoolConfig:

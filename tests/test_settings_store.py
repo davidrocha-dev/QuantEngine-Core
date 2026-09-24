@@ -1,3 +1,5 @@
+import pytest
+
 from app.settings_store import DEFAULT_APP_SETTINGS, load_settings, save_settings, update_section
 
 
@@ -86,3 +88,54 @@ def test_the_account_size_and_the_volume_ladder_reach_the_engine():
     assert defaults["risk"]["account_balance"] == 10_000.0
     assert defaults["broker_caps"]["min_lot_size"] == 0.01
     assert defaults["broker_caps"]["lot_step"] == 0.01
+
+
+def test_auto_spread_says_when_it_undercuts_the_configured_one(caplog):
+    """AUTO reads one live quote and charges it against years of history.
+
+    Campaigns get started in calm moments, and the spread in a calm moment
+    is not the spread over a news release or a rollover, so AUTO is
+    optimistic by construction. It was also silent: the owner configured
+    600 points for XAUUSD, AUTO read 0.15 of a dollar off a connected
+    terminal, and the campaign that produced three GOOD strategies charged
+    150 - a quarter of what the broker had actually been measured taking.
+    """
+    from app.main import _spread_points
+
+    costs = {
+        "spread_mode": "AUTO",
+        "manual_spread_points": 10.0,
+        "manual_spread_by_symbol": {"XAUUSD": 600},
+        "commission_per_lot": 7.0,
+        "slippage_points": 2.0,
+    }
+
+    class _Quote:
+        spread_points = 0.15
+
+    class _Bridge:
+        def is_connected(self):
+            return True
+
+        def connect(self):
+            return True
+
+        def get_live_quote(self, symbol):
+            return _Quote()
+
+    class _Instrument:
+        point_divisor = 1000
+
+    import app.main as main
+
+    original = main._mt5_bridge
+    main._mt5_bridge = _Bridge()
+    try:
+        with caplog.at_level("WARNING", logger="quantengine"):
+            charged = _spread_points(costs, "XAUUSD", _Instrument())
+    finally:
+        main._mt5_bridge = original
+
+    # AUTO still wins - it is what the setting asks for - but not quietly.
+    assert charged == pytest.approx(150.0)
+    assert any("below the 600" in record.getMessage() for record in caplog.records)
