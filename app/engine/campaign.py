@@ -72,6 +72,8 @@ class CampaignConfig:
     risk_pct: float = 0.01
     # Settings -> Risk -> MAX DRAWDOWN, as a Phase 4 gate. 0 disables it.
     max_drawdown_pct: float = 0.0
+    # And the daily one, which is the limit a prop firm enforces hardest.
+    max_daily_drawdown_pct: float = 0.0
     timeframe: str = "H1"
     point_size: float = 0.0001
     max_workers: int | None = None  # None = all detected cores
@@ -363,6 +365,7 @@ def run_campaign(
     rejections: dict[str, int] = {}
     vault_candidates = run_phase_4_robustness(
         phase_3.survivors, df, gene_pool, max_drawdown_pct=config.max_drawdown_pct,
+        max_daily_drawdown_pct=config.max_daily_drawdown_pct,
         rejections=rejections, **eval_kwargs,
     )
     _set_survivors_per_phase(session, campaign_id, PHASE_ROBUSTNESS, len(vault_candidates))

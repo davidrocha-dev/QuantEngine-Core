@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 
 from app.engine.backtest import BacktestResult, Trade
@@ -185,3 +186,42 @@ def test_icir_is_positive_for_a_profitable_low_win_rate_strategy():
     assert icir(high_payoff) > 0, "a profitable strategy cannot have a negative edge per trade"
     assert icir(losing_but_frequent) < 0, "and a losing one cannot have a positive one"
     assert icir(high_payoff) > icir(losing_but_frequent)
+
+
+def test_the_worst_day_is_measured_against_that_days_opening_equity():
+    """Total drawdown and daily drawdown are different rules, and a
+    strategy can pass one while failing the other. Prop firms enforce
+    both — typically 10% overall and 5% in any one day — and this engine
+    only measured the first, so a strategy that lost 6% in an afternoon
+    and recovered it looked flawless right up to the account being
+    closed.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from app.engine.metrics import max_daily_drawdown_pct, max_drawdown_pct
+
+    # Two days. Day one dips 6% and recovers in full; day two drifts down
+    # 3% and stays there. Overall peak-to-trough never exceeds 6%.
+    stamps = pd.DatetimeIndex(
+        [f"2026-01-01T{h:02d}:00" for h in range(6)] + [f"2026-01-02T{h:02d}:00" for h in range(6)]
+    )
+    equity = np.array(
+        [10_000, 9_800, 9_400, 9_600, 9_900, 10_000, 10_000, 9_950, 9_900, 9_800, 9_750, 9_700],
+        dtype=float,
+    )
+
+    assert max_daily_drawdown_pct(equity, stamps) == pytest.approx(6.0, abs=0.05)
+    assert max_drawdown_pct(equity) < 7.0, "the overall figure never sees that day as a problem"
+
+    # A 10% total limit passes this; a 5% daily limit does not.
+    assert max_drawdown_pct(equity) < 10.0
+    assert max_daily_drawdown_pct(equity, stamps) > 5.0
+
+
+def test_the_worst_day_is_zero_without_timestamps_rather_than_wrong():
+    import numpy as np
+
+    from app.engine.metrics import max_daily_drawdown_pct
+
+    assert max_daily_drawdown_pct(np.array([10_000.0, 9_000.0]), None) == 0.0

@@ -40,6 +40,10 @@ class TradeStats:
     payoff_ratio: float
     icir: float
     avg_hold_hours: float
+    # The worst single day. A different rule from max_dd_pct, and the one
+    # a prop firm closes an account over. Last and defaulted so callers
+    # that build a TradeStats positionally keep working.
+    max_daily_dd_pct: float = 0.0
 
 
 def profit_factor(trades: list[Trade]) -> float:
@@ -71,6 +75,33 @@ def max_drawdown_pct(equity_curve: np.ndarray) -> float:
     running_max = np.maximum.accumulate(equity_curve)
     drawdown = (equity_curve - running_max) / running_max
     return float(-drawdown.min() * 100)
+
+
+def max_daily_drawdown_pct(equity_curve: np.ndarray, timestamps: pd.DatetimeIndex | None) -> float:
+    """The worst single day, peak-to-trough, as a share of that day's start.
+
+    Total drawdown and daily drawdown are different rules and a strategy
+    can pass one while failing the other. Prop firms enforce both — a
+    typical account allows 10% overall and 5% in any one day — and this
+    engine only ever measured the first, so a strategy that loses 6% in
+    an afternoon and recovers it looked flawless right up to the moment
+    the account was closed.
+
+    Measured against the day's opening equity rather than the running
+    peak, which is how the daily rule is usually written: the allowance
+    resets at the session boundary.
+    """
+    if timestamps is None or len(timestamps) != len(equity_curve) or len(equity_curve) < 2:
+        return 0.0
+    series = pd.Series(equity_curve, index=pd.DatetimeIndex(timestamps))
+    worst = 0.0
+    for _, day in series.groupby(series.index.date):
+        if len(day) < 2 or day.iloc[0] <= 0:
+            continue
+        trough = float(day.min())
+        drop = (day.iloc[0] - trough) / day.iloc[0] * 100
+        worst = max(worst, float(drop))
+    return worst
 
 
 def net_profit_pct(equity_curve: np.ndarray, initial_balance: float) -> float:
@@ -211,6 +242,9 @@ def compute_trade_stats(result: BacktestResult, df: pd.DataFrame, initial_balanc
         win_rate=win_rate(result.trades),
         sharpe_ratio=sharpe_ratio(result.equity_curve, pd.DatetimeIndex(df["timestamp"]) if "timestamp" in df else None),
         max_dd_pct=max_drawdown_pct(result.equity_curve),
+        max_daily_dd_pct=max_daily_drawdown_pct(
+            result.equity_curve, pd.DatetimeIndex(df["timestamp"]) if "timestamp" in df else None
+        ),
         net_profit_pct=net_profit_pct(result.equity_curve, initial_balance),
         cagr_pct=cagr_pct(result.equity_curve, initial_balance, len(df), timeframe),
         payoff_ratio=payoff_ratio(result.trades),

@@ -423,6 +423,7 @@ def run_phase_4_robustness(
     initial_balance: float = DEFAULT_INITIAL_BALANCE,
     rng: np.random.Generator | None = None,
     max_drawdown_pct: float = 0.0,
+    max_daily_drawdown_pct: float = 0.0,
     rejections: dict[str, int] | None = None,
     **eval_kwargs,
 ) -> list[VaultCandidate]:
@@ -472,6 +473,10 @@ def run_phase_4_robustness(
         # where decoration is dangerous.
         if max_drawdown_pct > 0 and oos_stats.max_dd_pct > max_drawdown_pct:
             reject(f"drawdown above the {max_drawdown_pct:g}% limit in Settings -> Risk")
+            continue
+
+        if max_daily_drawdown_pct > 0 and oos_stats.max_daily_dd_pct > max_daily_drawdown_pct:
+            reject(f"a single day worse than the {max_daily_drawdown_pct:g}% limit in Settings -> Risk")
             continue
 
         # Two gates, both about evidence: a strategy that loses money on

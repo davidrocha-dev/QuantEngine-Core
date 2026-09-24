@@ -33,6 +33,7 @@ def vault_candidate_to_row(candidate: VaultCandidate, asset: str, timeframe: str
         return_pct=candidate.stats_oos.net_profit_pct,
         cagr_pct=candidate.stats_oos.cagr_pct,
         max_dd_pct=candidate.stats_oos.max_dd_pct,
+        max_daily_dd_pct=candidate.stats_oos.max_daily_dd_pct,
         archetype=classify_archetype(candidate.genome),
         robust_pct=_band(candidate)[0],
         robust_low_pct=_band(candidate)[1],

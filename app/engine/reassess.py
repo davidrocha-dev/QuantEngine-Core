@@ -102,6 +102,7 @@ def refresh_strategy(
     strategy.return_pct = oos_stats.net_profit_pct
     strategy.cagr_pct = oos_stats.cagr_pct
     strategy.max_dd_pct = oos_stats.max_dd_pct
+    strategy.max_daily_dd_pct = oos_stats.max_daily_dd_pct
     strategy.icir = oos_stats.icir
     strategy.win_rate_pct = oos_stats.win_rate * 100
     strategy.avg_hold_hours = oos_stats.avg_hold_hours

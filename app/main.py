@@ -331,6 +331,7 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
         # Settings → Risk (REQ-SET-1.2) is a percentage; the backtester takes a fraction.
         risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
         max_drawdown_pct=float(settings["risk"]["max_drawdown_pct"]),
+        max_daily_drawdown_pct=float(settings["risk"].get("max_daily_drawdown_pct", 0.0)),
         # Costs are in the instrument's own points (0.00001 on EURUSD,
         # 0.001 on USDJPY/XAUUSD), not a fixed pip.
         point_size=1 / instrument.point_divisor,
@@ -914,6 +915,7 @@ def _serialize_strategy(row: Strategy, *, full: bool) -> dict:
         "return_pct": row.return_pct,
         "cagr_pct": row.cagr_pct,
         "max_dd_pct": row.max_dd_pct,
+        "max_daily_dd_pct": row.max_daily_dd_pct,
         "archetype": row.archetype,
         "mechanism": _mechanism(row.genome_json),
         "robust_pct": row.robust_pct,

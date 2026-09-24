@@ -20,6 +20,10 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
     },
     "risk": {
         "max_drawdown_pct": 20.0,
+        # Prop firms enforce two limits, not one: a total drawdown and a
+        # daily one, typically 10% and 5%. A strategy can pass the first
+        # and lose the account on the second. 0 disables the check.
+        "max_daily_drawdown_pct": 0.0,
         "per_trade_risk_pct": 1.0,
         "max_leverage": 30.0,
     },

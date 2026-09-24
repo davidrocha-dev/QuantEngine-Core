@@ -24,6 +24,10 @@ class Strategy(Base):
     return_pct: Mapped[float | None]
     cagr_pct: Mapped[float | None]
     max_dd_pct: Mapped[float | None]
+    # Worst single day, peak-to-trough against that day's opening equity.
+    # A different rule from max_dd_pct and the one a prop firm enforces
+    # most aggressively.
+    max_daily_dd_pct: Mapped[float | None]
     archetype: Mapped[str | None] = mapped_column(String)
     robust_pct: Mapped[float | None]
     # The 10th/90th percentile of the sampled noise degradations, expressed

@@ -145,6 +145,11 @@ MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE strategies ADD COLUMN robust_high_pct REAL",
         ),
     ),
+    Migration(
+        version=10,
+        description="Worst single day, the limit a prop firm closes an account over",
+        statements=("ALTER TABLE strategies ADD COLUMN max_daily_dd_pct REAL",),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = max(m.version for m in MIGRATIONS)
