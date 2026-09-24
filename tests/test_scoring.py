@@ -2,7 +2,12 @@ import pytest
 
 from app.engine.metrics import TradeStats
 from app.engine.monte_carlo import RobustnessResult
-from app.engine.scoring import classify_archetype, compute_grade, compute_score
+from app.engine.scoring import (
+    GOOD_GRADE_THRESHOLD,
+    classify_archetype,
+    compute_grade,
+    compute_score,
+)
 from app.genome.genome import GeneChoice, Genome
 
 
@@ -116,3 +121,37 @@ def test_a_strong_result_on_a_thin_sample_is_never_graded_good():
 def test_grading_without_a_trade_count_still_works():
     # Callers that only have a score keep the old behaviour.
     assert compute_grade(70) == "GOOD"
+
+
+def test_a_strategy_that_lost_money_is_never_good():
+    """Nothing in the composite asked whether it made a profit.
+
+    Robustness measures how little a result decays under noise, and a
+    strategy that is reliably bad decays hardly at all. #6B8DCA came back
+    from REASSESS at -5.3% over its out-of-sample window and -10.2% a
+    year, and was graded GOOD at 64 on the strength of 100% robustness and
+    191 trades - two of the six components at full marks for losing money
+    consistently.
+    """
+    assert compute_grade(64, trade_count=191, net_profit_pct=-5.3) == "WEAK"
+    assert compute_grade(64, trade_count=191, net_profit_pct=+5.3) == "GOOD"
+    # Breakeven is not a profit either.
+    assert compute_grade(90, trade_count=400, net_profit_pct=0.0) == "WEAK"
+    # A caller with only a score keeps the old behaviour.
+    assert compute_grade(64, trade_count=191) == "GOOD"
+
+
+def test_breakeven_earns_nothing_on_the_profit_factor_component():
+    """A profit factor of 1.0 is breakeven. Dividing it by two handed a
+    losing strategy 45 of the 100 marks available on this component."""
+    losing = make_stats(profit_factor=0.9, win_rate=0.5, sharpe_ratio=0.0,
+                        max_dd_pct=15.5, trade_count=191, net_profit_pct=-5.3)
+    breakeven = make_stats(profit_factor=1.0, win_rate=0.5, sharpe_ratio=0.0,
+                           max_dd_pct=15.5, trade_count=191, net_profit_pct=0.0)
+    good = make_stats(profit_factor=1.8, win_rate=0.5, sharpe_ratio=1.0,
+                      max_dd_pct=10.0, trade_count=300, net_profit_pct=25.0)
+    flawless = make_robustness(mc_degradation=0.0, noise_degradation=0.0)
+
+    assert compute_score(losing, flawless) == compute_score(breakeven, flawless)
+    assert compute_score(losing, flawless) < GOOD_GRADE_THRESHOLD
+    assert compute_score(good, flawless) > compute_score(breakeven, flawless)

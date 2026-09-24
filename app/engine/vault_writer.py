@@ -42,7 +42,7 @@ def vault_candidate_to_row(candidate: VaultCandidate, asset: str, timeframe: str
         win_rate_pct=candidate.stats_oos.win_rate * 100,
         avg_hold_hours=candidate.stats_oos.avg_hold_hours,
         score=score,
-        grade=compute_grade(score, candidate.stats_oos.trade_count),
+        grade=compute_grade(score, candidate.stats_oos.trade_count, candidate.stats_oos.net_profit_pct),
         genome_json=json.dumps(candidate.genome.to_dict()),
         equity_is=json.dumps(candidate.equity_is) if candidate.equity_is else None,
         equity_oos=json.dumps(candidate.equity_oos) if candidate.equity_oos else None,

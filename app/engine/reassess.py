@@ -180,7 +180,7 @@ def reassess_strategy(
 
     score = compute_score(oos_stats, robustness)
     strategy.score = score
-    strategy.grade = compute_grade(score, oos_stats.trade_count)
+    strategy.grade = compute_grade(score, oos_stats.trade_count, oos_stats.net_profit_pct)
     robust_value, robust_low, robust_high = robustness_band(robustness)
     strategy.robust_pct = robust_value
     strategy.robust_low_pct = robust_low
