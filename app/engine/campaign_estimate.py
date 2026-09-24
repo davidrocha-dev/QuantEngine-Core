@@ -1,42 +1,111 @@
 """Campaign duration estimate — REQ-DASH-1.5.
 
-The estimate is derived from the work the campaign will actually do, not
-from the core count alone: number of backtests (Phase 0's population, plus
-each tribe's children per generation, plus Phase 3's crossover children)
-multiplied by the cost of one backtest, divided across cores.
+The estimate is derived from the work a campaign actually does, measured
+by instrumenting `simulate_trades` and running real campaigns end to end
+on one core. What that measurement corrected:
 
-`SECONDS_PER_BAR_PER_BACKTEST` is measured, not guessed: a full genome
-evaluation over a 14,212-bar M1 series takes ~0.127s on this machine's
-single core, i.e. ~9e-6 s/bar. It is a coefficient to re-measure when the
-backtester's hot path changes, not a constant of nature.
+  * **Screening repeats.** Phase 0 redraws a whole fresh population and
+    screens it again, up to `MAX_SCREENING_ROUNDS` times, until the
+    tribes have a pool worth evolving (campaign.py). The old model
+    counted one round. Measured: three rounds on a synthetic series, and
+    the count is data-dependent, which is most of the honest uncertainty
+    in this number.
+  * **Phase 4 was counted as one backtest per survivor.** It is the
+    out-of-sample run, plus `NOISE_SAMPLES` re-simulations of it, plus
+    the walk-forward windows, which together cover the history once more.
+  * **Phase 4 is serial.** Only the population evaluations in Phases 0 to
+    3 go through the process pool; robustness, walk-forward and the Vault
+    write happen one candidate at a time in the parent. Dividing the
+    whole campaign by the core count was the largest single error for a
+    machine with many cores.
+  * **Windows differ per phase.** Phases 0 to 3 run on the in-sample
+    slice, Phase 4's baseline and noise runs on the out-of-sample
+    remainder, walk-forward across the whole series.
 
-Pure function so the Dashboard's "before you confirm launch" estimate can
-be unit-tested without spinning up a real campaign.
+Work is counted in "full runs": one backtest over the whole series. A
+Phase 0 evaluation is therefore 0.7 of a full run, and the totals below
+are directly comparable to the measurements in `tests/`.
+
+`SECONDS_PER_BAR` is a campaign-level coefficient, not the cost of a bare
+backtest — it absorbs process-pool startup, the per-candidate statistics,
+checkpointing and the Vault write. It is calibrated against a measured
+campaign and is the first thing to re-measure when the hot path changes.
+
+Pure functions, so the Dashboard's "before you confirm launch" estimate
+can be unit-tested without spinning up a real campaign.
 """
 
 from __future__ import annotations
 
-SECONDS_PER_BAR_PER_BACKTEST = 9.0e-6
-# Phases 1 and 2 each breed `children_per_generation` candidates per
-# generation; the breeding pool is capped (phases.py DEFAULT_MAX_BREEDING_
-# POPULATION) and 80% of it is replaced each generation (elite fraction 0.2).
+from dataclasses import dataclass
+
+from app.engine.campaign import MAX_SCREENING_ROUNDS
+from app.engine.monte_carlo import NOISE_SAMPLES
+from app.engine.phases import DEFAULT_MAX_BREEDING_POPULATION, IS_FRACTION
+
+# Seconds per bar of every full-run-equivalent, at campaign level.
+# Calibrated against an ECO campaign on this machine: 39,734 XAUUSD M15
+# bars, 12 cores, 84 seconds wall clock.
+SECONDS_PER_BAR = 1.25e-5
+
 TRIBES = 2
+# Phases 1 and 2 replace this share of the breeding pool each generation
+# (elite fraction 0.2, phases.py).
 CHILD_FRACTION = 0.8
-# Parallel efficiency is never 1.0 — pickling, pool startup and the
-# sequential Phase 4 all eat into it.
+# Pool startup, pickling the bar frame to each worker and the sequential
+# stretches inside an otherwise parallel phase.
 PARALLEL_EFFICIENCY = 0.75
-ESTIMATE_BAND = 0.4  # +/- 40% around the point estimate
 
 
-def campaign_backtest_count(population_size: int, generations: int, breeding_population: int, phase3_children: int) -> int:
-    """Total genome evaluations a campaign performs, across all 5 phases."""
-    children_per_generation = max(1, int(breeding_population * CHILD_FRACTION))
-    return (
-        population_size  # Phase 0
-        + TRIBES * generations * children_per_generation  # Phases 1 and 2
-        + phase3_children  # Phase 3
-        + phase3_children  # Phase 4 re-runs survivors against OOS
+@dataclass(frozen=True)
+class CampaignWork:
+    """Work a campaign performs, in full-run equivalents."""
+
+    parallel: float  # Phases 0-3: population evaluations, across the pool
+    serial: float  # Phase 4: robustness, noise samples and walk-forward
+
+    @property
+    def total(self) -> float:
+        return self.parallel + self.serial
+
+
+def campaign_work(
+    population_size: int,
+    generations: int,
+    phase3_children: int,
+    screening_rounds: int,
+    phase4_full_depth: bool,
+    max_breeding_population: int = DEFAULT_MAX_BREEDING_POPULATION,
+) -> CampaignWork:
+    """Full-run equivalents for one configuration.
+
+    `screening_rounds` and `phase4_full_depth` are the two things that
+    cannot be known before the run: how many times Phase 0 has to redraw
+    before it has a breeding pool, and how many Phase 3 children survive
+    robustness far enough to reach the noise sampling and the
+    walk-forward. Callers pass the optimistic and the pessimistic case
+    and report the pair.
+    """
+    breeding_population = min(population_size, max_breeding_population)
+    children = max(1, int(breeding_population * CHILD_FRACTION))
+    oos_fraction = 1 - IS_FRACTION
+
+    parallel = (
+        screening_rounds * population_size * IS_FRACTION  # Phase 0, redrawn each round
+        + TRIBES * generations * children * IS_FRACTION  # Phases 1 and 2
+        + phase3_children * IS_FRACTION  # Phase 3
     )
+
+    # Phase 4, per candidate: the out-of-sample baseline always, then the
+    # noise re-simulations and the walk-forward windows only for those
+    # that clear robustness. The walk-forward windows partition the whole
+    # series, so together they are one full run.
+    per_candidate = oos_fraction
+    if phase4_full_depth:
+        per_candidate += oos_fraction * NOISE_SAMPLES + 1.0
+    serial = phase3_children * per_candidate
+
+    return CampaignWork(parallel=parallel, serial=serial)
 
 
 def estimate_campaign_minutes(
@@ -44,20 +113,29 @@ def estimate_campaign_minutes(
     population_size: int = 300,
     generations: int = 5,
     bars: int = 20_000,
-    breeding_population: int = 200,
     phase3_children: int = 80,
+    max_breeding_population: int = DEFAULT_MAX_BREEDING_POPULATION,
 ) -> tuple[int, int]:
-    """Return an inclusive (min, max) minute range for this configuration.
+    """An inclusive (min, max) minute range for this configuration.
 
-    Defaults match the MEDIUM POWER preset so a caller with no settings in
-    hand still gets a sane number rather than a fixed 15-60 placeholder.
+    The range is the real uncertainty, not a percentage band bolted on
+    afterwards: the low end assumes screening finds a breeding pool on
+    its first draw and nothing survives robustness, the high end assumes
+    it redraws the maximum number of times and every Phase 3 child goes
+    through the full noise sampling and walk-forward.
+
+    Defaults match the MEDIUM POWER preset so a caller with no settings
+    in hand still gets a sane number.
     """
     cores = max(1, cpu_cores)
-    backtests = campaign_backtest_count(population_size, generations, breeding_population, phase3_children)
-    serial_seconds = backtests * bars * SECONDS_PER_BAR_PER_BACKTEST
-    parallel_seconds = serial_seconds / (cores * PARALLEL_EFFICIENCY)
 
-    minutes = parallel_seconds / 60
-    low = max(1, round(minutes * (1 - ESTIMATE_BAND)))
-    high = max(low + 1, round(minutes * (1 + ESTIMATE_BAND)))
+    def minutes(rounds: int, full_depth: bool) -> float:
+        work = campaign_work(
+            population_size, generations, phase3_children, rounds, full_depth, max_breeding_population
+        )
+        effective_runs = work.parallel / (cores * PARALLEL_EFFICIENCY) + work.serial
+        return effective_runs * bars * SECONDS_PER_BAR / 60
+
+    low = max(1, round(minutes(1, False)))
+    high = max(low + 1, round(minutes(MAX_SCREENING_ROUNDS, True)))
     return low, high
