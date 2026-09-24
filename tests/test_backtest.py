@@ -223,3 +223,46 @@ def test_a_stop_loss_costs_exactly_one_r():
     assert stopped, "this series is meant to produce stop-outs"
     for trade in stopped:
         assert abs(trade.r_multiple + 1.0) < 1e-9, trade.r_multiple
+
+
+def test_a_resting_order_fills_only_when_price_trades_through_it():
+    """Filling a buy limit the moment a bar's low reaches it means buying
+    at the exact low of that bar — the one price in it nobody gets — and
+    then measuring the trade from there.
+
+    Measured on a real strategy: swapping only the execution gene, with
+    signal, bias, filters and management untouched, moved the campaign
+    return from +27,381% on LIMIT2 to -9.6% on MARKET2. Every one of the
+    26 strategies in the Vault at the time used LIMIT or LIMIT2 — the
+    search had found this and converged on it.
+    """
+    from app.engine.backtest import _wait_for_fill
+
+    # A bar that reaches exactly 100.0 and no further.
+    highs = np.array([101.0, 101.0, 101.0])
+    lows = np.array([100.5, 100.0, 100.5])
+
+    touched_exactly = _wait_for_fill(highs, lows, 0, 1, order_price=100.0, is_limit=True, margin=0.1)
+    assert touched_exactly == (None, None), "a buy limit merely reached is not a buy limit filled"
+
+    traded_through = _wait_for_fill(highs, lows, 0, 1, order_price=100.2, is_limit=True, margin=0.1)
+    assert traded_through[0] == 1 and traded_through[1] == 100.2
+
+    # And the same rule the other way for a sell limit, which rests above.
+    sell_reached = _wait_for_fill(
+        np.array([100.0, 100.0, 100.0]), np.array([99.0, 99.0, 99.0]), 0, -1,
+        order_price=100.0, is_limit=True, margin=0.1,
+    )
+    assert sell_reached == (None, None)
+
+
+def test_a_wider_spread_makes_a_resting_order_harder_to_fill():
+    """The margin is the spread: a buy limit rests on the ask, and the
+    quote has to cross it."""
+    from app.engine.backtest import _wait_for_fill
+
+    highs = np.array([101.0, 101.0])
+    lows = np.array([100.5, 99.95])
+
+    assert _wait_for_fill(highs, lows, 0, 1, 100.0, is_limit=True, margin=0.0)[0] == 1
+    assert _wait_for_fill(highs, lows, 0, 1, 100.0, is_limit=True, margin=0.2) == (None, None)

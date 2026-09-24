@@ -232,7 +232,9 @@ def simulate_trades(
             i += 1
             continue
 
-        entry_idx, entry_price = _resolve_entry(df, genome, i, direction, closes, highs, lows, opens, atr_series)
+        entry_idx, entry_price = _resolve_entry(
+            df, genome, i, direction, closes, highs, lows, opens, atr_series, fill_margin=cost_points * point_size
+        )
         if entry_idx is None:
             i += 1
             continue
@@ -344,7 +346,7 @@ def simulate_trades(
 _EXIT_NAMES = {EXIT_STOP: "stop", EXIT_TARGET: "target", EXIT_MAX_HOLD: "max_hold"}
 
 
-def _resolve_entry(df, genome, signal_idx, direction, closes, highs, lows, opens, atr_series):
+def _resolve_entry(df, genome, signal_idx, direction, closes, highs, lows, opens, atr_series, fill_margin=0.0):
     """Applies the genome's EXECUTION gene to resolve an actual fill index
     and price from the bar where the signal fired."""
     name, params = genome.execution.name, genome.execution.params
@@ -361,12 +363,12 @@ def _resolve_entry(df, genome, signal_idx, direction, closes, highs, lows, opens
     if name == "LIMIT":
         offset = params.get("offset_atr", 0.5) * atr_at_signal
         limit_price = signal_price - direction * offset
-        return _wait_for_fill(highs, lows, signal_idx, direction, limit_price, is_limit=True)
+        return _wait_for_fill(highs, lows, signal_idx, direction, limit_price, is_limit=True, margin=fill_margin)
 
     if name == "STOP":
         offset = params.get("offset_atr", 0.3) * atr_at_signal
         stop_price = signal_price + direction * offset
-        return _wait_for_fill(highs, lows, signal_idx, direction, stop_price, is_limit=False)
+        return _wait_for_fill(highs, lows, signal_idx, direction, stop_price, is_limit=False, margin=fill_margin)
 
     if name == "LIMIT2":
         offset_1 = params.get("offset_atr_1", 0.5) * atr_at_signal
@@ -374,16 +376,44 @@ def _resolve_entry(df, genome, signal_idx, direction, closes, highs, lows, opens
         price_1 = signal_price - direction * offset_1
         price_2 = signal_price - direction * offset_2
         avg_price = (price_1 + price_2) / 2
-        return _wait_for_fill(highs, lows, signal_idx, direction, avg_price, is_limit=True)
+        return _wait_for_fill(highs, lows, signal_idx, direction, avg_price, is_limit=True, margin=fill_margin)
 
     return signal_idx, signal_price  # unknown execution gene — immediate fill fallback
 
 
-def _wait_for_fill(highs, lows, signal_idx, direction, order_price, is_limit: bool):
+def _wait_for_fill(highs, lows, signal_idx, direction, order_price, is_limit: bool, margin: float = 0.0):
+    """When a resting order gets filled, if it does.
+
+    The order fills once the market trades *through* its price, not when a
+    bar's range happens to reach it. The difference is the whole edge of
+    every limit-entry strategy this engine has ever bred.
+
+    Filling a buy limit the moment `lows[i] <= order_price` means the
+    backtester buys at the exact low of the bar that touched it — the one
+    price in that bar nobody actually gets — and then measures the trade
+    from there. A bar's close is above its low on average, so any exit
+    that happens soon after is favourable for free. Measured on a real
+    strategy whose management gene closes positions the same session:
+    41.5% of its trades exited that way at a mean of +0.35R, and swapping
+    only the execution gene, leaving signal, bias, filters and management
+    untouched, moved the campaign return from +27,381% on LIMIT2 to -9.6%
+    on MARKET2. Every one of the 26 strategies in the Vault at the time
+    used LIMIT or LIMIT2: the search had found this and converged on it.
+
+    `margin` is the distance the price has to go beyond the order before
+    the fill counts — the spread, since a buy limit rests on the ask and
+    the quote has to cross it, and since being merely touched does not
+    put you at the front of a queue.
+    """
     last_i = min(signal_idx + PENDING_ORDER_WINDOW_BARS, len(highs) - 1)
     for i in range(signal_idx + 1, last_i + 1):
-        touched = (lows[i] <= order_price <= highs[i])
-        if touched:
+        if is_limit:
+            # A buy limit rests below: price has to come down through it.
+            through = lows[i] <= order_price - margin if direction == 1 else highs[i] >= order_price + margin
+        else:
+            # A buy stop rests above: price has to rise up through it.
+            through = highs[i] >= order_price + margin if direction == 1 else lows[i] <= order_price - margin
+        if through:
             return i, order_price
     return None, None
 
