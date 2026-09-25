@@ -69,6 +69,11 @@ class PhaseOutcome:
     survivors: list[CandidateResult] = field(default_factory=list)
     rejected: list[tuple[Genome, str]] = field(default_factory=list)
     fail_reason: str | None = None
+    # Every reason Phase 4 said no, with its count. `fail_reason` is one
+    # sentence and can only carry the top two; a campaign that runs for
+    # twenty minutes and approves nothing has earned the whole list, and
+    # the caller needs it structured to show it as anything but prose.
+    rejections: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass

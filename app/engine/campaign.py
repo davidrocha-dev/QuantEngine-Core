@@ -405,6 +405,7 @@ def run_campaign(
             passed=True,
             survivors=[],
             fail_reason=f"No candidate cleared Phase 4: {detail}.",
+            rejections=dict(ranked),
         )
 
     return PhaseOutcome(passed=True, survivors=[])

@@ -12,6 +12,7 @@ from app.engine.campaign import (
     mark_crashed_campaigns,
     run_campaign,
 )
+from app.engine.phases import PhaseOutcome
 from app.genome.gene_pool import GenePoolConfig
 from app.models import Campaign
 from tests.helpers import make_synthetic_ohlc
@@ -189,3 +190,31 @@ def test_a_campaign_that_approves_nothing_says_why():
     assert outcome.fail_reason, "an empty campaign has to explain itself"
     assert "drawdown above the 20% limit" in outcome.fail_reason
     assert "7 for" in outcome.fail_reason, "and say how many, so the user knows if it is the main cause"
+
+
+def test_phase_4_reports_every_gate_it_rejected_on_not_just_two():
+    """A campaign that approves nothing has a result, and the result is
+    the reasons.
+
+    `fail_reason` is one sentence and can only carry the top two, which is
+    how a real campaign came back saying "80 for drawdown" and nothing
+    about the other gates that also turned candidates away. The structured
+    breakdown goes to the renderer, which shows all of it and names the
+    Settings field behind the ones that are limits the owner set.
+    """
+    rejections = {"drawdown": 80, "daily drawdown": 12, "robustness": 5}
+    outcome = PhaseOutcome(
+        passed=True,
+        survivors=[],
+        fail_reason="No candidate cleared Phase 4: 80 for drawdown, 12 for daily drawdown.",
+        rejections=rejections,
+    )
+
+    assert outcome.rejections == rejections
+    # The sentence keeps its two; nothing is lost alongside it.
+    assert "robustness" not in (outcome.fail_reason or "")
+    assert outcome.rejections["robustness"] == 5
+
+
+def test_an_outcome_with_nothing_to_explain_carries_no_rejections():
+    assert PhaseOutcome(passed=True).rejections == {}

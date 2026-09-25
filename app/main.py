@@ -429,7 +429,8 @@ def _run_campaign_background(
             _emit_event_threadsafe(
                 {"type": "campaign_complete", "campaign_id": campaign_id, "status": "cancelled",
                  "phase": None, "generation": None, "tribe": None, "fitness": None,
-                 "survivors_per_phase": {}, "detail": outcome.fail_reason}
+                 "survivors_per_phase": {}, "detail": outcome.fail_reason,
+                 "rejections": outcome.rejections or {}}
             )
     except CampaignPaused:
         # Not a failure. The generation that was running finished and was
