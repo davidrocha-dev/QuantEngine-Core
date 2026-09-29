@@ -59,9 +59,18 @@ def true_range(df: pd.DataFrame) -> pd.Series:
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average True Range: Wilder's smoothed average of the true range."""
-    tr = true_range(df)
-    return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    """Average True Range as MetaTrader computes it: a simple moving
+    average of the true range over `period` bars.
+
+    Not Wilder's smoothing. Every exported EA sizes its stop, its target
+    and its lot from MT5's built-in iATR, which is this SMA, and every
+    ATR-based gene reads the same handle there. With Wilder here the two
+    sides disagreed by -16% to +28% on the same bar (EURUSD H1, 5th-95th
+    percentile), so the EA traded different stops, different sizes and -
+    for RECEDING, which asks whether ATR fell five bars running - a
+    different veto on more than half the bars that either side vetoed.
+    """
+    return true_range(df).rolling(window=period, min_periods=period).mean()
 
 
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
@@ -73,15 +82,25 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     result = 100 - (100 / (1 + rs))
+    # No losses in the window is the strongest reading RSI has, not a
+    # neutral one: MT5 reports 100 there, and this used to report 50.
+    result = result.mask(avg_loss.eq(0) & avg_gain.gt(0), 100.0)
     return result.fillna(50.0)
 
 
 def macd(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[pd.Series, pd.Series, pd.Series]:
-    """MACD line, signal line, and histogram — standard 12/26/9 EMA setup."""
+    """MACD line, signal line, and histogram, as MetaTrader's iMACD
+    computes them: EMA(fast) - EMA(slow), and a signal line that is a
+    *simple* moving average of the MACD line.
+
+    Textbook MACD smooths the signal with an EMA; MT5's built-in does
+    not, and the exported EA reads the built-in. With an EMA here only
+    half of the crossovers the backtest traded happened in MetaTrader.
+    """
     ema_fast = series.ewm(span=fast, adjust=False).mean()
     ema_slow = series.ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    signal_line = macd_line.rolling(window=signal, min_periods=signal).mean()
     histogram = macd_line - signal_line
     return macd_line, signal_line, histogram
 
@@ -98,7 +117,8 @@ def cci(df: pd.DataFrame, period: int = 20) -> pd.Series:
 
 
 def stochastic(df: pd.DataFrame, k_period: int = 14, d_period: int = 3) -> tuple[pd.Series, pd.Series]:
-    """Stochastic oscillator %K / %D, standard 14/3 setup."""
+    """Stochastic oscillator %K / %D, standard 14/3 setup, with no
+    slowing: iStochastic(k, d, slowing=1) in MetaTrader."""
     lowest_low = df["low"].rolling(k_period).min()
     highest_high = df["high"].rolling(k_period).max()
     percent_k = 100 * (df["close"] - lowest_low) / (highest_high - lowest_low).replace(0, np.nan)
@@ -114,7 +134,10 @@ def williams_r(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average Directional Index, standard Wilder 14-period setup."""
+    """Average Directional Index, standard Wilder 14-period setup.
+
+    The EA must read this through iADXWilder, not iADX: MetaTrader's
+    plain iADX smooths with an EMA of 2/(n+1), which is not Wilder."""
     up_move = df["high"].diff()
     down_move = -df["low"].diff()
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)

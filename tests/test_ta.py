@@ -65,3 +65,27 @@ def test_wick_rejection_directions():
     })
     result = ta.wick_rejection(df, wick_ratio=2.0)
     assert result.iloc[0] == 1
+
+
+# The exported EA reads MetaTrader's built-in indicators, so these pin the
+# Python side to MT5's definitions rather than to the textbook ones.
+
+def test_atr_is_mt5_simple_average_of_true_range():
+    df = make_synthetic_ohlc(100)
+    expected = ta.true_range(df).rolling(14).mean()
+    np.testing.assert_allclose(ta.atr(df).to_numpy(), expected.to_numpy(), equal_nan=True)
+
+
+def test_macd_signal_is_mt5_simple_average_of_the_macd_line():
+    df = make_synthetic_ohlc(200)
+    macd_line, signal_line, _ = ta.macd(df["close"], 12, 26, 9)
+    np.testing.assert_allclose(
+        signal_line.to_numpy(), macd_line.rolling(9).mean().to_numpy(), equal_nan=True
+    )
+
+
+def test_rsi_with_no_losses_reads_100_not_50():
+    import pandas as pd
+
+    rising = pd.Series(np.arange(1.0, 40.0))
+    assert ta.rsi(rising).iloc[-1] == pytest.approx(100.0)

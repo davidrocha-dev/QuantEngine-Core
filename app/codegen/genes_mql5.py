@@ -128,7 +128,9 @@ def _signal(name: str, params: dict, index: int) -> GeneCode:
         stoch = _i("stoch", index)
         k_period, d_period = int(p.get("k_period", 14)), int(p.get("d_period", 3))
         return GeneCode(
-            {stoch: f"iStochastic(_Symbol, PERIOD_CURRENT, {k_period}, {d_period}, 3, MODE_SMA, STO_LOWHIGH)"},
+            # slowing=1: the Python gene has no slowing, and a slowing of 3
+            # here left one crossover in eleven in common with the backtest.
+            {stoch: f"iStochastic(_Symbol, PERIOD_CURRENT, {k_period}, {d_period}, 1, MODE_SMA, STO_LOWHIGH)"},
             f"Val({stoch}, 0, 1) > Val({stoch}, 1, 1) && Val({stoch}, 0, 2) <= Val({stoch}, 1, 2) && Val({stoch}, 0, 1) < 20",
             f"Val({stoch}, 0, 1) < Val({stoch}, 1, 1) && Val({stoch}, 0, 2) >= Val({stoch}, 1, 2) && Val({stoch}, 0, 1) > 80",
         )
@@ -171,7 +173,8 @@ def _bias(name: str, params: dict, index: int) -> GeneCode:
         adx, period, threshold = _i("adx", index), int(p.get("period", 14)), p.get("threshold", 20)
         strong = f"Val({adx}, 0, 1) > {threshold}"
         return GeneCode(
-            {adx: f"iADX(_Symbol, PERIOD_CURRENT, {period})"},
+            # iADXWilder: the Python side is Wilder; plain iADX is an EMA.
+            {adx: f"iADXWilder(_Symbol, PERIOD_CURRENT, {period})"},
             f"{strong} && Val({adx}, 1, 1) > Val({adx}, 2, 1)",
             f"{strong} && Val({adx}, 1, 1) < Val({adx}, 2, 1)",
         )
@@ -268,9 +271,13 @@ def _filter(name: str, params: dict, index: int) -> GeneCode:
         )
 
     if name == "CONSEC":
-        # Cool-down on the EA's own trade history, which is what the gene
-        # describes; the Python side evaluates the same rule per candidate.
-        return GeneCode(veto_expr=f"ConsecutiveLosses() >= {int(p.get('max_losses', 3))}")
+        # The backtester has never applied this gene - its Python side
+        # vetoes nothing - so every strategy carrying it was measured
+        # without it, and that is what the EA must trade. It used to veto
+        # on the EA's own losing streak, which never resets once trading
+        # stops: after N losses in a row the EA was switched off for good.
+        # Campaigns no longer draw it (main._gene_pool_for_campaign).
+        return GeneCode(veto_expr="false")
 
     if name == "DOJI":
         return GeneCode(veto_expr=f"IsDoji(1, {p.get('body_ratio', 0.1)})")
@@ -307,7 +314,7 @@ def _filter(name: str, params: dict, index: int) -> GeneCode:
         require = p.get("require", "trend")
         comparison = "<" if require == "trend" else ">="
         return GeneCode(
-            {adx: f"iADX(_Symbol, PERIOD_CURRENT, {period})"},
+            {adx: f"iADXWilder(_Symbol, PERIOD_CURRENT, {period})"},
             veto_expr=f"Val({adx}, 0, 1) {comparison} {threshold}",
         )
 
