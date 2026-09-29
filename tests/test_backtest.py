@@ -1,3 +1,4 @@
+import pytest
 import numpy as np
 import pandas as pd
 
@@ -10,7 +11,7 @@ from tests.helpers import make_synthetic_ohlc
 def test_scan_exit_numba_hits_target_first():
     highs = np.array([1.0, 1.01, 1.05, 1.02])
     lows = np.array([1.0, 0.99, 1.00, 1.00])
-    idx, price, code = _scan_exit_numba(highs, lows, 0, 1, stop_price=0.90, target_price=1.05, max_hold=10)
+    idx, price, code = _scan_exit_numba(highs, lows, highs * 0 + 1.0, 0, 1, stop_price=0.90, target_price=1.05, max_hold=10)
     assert idx == 2
     assert price == 1.05
     assert code == EXIT_TARGET
@@ -19,7 +20,7 @@ def test_scan_exit_numba_hits_target_first():
 def test_scan_exit_numba_hits_stop_first():
     highs = np.array([1.0, 1.01, 1.02, 1.03])
     lows = np.array([1.0, 0.89, 1.00, 1.00])
-    idx, price, code = _scan_exit_numba(highs, lows, 0, 1, stop_price=0.90, target_price=1.20, max_hold=10)
+    idx, price, code = _scan_exit_numba(highs, lows, highs * 0 + 1.0, 0, 1, stop_price=0.90, target_price=1.20, max_hold=10)
     assert idx == 1
     assert price == 0.90
     assert code == EXIT_STOP
@@ -28,7 +29,7 @@ def test_scan_exit_numba_hits_stop_first():
 def test_scan_exit_numba_respects_max_hold():
     highs = np.array([1.0, 1.01, 1.01, 1.01, 1.01])
     lows = np.array([1.0, 0.99, 0.99, 0.99, 0.99])
-    idx, price, code = _scan_exit_numba(highs, lows, 0, 1, stop_price=0.5, target_price=5.0, max_hold=2)
+    idx, price, code = _scan_exit_numba(highs, lows, highs * 0 + 1.0, 0, 1, stop_price=0.5, target_price=5.0, max_hold=2)
     assert idx == 2
     assert np.isnan(price)
 
@@ -36,7 +37,7 @@ def test_scan_exit_numba_respects_max_hold():
 def test_scan_exit_numba_short_direction():
     highs = np.array([1.0, 1.10, 1.01, 1.01])
     lows = np.array([1.0, 1.00, 0.95, 1.00])
-    idx, price, code = _scan_exit_numba(highs, lows, 0, -1, stop_price=1.10, target_price=0.95, max_hold=10)
+    idx, price, code = _scan_exit_numba(highs, lows, highs * 0 + 1.0, 0, -1, stop_price=1.10, target_price=0.95, max_hold=10)
     assert idx == 1
     assert code == EXIT_STOP
 
@@ -127,7 +128,7 @@ def test_partial_tp_cannot_fire_beyond_the_take_profit():
 
     baseline = (7, 110.9, EXIT_TARGET)
     partial_r, exit_idx, exit_price, exit_code = _run_partial_tp(
-        genome, highs, lows, closes,
+        genome, highs, lows, closes, closes,
         entry_idx=0, direction=1, entry_price=100.0,
         stop_price=100.0 - 2.79, target_price=100.0 + 1.09,
         exit_idx=baseline[0], exit_price=baseline[1], exit_code=baseline[2],
@@ -148,7 +149,7 @@ def test_partial_tp_still_fires_when_the_target_is_further_out():
     closes = highs - 0.25
 
     partial_r, _, _, _ = _run_partial_tp(
-        genome, highs, lows, closes,
+        genome, highs, lows, closes, closes,
         entry_idx=0, direction=1, entry_price=100.0,
         stop_price=100.0 - 2.79, target_price=100.0 + 5.58,
         exit_idx=30, exit_price=105.58, exit_code=EXIT_TARGET,
@@ -347,3 +348,98 @@ def test_the_ladder_is_off_unless_a_step_is_given():
                                lot_step=0.0, min_lot=0.01, max_lot=10.0)
 
     assert default.final_balance == explicit.final_balance
+
+
+# --- The backtest and the EA take the same trades -------------------------
+
+
+def test_a_stop_gapped_through_fills_at_the_open_not_at_the_stop():
+    highs = np.array([1.00, 1.00, 0.86])
+    lows = np.array([1.00, 0.99, 0.80])
+    opens = np.array([1.00, 1.00, 0.85])  # bar 2 opens below the 0.90 stop
+    idx, price, code = _scan_exit_numba(highs, lows, opens, 0, 1, stop_price=0.90, target_price=1.20, max_hold=10)
+    assert (idx, code) == (2, EXIT_STOP)
+    assert price == 0.85
+
+
+def test_a_stop_entry_gapped_through_fills_at_the_open():
+    from app.engine.backtest import _wait_for_fill
+
+    highs = np.array([100.0, 101.5])
+    lows = np.array([99.5, 100.9])
+    opens = np.array([100.0, 101.0])  # opens above the 100.5 buy stop
+    assert _wait_for_fill(highs, lows, 0, 1, 100.5, is_limit=False, opens=opens) == (1, 101.0)
+
+
+def _one_bar_series(n=40):
+    """Flat bars with a range, so ATR is defined and nothing fills by accident."""
+    from datetime import datetime, timedelta, timezone
+    import pandas as pd
+
+    start = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    return pd.DataFrame({
+        "timestamp": [start + timedelta(hours=i) for i in range(n)],
+        "open": [100.0] * n, "high": [100.1] * n, "low": [99.9] * n, "close": [100.0] * n,
+        "volume": [1.0] * n,
+    })
+
+
+def test_an_unfilled_resting_order_blocks_signals_for_its_whole_window(monkeypatch):
+    """The EA holds one pending order at a time. While it waits, no other
+    signal is looked at; the next one evaluated is on the bar it expired
+    after. The backtest used to try again on the very next bar."""
+    import pandas as pd
+
+    from app.engine import backtest
+    from app.genome.gene_pool import GenePoolConfig
+    from app.genome.genome import GeneChoice, Genome
+
+    df = _one_bar_series()
+    placed: list[int] = []
+
+    def never_fills(df_, genome, signal_idx, *args, **kwargs):
+        placed.append(signal_idx)
+        return None, None
+
+    monkeypatch.setattr(backtest, "_resolve_entry", never_fills)
+    spec = backtest.ALL_GENES[("signal", "BREAKOUT")]
+    monkeypatch.setitem(
+        backtest.ALL_GENES, ("signal", "BREAKOUT"),
+        type(spec)(spec.name, spec.layer, spec.default_params, lambda d, h, p: pd.Series(1, index=d.index)),
+    )
+    genome = Genome(signal=GeneChoice("BREAKOUT", {}), execution=GeneChoice("LIMIT", {"offset_atr": 0.5}))
+    backtest.simulate_trades(df, genome, GenePoolConfig())
+
+    gaps = np.diff(placed)
+    assert (gaps == backtest.PENDING_ORDER_WINDOW_BARS).all()
+
+
+def test_a_usdjpy_lot_is_sized_in_account_currency():
+    """A JPY price move is worth 1/price dollars. Without converting, the
+    backtest asked for about 1/150th of the real lot and the 0.01 minimum
+    took over."""
+    import pandas as pd
+
+    from app.engine.backtest import simulate_trades
+    from app.genome.gene_pool import GenePoolConfig
+    from app.genome.genome import GeneChoice, Genome
+    from tests.helpers import make_synthetic_ohlc
+
+    df = make_synthetic_ohlc(600)
+    df[["open", "high", "low", "close"]] *= 1.5  # ~150, a yen-like price
+    genome = Genome(signal=GeneChoice("BREAKOUT", {"period": 20}), execution=GeneChoice("MARKET2", {"confirm_bars": 1}))
+    rate = pd.Series(1 / df["close"].to_numpy(), index=pd.DatetimeIndex(df["timestamp"]))
+    kwargs = dict(initial_balance=10_000, risk_pct=0.01, contract_size=100_000,
+                  lot_step=0.01, min_lot=0.01, max_lot=100)
+
+    converted = simulate_trades(df, genome, GenePoolConfig(), quote_to_account=rate, **kwargs)
+    # With the lot sized in dollars, the ladder rounds a real lot and the
+    # loss on a stop is the 1% of the balance at entry asked for, within
+    # one lot step.
+    balance, checked = 10_000.0, 0
+    for trade in converted.trades:
+        if trade.exit_reason == "stop":
+            assert trade.pnl == pytest.approx(-0.01 * balance, rel=0.05)
+            checked += 1
+        balance += trade.pnl
+    assert checked

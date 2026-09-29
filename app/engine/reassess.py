@@ -83,6 +83,10 @@ def _backtest_kwargs(config) -> dict:
         "lot_step": getattr(config, "lot_step", 0.0),
         "min_lot": getattr(config, "min_lot", 0.0),
         "max_lot": getattr(config, "max_lot", 0.0),
+        "quote_to_account": getattr(config, "quote_to_account", None),
+        # Without it every HTF bias re-checked here read as neutral, whatever
+        # the strategy had been bred with.
+        "htf_df": getattr(config, "htf_df", None),
     }
 
 

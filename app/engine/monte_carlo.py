@@ -186,7 +186,7 @@ def inject_noise(
         new_stop = adjusted_entry - trade.direction * stop_distance
         new_target = adjusted_entry + trade.direction * target_distance
         displaced_exit_idx, new_exit_price, exit_code = _scan_exit_numba(
-            highs, lows, displaced_idx, trade.direction, new_stop, new_target, MAX_HOLD_BARS
+            highs, lows, opens, displaced_idx, trade.direction, new_stop, new_target, MAX_HOLD_BARS
         )
         if exit_code == EXIT_MAX_HOLD:
             new_exit_price = float(closes[displaced_exit_idx])

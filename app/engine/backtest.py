@@ -71,6 +71,7 @@ class BacktestResult:
 def _scan_exit_numba(
     highs: np.ndarray,
     lows: np.ndarray,
+    opens: np.ndarray,
     entry_idx: int,
     direction: int,
     stop_price: float,
@@ -79,18 +80,25 @@ def _scan_exit_numba(
 ) -> tuple[int, float, int]:
     """Scans forward from `entry_idx` (exclusive) until price touches the
     stop or target, or `max_hold` bars elapse. Conservative tie-break: if a
-    single bar's range spans both levels, the stop is assumed hit first."""
+    single bar's range spans both levels, the stop is assumed hit first.
+
+    A bar that *opens* beyond the stop fills the stop at that open, not at
+    the stop price: a stop is a market order once triggered, and after a
+    gap the first price available is the open. Filling it at the stop
+    handed every weekend gap and every news jump to the strategy for
+    free. A target gapped through stays at the target price, which is the
+    conservative side of the same question."""
     n = len(highs)
     last_idx = min(entry_idx + max_hold, n - 1)
     for i in range(entry_idx + 1, last_idx + 1):
         if direction == 1:
             if lows[i] <= stop_price:
-                return i, stop_price, EXIT_STOP
+                return i, min(stop_price, opens[i]), EXIT_STOP
             if highs[i] >= target_price:
                 return i, target_price, EXIT_TARGET
         else:
             if highs[i] >= stop_price:
-                return i, stop_price, EXIT_STOP
+                return i, max(stop_price, opens[i]), EXIT_STOP
             if lows[i] <= target_price:
                 return i, target_price, EXIT_TARGET
     return last_idx, np.nan, EXIT_MAX_HOLD
@@ -180,6 +188,7 @@ def simulate_trades(
     cost_points: float = 0.0,
     commission_per_lot: float = 0.0,
     contract_size: float = 100_000.0,
+    quote_to_account: pd.Series | None = None,
     entry_delay_bars: int = 0,
     max_leverage_breach_balance: float = 0.0,
     lot_step: float = 0.0,
@@ -205,7 +214,16 @@ def simulate_trades(
     on XAUUSD from a 10,000 account at 0.35%, every one of 344 trades was
     the 0.01 minimum: the median trade risked 27.20 of the 35.00 asked
     for, and the worst risked 68.85, twice the setting. On a prop-firm
-    account that is the difference between a rule and a hope."""
+    account that is the difference between a rule and a hope.
+
+    `quote_to_account` is what one unit of the instrument's quote currency
+    is worth in the account's currency, indexed by timestamp: 1/price for
+    USDJPY on a dollar account, the GBPUSD rate for EURGBP, None when the
+    quote currency is the account's own. A price move is measured in the
+    quote currency, and sizing without converting it made a USDJPY lot
+    look about 150 times bigger than it is - the broker ladder then
+    rounded a real 0.5 lot to the 0.01 minimum and commission all but
+    vanished."""
     _validate_genome_against_pool(genome, gene_pool)
 
     signal_spec = ALL_GENES[("signal", genome.signal.name)]
@@ -232,6 +250,8 @@ def simulate_trades(
     else:
         bar_hours = bar_weekdays = np.empty(0, dtype=np.int64)
     signal_arr, bias_arr, veto_arr = signal.to_numpy(), bias.to_numpy(), veto.to_numpy()
+    conversion = _conversion_per_bar(df, quote_to_account)
+    pending_entry = genome.execution.name in PENDING_EXECUTION_GENES
 
     n = len(df)
     balance = initial_balance
@@ -254,7 +274,16 @@ def simulate_trades(
             df, genome, i, direction, closes, highs, lows, opens, atr_series, fill_margin=cost_points * point_size
         )
         if entry_idx is None:
-            i += 1
+            # A resting order that expired unfilled held the slot for its
+            # whole window, and the EA does not look at another signal
+            # while it waits: it evaluates the next one on the bar the
+            # order expired after. Moving on one bar here let the
+            # backtest place an order on every bar of the window that
+            # the EA was blocked for.
+            if pending_entry:
+                i = max(i + 1, min(i + PENDING_ORDER_WINDOW_BARS, n - 1))
+            else:
+                i += 1
             continue
 
         # Phase 4's entry-displacement perturbation (REQ-ENGINE-3.8): the
@@ -304,7 +333,7 @@ def simulate_trades(
             baseline_exit_idx, exit_price, exit_code = entry_idx, stop_price, EXIT_STOP
         else:
             baseline_exit_idx, exit_price, exit_code = _scan_exit_numba(
-                highs, lows, entry_idx, int(direction), stop_price, target_price, MAX_HOLD_BARS
+                highs, lows, opens, entry_idx, int(direction), stop_price, target_price, MAX_HOLD_BARS
             )
         if exit_code == EXIT_MAX_HOLD:
             exit_price = closes[baseline_exit_idx]
@@ -312,7 +341,7 @@ def simulate_trades(
         partial_r = None
         if not entry_bar_stopped and genome.management is not None and genome.management.name == "PARTIAL TP":
             partial_r, baseline_exit_idx, exit_price, exit_code = _run_partial_tp(
-                genome, highs, lows, closes, entry_idx, int(direction), effective_entry, stop_price, target_price,
+                genome, highs, lows, opens, closes, entry_idx, int(direction), effective_entry, stop_price, target_price,
                 baseline_exit_idx, exit_price, exit_code,
             )
 
@@ -330,7 +359,9 @@ def simulate_trades(
         # sizing implies. Phase 4's noise injection perturbs the entry on
         # top of this baseline (REQ-ENGINE-3.8).
         stop_distance = abs(effective_entry - stop_price)
-        lots = risk_amount / (stop_distance * contract_size) if stop_distance > 0 else 0.0
+        # Account currency lost per lot on a full stop-out.
+        loss_per_lot = stop_distance * contract_size * conversion[entry_idx]
+        lots = risk_amount / loss_per_lot if loss_per_lot > 0 else 0.0
         traded_risk = risk_amount
         if lot_step > 0.0 and lots > 0.0:
             # Down to the step, never up: a broker fills 0.01 or 0.02, not
@@ -339,7 +370,7 @@ def simulate_trades(
             lots = max(lots, min_lot)
             if max_lot > 0.0:
                 lots = min(lots, max_lot)
-            traded_risk = lots * stop_distance * contract_size
+            traded_risk = lots * loss_per_lot
 
         gross_pnl, r_multiple = _blend_partial_tp(
             genome, direction, effective_entry, stop_price, exit_price, traded_risk, partial_r
@@ -366,12 +397,32 @@ def simulate_trades(
                 r_multiple, pnl_amount, exit_reason, partial_closed,
             )
         )
-        i = exit_idx + 1
+        # The EA looks for its next entry on the bar after the one that
+        # closed the position, and that bar's signal is the exit bar's -
+        # a stop hit intrabar leaves the rest of the bar flat, and the
+        # signal at its close is as good as any other. Resuming one bar
+        # later skipped exactly those entries, which MetaTrader then took.
+        i = max(exit_idx, i + 1)
 
     return BacktestResult(trades=trades, equity_curve=equity_curve, final_balance=balance, margin_breach=margin_breach)
 
 
 _EXIT_NAMES = {EXIT_STOP: "stop", EXIT_TARGET: "target", EXIT_MAX_HOLD: "max_hold"}
+
+# Execution genes that rest an order in the book and wait for a fill.
+PENDING_EXECUTION_GENES = ("LIMIT", "LIMIT2", "STOP")
+
+
+def _conversion_per_bar(df: pd.DataFrame, quote_to_account: pd.Series | None) -> np.ndarray:
+    """Quote-to-account rate for every bar of `df`, last known value
+    carried forward (and the first one carried back to the start)."""
+    if quote_to_account is None or len(quote_to_account) == 0 or "timestamp" not in df:
+        return np.ones(len(df))
+    rates = quote_to_account.sort_index()
+    rates = rates[~rates.index.duplicated(keep="last")]
+    aligned = rates.reindex(pd.DatetimeIndex(df["timestamp"]), method="ffill")
+    aligned = aligned.bfill().fillna(1.0)
+    return aligned.to_numpy(dtype=float)
 
 
 def _resolve_entry(df, genome, signal_idx, direction, closes, highs, lows, opens, atr_series, fill_margin=0.0):
@@ -391,12 +442,12 @@ def _resolve_entry(df, genome, signal_idx, direction, closes, highs, lows, opens
     if name == "LIMIT":
         offset = params.get("offset_atr", 0.5) * atr_at_signal
         limit_price = signal_price - direction * offset
-        return _wait_for_fill(highs, lows, signal_idx, direction, limit_price, is_limit=True, margin=fill_margin)
+        return _wait_for_fill(highs, lows, signal_idx, direction, limit_price, is_limit=True, margin=fill_margin, opens=opens)
 
     if name == "STOP":
         offset = params.get("offset_atr", 0.3) * atr_at_signal
         stop_price = signal_price + direction * offset
-        return _wait_for_fill(highs, lows, signal_idx, direction, stop_price, is_limit=False, margin=fill_margin)
+        return _wait_for_fill(highs, lows, signal_idx, direction, stop_price, is_limit=False, margin=fill_margin, opens=opens)
 
     if name == "LIMIT2":
         offset_1 = params.get("offset_atr_1", 0.5) * atr_at_signal
@@ -404,12 +455,12 @@ def _resolve_entry(df, genome, signal_idx, direction, closes, highs, lows, opens
         price_1 = signal_price - direction * offset_1
         price_2 = signal_price - direction * offset_2
         avg_price = (price_1 + price_2) / 2
-        return _wait_for_fill(highs, lows, signal_idx, direction, avg_price, is_limit=True, margin=fill_margin)
+        return _wait_for_fill(highs, lows, signal_idx, direction, avg_price, is_limit=True, margin=fill_margin, opens=opens)
 
     return signal_idx, signal_price  # unknown execution gene — immediate fill fallback
 
 
-def _wait_for_fill(highs, lows, signal_idx, direction, order_price, is_limit: bool, margin: float = 0.0):
+def _wait_for_fill(highs, lows, signal_idx, direction, order_price, is_limit: bool, margin: float = 0.0, opens=None):
     """When a resting order gets filled, if it does.
 
     The order fills once the market trades *through* its price, not when a
@@ -432,9 +483,22 @@ def _wait_for_fill(highs, lows, signal_idx, direction, order_price, is_limit: bo
     the fill counts — the spread, since a buy limit rests on the ask and
     the quote has to cross it, and since being merely touched does not
     put you at the front of a queue.
+
+    A bar that opens already through the order fills at that open, which
+    is what happens to a resting order after a gap - and what the EA does
+    when the price has passed the order before it can be placed. For a
+    stop entry that is worse than the order price; filling it at the
+    order price gave breakouts every gap for free.
     """
     last_i = min(signal_idx + PENDING_ORDER_WINDOW_BARS, len(highs) - 1)
     for i in range(signal_idx + 1, last_i + 1):
+        if opens is not None:
+            if is_limit:
+                gapped = opens[i] <= order_price - margin if direction == 1 else opens[i] >= order_price + margin
+            else:
+                gapped = opens[i] >= order_price + margin if direction == 1 else opens[i] <= order_price - margin
+            if gapped:
+                return i, opens[i]
         if is_limit:
             # A buy limit rests below: price has to come down through it.
             through = lows[i] <= order_price - margin if direction == 1 else highs[i] >= order_price + margin
@@ -447,7 +511,7 @@ def _wait_for_fill(highs, lows, signal_idx, direction, order_price, is_limit: bo
 
 
 def _run_partial_tp(
-    genome, highs, lows, closes, entry_idx, direction, entry_price, stop_price, target_price,
+    genome, highs, lows, opens, closes, entry_idx, direction, entry_price, stop_price, target_price,
     exit_idx, exit_price, exit_code,
 ):
     """PARTIAL TP: if price reaches `r_multiple` R before the stop, that
@@ -474,14 +538,14 @@ def _run_partial_tp(
 
     partial_price = entry_price + direction * r_target * stop_distance
     partial_idx, _, partial_code = _scan_exit_numba(
-        highs, lows, entry_idx, direction, stop_price, partial_price, MAX_HOLD_BARS
+        highs, lows, opens, entry_idx, direction, stop_price, partial_price, MAX_HOLD_BARS
     )
     if partial_code != EXIT_TARGET:
         return None, exit_idx, exit_price, exit_code
 
     remaining_hold = MAX_HOLD_BARS - (partial_idx - entry_idx)
     exit_idx, exit_price, exit_code = _scan_exit_numba(
-        highs, lows, partial_idx, direction, entry_price, target_price, remaining_hold
+        highs, lows, opens, partial_idx, direction, entry_price, target_price, remaining_hold
     )
     if exit_code == EXIT_MAX_HOLD:
         exit_price = closes[exit_idx]
