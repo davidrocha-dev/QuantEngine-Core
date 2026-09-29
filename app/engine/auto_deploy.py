@@ -27,6 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.broker.mt5_install import install_ea, uninstall_ea
+from app.data.broker_clock import DEFAULT_CLOCK, BrokerClock
 from app.codegen.mql5 import _safe_name, UnsupportedGeneError, generate_ea
 from app.engine.health import run_health_check
 from app.genome.genome import Genome
@@ -79,6 +80,7 @@ def find_replacement(session: Session, degraded: Strategy) -> Strategy | None:
 def replace_degraded(
     session: Session, risk_pct: float = 0.01, max_spread_points: float = 0.0,
     higher_timeframe_for: Callable[[Strategy], str | None] | None = None,
+    broker_clock: BrokerClock = DEFAULT_CLOCK,
 ) -> list[Replacement]:
     """Retires every degraded bot that has a qualified successor.
 
@@ -113,6 +115,7 @@ def replace_degraded(
                 Genome.from_dict(__import__("json").loads(replacement.genome_json)),
                 replacement.id, replacement.asset, replacement.timeframe,
                 risk_pct=risk_pct, max_spread_points=max_spread_points,
+                broker_clock=broker_clock,
                 **({"higher_timeframe": higher_timeframe_for(replacement)} if higher_timeframe_for else {}),
             )
         except (UnsupportedGeneError, KeyError, TypeError, ValueError) as exc:

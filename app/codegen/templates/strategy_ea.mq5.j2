@@ -23,13 +23,6 @@ input double MaxSpreadPoints  = {{ max_spread_points }};  // skip entries above 
 input long   MagicNumber      = {{ magic }};
 input bool   AllowLong        = true;
 input bool   AllowShort       = true;
-// The hours and weekdays this strategy was bred on are UTC. TimeCurrent()
-// is the broker's clock, and TimeGMT() is not reliable in the Strategy
-// Tester - a run on an IC Markets EU server (UTC+3 in summer) behaved
-// exactly as if this were three hours off, firing FRIDAY PROFIT 45 times
-// where the engine fires it 12. AUTO reads the terminal, which is right
-// live and can be wrong in the tester: set it by hand when you backtest.
-input int    ServerGmtOffsetHours = 99;   // 99 = auto; else the server's offset from UTC
 // The backtest closes any trade still open this many bars after its entry
 // bar (engine/app/engine/backtest.py MAX_HOLD_BARS). 0 disables it.
 input int    MaxHoldBars      = {{ max_hold_bars }};
@@ -37,10 +30,14 @@ input ulong  MaxSlippagePoints = 50;       // market-order deviation, broker poi
 
 CTrade   Trade;
 datetime LastBarTime = 0;
-int GmtOffsetSeconds = 0;   // resolved in OnInit
 
-// Every rule that reads an hour or a weekday goes through this.
-datetime UtcNow() { return TimeCurrent() - GmtOffsetSeconds; }
+// This strategy was bred on history cut to the broker's server clock -
+// {{ server_time_description }} - so its days, H4/D1 bars and every
+// hour and weekday rule are read straight off this terminal's own bars.
+// No offset to set, in the tester or live. OnInit checks, live, that
+// the server really keeps that clock.
+#define QE_NY_CLOSE {{ "true" if server_time_mode == "NY_CLOSE" else "false" }}
+#define QE_SERVER_OFFSET_HOURS {{ server_offset_hours }}
 
 // A resting LIMIT/STOP order is cancelled after this many bars unfilled,
 // counted by the EA itself on bar opens rather than by a broker expiry
@@ -207,22 +204,66 @@ double AverageAtr(int handle, int period)
    return total / period;
 }
 
-// UtcNow, not TimeCurrent, in every rule that reads a weekday or an
-// hour: the bars these genes were bred against are UTC and the broker's
-// clock is not. A UTC+3 server starts Friday on Thursday evening and
-// reaches lock_hour three hours early: replaying this strategy that way
-// moved its Friday entries from 64 to 96.
+// NO FRI OPEN judges the signal bar - the one that just closed - by its
+// open time on the server clock, as the backtester judges it.
 bool IsFridayAfter(int cutoffHour)
 {
-   MqlDateTime now; TimeToStruct(UtcNow(), now);
-   return now.day_of_week == 5 && now.hour >= cutoffHour;
+   MqlDateTime bar; TimeToStruct(iTime(_Symbol, PERIOD_CURRENT, 1), bar);
+   return bar.day_of_week == 5 && bar.hour >= cutoffHour;
+}
+
+//--- The server-clock check. US daylight saving runs from the second
+//--- Sunday of March (07:00 UTC) to the first Sunday of November (06:00 UTC).
+datetime UtcAt(int year, int month, int day, int hour)
+{
+   MqlDateTime t; t.year = year; t.mon = month; t.day = day; t.hour = hour; t.min = 0; t.sec = 0;
+   return StructToTime(t);
+}
+
+int NthSunday(int year, int month, int n)
+{
+   MqlDateTime first; TimeToStruct(UtcAt(year, month, 1, 0), first);
+   return 1 + (7 - first.day_of_week) % 7 + 7 * (n - 1);
+}
+
+int ExpectedServerOffsetHours(datetime utc)
+{
+   if(!QE_NY_CLOSE) return (int)MathRound(QE_SERVER_OFFSET_HOURS);
+   MqlDateTime t; TimeToStruct(utc, t);
+   datetime dstStart = UtcAt(t.year, 3, NthSunday(t.year, 3, 2), 7);
+   datetime dstEnd   = UtcAt(t.year, 11, NthSunday(t.year, 11, 1), 6);
+   return (utc >= dstStart && utc < dstEnd) ? 3 : 2;
+}
+
+void CheckServerClock()
+{
+   if(MQLInfoInteger(MQL_TESTER))
+   {
+      // The tester has no reliable GMT; its bars are the server's, which
+      // is all this strategy reads. It only has to be the right server.
+      PrintFormat("QuantEngine: bred for a server on %s. Test it on a broker whose server keeps that clock.",
+                  "{{ server_time_description }}");
+      return;
+   }
+   int actual = (int)MathRound((double)(TimeTradeServer() - TimeGMT()) / 3600.0);
+   int expected = ExpectedServerOffsetHours(TimeGMT());
+   if(actual != expected)
+   {
+      string message = StringFormat(
+         "QuantEngine: this server is on UTC%+d, but the strategy was bred for UTC%+d (%s). "
+         "Its days and hours will not line up: set Settings -> Broker caps -> Server time to this broker's clock "
+         "in QuantEngine, re-check the strategy and export it again.",
+         actual, expected, "{{ server_time_description }}");
+      Print(message);
+      Alert(message);
+   }
 }
 
 ENUM_TIMEFRAMES HigherTimeframe() { return {{ higher_timeframe }}; }
 
-// The bar that just closed, in UTC. Time-based management judges this bar,
-// as the backtester does, not the clock at the tick that follows it.
-datetime ClosedBarUtc() { return iTime(_Symbol, PERIOD_CURRENT, 1) - GmtOffsetSeconds; }
+// The bar that just closed, on the server clock. Time-based management
+// judges this bar, as the backtester does, not the tick that follows it.
+datetime ClosedBarTime() { return iTime(_Symbol, PERIOD_CURRENT, 1); }
 
 // The backtester never lets a management rule fire on the entry bar
 // itself; it starts looking on the bar after. Call with a position selected.
@@ -382,9 +423,9 @@ void ManageOpenPosition(bool newBar)
 {% if management == "EOD CLOSE" %}
    if(!newBar) return;   // a bar-close decision in the backtester
    // The backtester closes at the close of the first bar after the entry
-   // bar whose open hour (UTC) is close_hour or later. That bar is the one
+   // bar whose open hour (server time) is close_hour or later. That bar is the one
    // that just closed - shift 1 - and this is its close.
-   MqlDateTime bar; TimeToStruct(ClosedBarUtc(), bar);
+   MqlDateTime bar; TimeToStruct(ClosedBarTime(), bar);
    if(bar.hour >= {{ management_params.close_hour | default(21) }})
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
@@ -402,7 +443,7 @@ void ManageOpenPosition(bool newBar)
    // closes, put 55 there.
    if(!newBar) return;
    // Judged on the bar that just closed, as the backtester judges it.
-   MqlDateTime bar; TimeToStruct(ClosedBarUtc(), bar);
+   MqlDateTime bar; TimeToStruct(ClosedBarTime(), bar);
    if(bar.day_of_week == 5 && bar.hour >= {{ management_params.lock_hour | default(18) }})
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
@@ -569,13 +610,7 @@ int OnInit()
    // FOK, CTrade's default, is refused outright by many brokers.
    Trade.SetTypeFillingBySymbol(_Symbol);
    Trade.SetDeviationInPoints(MaxSlippagePoints);
-   GmtOffsetSeconds = ServerGmtOffsetHours == 99
-      ? (int)(TimeCurrent() - TimeGMT())
-      : ServerGmtOffsetHours * 3600;
-   if(MQLInfoInteger(MQL_TESTER) && ServerGmtOffsetHours == 99 && GmtOffsetSeconds == 0)
-      Print("QuantEngine: the terminal reports no GMT offset, which is usual in the tester. ",
-            "If this broker's server is not on UTC, set ServerGmtOffsetHours or every ",
-            "hour-of-day and day-of-week rule in this strategy will fire at the wrong time.");
+   CheckServerClock();
    h_entry_atr = iATR(_Symbol, PERIOD_CURRENT, 14);
    if(h_entry_atr == INVALID_HANDLE) return INIT_FAILED;
 {% for name, ctor in handles.items() %}

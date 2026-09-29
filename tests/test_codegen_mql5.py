@@ -216,38 +216,36 @@ def test_market2_waits_out_its_confirmation_bars():
     assert "BarsUntilEntry" not in stop
 
 
-def test_time_of_day_rules_read_utc_not_the_broker_clock():
-    """FRIDAY PROFIT, EOD CLOSE and the SESSION filter were bred against
-    UTC bars and asked the broker what time it was. A UTC+3 server begins
-    its Friday on Thursday at 21:00 UTC and reaches lock_hour three hours
-    early: replaying #6F0A16 with that offset moved its Friday entries
-    from 64 to 96 and its trade count from 368 to 394.
-
-    TimeGMT() alone does not fix it. The exported EA was run on an
-    IC Markets EU server and fired FRIDAY PROFIT 45 times against the
-    engine's 12 — the behaviour of a clock three hours ahead, which is
-    that server's summer time. The offset has to be resolvable by hand,
-    because the tester will not tell the EA what it is.
-    """
+def test_time_of_day_rules_read_the_servers_own_bars():
+    """The strategy is bred on history cut to the broker's server clock,
+    so the EA reads hours and weekdays straight off its bars - no GMT
+    offset to set. The old UTC design needed ServerGmtOffsetHours, which
+    the tester cannot resolve: an IC Markets EU run fired FRIDAY PROFIT
+    45 times against the engine's 12 with it left on auto."""
     genome = make_genome(
         management=GeneChoice("FRIDAY PROFIT", {"lock_hour": 19}),
         execution=GeneChoice("MARKET2", {"confirm_bars": 2}),
+        filters=[GeneChoice("NO FRI OPEN", {"cutoff_hour": 18})],
     )
-    source = generate_ea(genome, "#UTC", "XAUUSD", "M15").source
+    source = generate_ea(genome, "#CLOCK", "XAUUSD", "M15").source
 
-    assert "input int    ServerGmtOffsetHours" in source
-    assert "datetime UtcNow() { return TimeCurrent() - GmtOffsetSeconds; }" in source
-    # Nothing reads a weekday or an hour off the broker's clock directly.
+    assert "ServerGmtOffsetHours" not in source
+    assert "UtcNow" not in source
+    assert "TimeToStruct(ClosedBarTime(), bar)" in source
+    assert "TimeToStruct(iTime(_Symbol, PERIOD_CURRENT, 1), bar)" in source  # NO FRI OPEN, signal bar
     assert "TimeToStruct(TimeCurrent(), now)" not in source
-    assert "TimeToStruct(TimeGMT(), now)" not in source
-    assert source.count("TimeToStruct(UtcNow(), now)") == 1  # IsFridayAfter
-    # FRIDAY PROFIT judges the bar that just closed, in UTC, as the
-    # backtester does - not the clock at the next tick.
-    assert "TimeToStruct(ClosedBarUtc(), bar)" in source
-    assert "iTime(_Symbol, PERIOD_CURRENT, 1) - GmtOffsetSeconds" in source
+    # Live, the EA says so if the server is not on the clock it was bred for.
+    assert "CheckServerClock();" in source
+    assert "#define QE_NY_CLOSE true" in source
 
 
-# --- Execution the backtest can reproduce ----------------------------------
+def test_a_fixed_offset_server_is_checked_against_its_own_offset():
+    from app.data.broker_clock import BrokerClock
+
+    source = generate_ea(make_genome(), "#FIXED", "EURUSD", "H1", broker_clock=BrokerClock("FIXED", 0)).source
+    assert "#define QE_NY_CLOSE false" in source
+    assert "#define QE_SERVER_OFFSET_HOURS 0.0" in source
+    source.encode("ascii")
 
 
 def test_the_ea_has_no_spread_ceiling_unless_asked_for_one():

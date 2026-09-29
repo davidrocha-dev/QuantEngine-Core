@@ -24,6 +24,7 @@ from app.broker.mt5_install import install_compiled_ea, install_ea
 from app.codegen.mql5 import GeneratedEa, UnsupportedGeneError, generate_ea
 from app.config import get_config, set_auto_backup_before_updates, set_built_in_data_only
 from app.data.provider import TIMEFRAME_MINUTES, get_historical_bars
+from app.data.broker_clock import clock_from_settings
 from app.data.conversion import quote_to_account_series
 from app.data.sync import DeltaSyncRunner, SyncState
 from app.data.symbols import BUNDLED_SYMBOLS, INSTRUMENTS, TIMEFRAMES, get_instrument
@@ -604,6 +605,7 @@ async def _scheduler_loop() -> None:
                         risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
                         max_spread_points=0.0,
                         higher_timeframe_for=lambda row: _strategy_higher_timeframe(settings, row),
+                        broker_clock=clock_from_settings(settings),
                     )
                 update_section(config.settings_path, "automation", {"last_auto_deploy_at": now.isoformat()})
                 for action in actions:
@@ -778,6 +780,8 @@ def get_mt5_status() -> dict:
         "server": server_info["server"],
         "latency_ms": latency_ms,
         "is_metaquotes_demo": server_info["is_metaquotes_demo"],
+        # What Settings -> Broker caps -> Server time should say.
+        "server_gmt_offset_hours": _mt5_bridge.server_gmt_offset_hours(),
     }
 
 
@@ -1224,6 +1228,7 @@ def _generate_ea_for(strategy_id: str) -> tuple[Strategy, "GeneratedEa"]:
             # anyone who wants one on purpose.
             risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
             higher_timeframe=_strategy_higher_timeframe(settings, row),
+            broker_clock=clock_from_settings(settings),
         )
     except UnsupportedGeneError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -2291,6 +2296,7 @@ def post_run_auto_deploy() -> dict:
             risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
             max_spread_points=0.0,
             higher_timeframe_for=lambda row: _strategy_higher_timeframe(settings, row),
+            broker_clock=clock_from_settings(settings),
         )
     return {"actions": [action.to_dict() for action in actions]}
 

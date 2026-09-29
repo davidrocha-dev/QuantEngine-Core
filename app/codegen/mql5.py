@@ -24,6 +24,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from app.codegen.genes_mql5 import GeneCode, emit
+from app.data.broker_clock import DEFAULT_CLOCK, BrokerClock
 from app.engine.backtest import MAX_HOLD_BARS, PENDING_ORDER_WINDOW_BARS
 from app.genome.genome import Genome
 
@@ -66,6 +67,7 @@ def _safe_name(hash_id: str) -> str:
 def build_context(
     genome: Genome, hash_id: str, symbol: str, timeframe: str, risk_pct: float, max_spread_points: float,
     higher_timeframe: str | None = AUTO_HIGHER_TIMEFRAME,
+    broker_clock: BrokerClock = DEFAULT_CLOCK,
 ) -> dict:
     """`higher_timeframe` is the context the strategy was measured with:
     a timeframe, None when HIGHER TF was off, or AUTO_HIGHER_TIMEFRAME
@@ -130,6 +132,9 @@ def build_context(
         "stop_atr_mult": genome.stop_atr_mult,
         "target_atr_mult": genome.target_atr_mult,
         "higher_timeframe": MQL5_TIMEFRAME[higher_timeframe] if higher_timeframe else "PERIOD_CURRENT",
+        "server_time_mode": broker_clock.mode,
+        "server_offset_hours": float(broker_clock.offset_hours),
+        "server_time_description": broker_clock.describe(),
     }
 
 
@@ -153,10 +158,11 @@ def generate_ea(
     risk_pct: float = 0.01,
     max_spread_points: float = 0.0,
     higher_timeframe: str | None = AUTO_HIGHER_TIMEFRAME,
+    broker_clock: BrokerClock = DEFAULT_CLOCK,
 ) -> GeneratedEa:
     environment = Environment(
         loader=FileSystemLoader(TEMPLATE_DIR), undefined=StrictUndefined, trim_blocks=False, lstrip_blocks=False
     )
     template = environment.get_template("strategy_ea.mq5.j2")
-    context = build_context(genome, hash_id, symbol, timeframe, risk_pct, max_spread_points, higher_timeframe)
+    context = build_context(genome, hash_id, symbol, timeframe, risk_pct, max_spread_points, higher_timeframe, broker_clock)
     return GeneratedEa(filename=f"{_safe_name(hash_id)}.mq5", source=template.render(**context))

@@ -99,6 +99,27 @@ class MT5Bridge:
             spread_points=(tick.ask - tick.bid),
         )
 
+    def server_gmt_offset_hours(self) -> int | None:
+        """The server clock's offset from UTC right now, read off the most
+        recent tick in Market Watch - or None when nothing has ticked in
+        the last ten minutes (a weekend, a closed market), since an old
+        tick cannot tell a clock offset from a quiet market."""
+        if mt5 is None or not self._connected:
+            return None
+        import time
+
+        now = time.time()
+        for info in mt5.symbols_get() or ():
+            if not getattr(info, "visible", False):
+                continue
+            tick = mt5.symbol_info_tick(info.name)
+            if tick is None or not tick.time:
+                continue
+            offset = round((tick.time - now) / 3600)
+            if abs(tick.time - now - offset * 3600) < 600:
+                return int(offset)
+        return None
+
     def get_server_info(self) -> dict | None:
         if mt5 is None or not self._connected:
             return None
