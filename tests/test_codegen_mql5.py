@@ -240,4 +240,79 @@ def test_time_of_day_rules_read_utc_not_the_broker_clock():
     # Nothing reads a weekday or an hour off the broker's clock directly.
     assert "TimeToStruct(TimeCurrent(), now)" not in source
     assert "TimeToStruct(TimeGMT(), now)" not in source
-    assert source.count("TimeToStruct(UtcNow(), now)") == 2  # FRIDAY PROFIT, IsFridayAfter
+    assert source.count("TimeToStruct(UtcNow(), now)") == 1  # IsFridayAfter
+    # FRIDAY PROFIT judges the bar that just closed, in UTC, as the
+    # backtester does - not the clock at the next tick.
+    assert "TimeToStruct(ClosedBarUtc(), bar)" in source
+    assert "iTime(_Symbol, PERIOD_CURRENT, 1) - GmtOffsetSeconds" in source
+
+
+# --- Execution the backtest can reproduce ----------------------------------
+
+
+def test_the_ea_has_no_spread_ceiling_unless_asked_for_one():
+    """The export passed the *cost* spread (10 points by default) as the
+    ceiling, and the EA skipped every entry above it - most of them on
+    gold or a standard account. The backtest skips none."""
+    source = generate_ea(make_genome(), "#SPREAD", "XAUUSD", "M15").source
+    assert "input double MaxSpreadPoints  = 0.0;" in source
+
+
+def test_the_ea_closes_a_trade_after_the_backtests_max_hold():
+    from app.engine.backtest import MAX_HOLD_BARS
+
+    source = generate_ea(make_genome(), "#HOLD", "EURUSD", "M5").source
+    assert f"input int    MaxHoldBars      = {MAX_HOLD_BARS};" in source
+    assert "if(newBar) CloseStalePositions();" in source
+
+
+def test_resting_orders_expire_by_bar_count_and_fall_back_to_market_when_passed():
+    for execution in ("LIMIT", "LIMIT2", "STOP"):
+        genome = make_genome(execution=GeneChoice(execution, dict(ALL_GENES[("execution", execution)].default_params)))
+        source = generate_ea(genome, "#PEND", "EURUSD", "M15").source
+        assert "ORDER_TIME_SPECIFIED, expiry" not in source and "ORDER_TIME_GTC" in source, execution
+        assert "#define PENDING_BARS 5" in source, execution
+        assert "ExpirePendingOrders();" in source, execution
+        # Expired before the next signal is read.
+        assert source.index("ExpirePendingOrders();") < source.index("   TryEnter();\n}")
+        assert "PlacePendingOrder(direction," in source, execution
+
+
+def test_orders_are_normalised_and_use_the_symbols_filling_mode():
+    source = generate_ea(make_genome(), "#HYGIENE", "XAUUSD", "M15").source
+    assert "Trade.SetTypeFillingBySymbol(_Symbol);" in source
+    assert "NormalizePrice(price - direction * stopDistance)" in source
+    assert "StopsAllowed(stopDistance, targetDistance)" in source
+
+
+def test_partial_tp_does_not_divide_by_a_breakeven_stop():
+    source = generate_ea(
+        make_genome(management=GeneChoice("PARTIAL TP", {"r_multiple": 1.0, "close_fraction": 0.5})),
+        "#BE", "XAUUSD", "M15",
+    ).source
+    body = source.split("void ManageOpenPosition(bool newBar)")[1]
+    assert body.index("if(stopDistance <= _Point) continue;") < body.index("/ stopDistance")
+
+
+def test_indicators_are_mt5s_equivalents_of_the_python_genes():
+    stoch = generate_ea(make_genome(signal=GeneChoice("STOCH", {"k_period": 14, "d_period": 3})), "#S", "EURUSD", "H1").source
+    assert "iStochastic(_Symbol, PERIOD_CURRENT, 14, 3, 1, MODE_SMA, STO_LOWHIGH)" in stoch
+    adx = generate_ea(make_genome(bias=GeneChoice("ADX", {"period": 14, "threshold": 20})), "#A", "EURUSD", "H1").source
+    assert "iADXWilder(" in adx and "iADX(" not in adx
+
+
+def test_consec_is_exported_as_the_no_op_it_was_backtested_as():
+    """It used to veto on the EA's own losing streak, which never resets
+    once the EA stops trading: N losses in a row switched it off for good."""
+    genome = make_genome(filters=[GeneChoice("CONSEC", {"max_losses": 3})])
+    source = generate_ea(genome, "#CONSEC", "EURUSD", "H1").source
+    assert "ConsecutiveLosses" not in source
+
+
+def test_htf_bias_follows_the_context_the_strategy_was_bred_with():
+    genome = make_genome(bias=GeneChoice("HTF", {"period": 20}))
+    off = generate_ea(genome, "#HTF", "EURUSD", "M15", higher_timeframe=None).source
+    assert "HtfClose(1) > Val(" not in off  # neutral, as the backtest had it
+    manual = generate_ea(genome, "#HTF", "EURUSD", "M15", higher_timeframe="H4").source
+    assert "ENUM_TIMEFRAMES HigherTimeframe() { return PERIOD_H4; }" in manual
+    assert "HtfClose(1) > Val(" in manual

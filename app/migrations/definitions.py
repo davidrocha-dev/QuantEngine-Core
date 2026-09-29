@@ -150,6 +150,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         description="Worst single day, the limit a prop firm closes an account over",
         statements=("ALTER TABLE strategies ADD COLUMN max_daily_dd_pct REAL",),
     ),
+    Migration(
+        version=11,
+        description="The higher-timeframe context a strategy was bred with, so its EA reads the same one",
+        statements=("ALTER TABLE strategies ADD COLUMN higher_timeframe TEXT",),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = max(m.version for m in MIGRATIONS)

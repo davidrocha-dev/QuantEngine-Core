@@ -24,6 +24,7 @@ from pathlib import Path
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
 from app.codegen.genes_mql5 import GeneCode, emit
+from app.engine.backtest import MAX_HOLD_BARS, PENDING_ORDER_WINDOW_BARS
 from app.genome.genome import Genome
 
 TEMPLATE_DIR = Path(__file__).resolve().parent / "templates"
@@ -35,13 +36,10 @@ MQL5_TIMEFRAME = {
 }
 HIGHER_TIMEFRAME = {"M15": "H1", "M30": "H1", "H1": "H4", "H2": "D1", "H4": "D1", "D1": "D1", "M5": "H1", "M1": "M15"}
 
-# LIMIT/STOP orders expire unfilled after this many bars in the backtester
-# (PENDING_ORDER_WINDOW_BARS); the EA expresses the same window in seconds.
-PENDING_ORDER_WINDOW_BARS = 5
-TIMEFRAME_SECONDS = {
-    "M1": 60, "M5": 300, "M15": 900, "M30": 1800,
-    "H1": 3600, "H2": 7200, "H4": 14400, "D1": 86400,
-}
+# `higher_timeframe` for a strategy whose HIGHER TF context is not known:
+# fall back to the automatic mapping, which is what every export did before
+# the context was recorded per strategy.
+AUTO_HIGHER_TIMEFRAME = "AUTO"
 
 
 class UnsupportedGeneError(RuntimeError):
@@ -65,8 +63,19 @@ def _safe_name(hash_id: str) -> str:
     return "QE_" + re.sub(r"[^A-Za-z0-9]", "", hash_id).upper()
 
 
-def build_context(genome: Genome, hash_id: str, symbol: str, timeframe: str, risk_pct: float, max_spread_points: float) -> dict:
+def build_context(
+    genome: Genome, hash_id: str, symbol: str, timeframe: str, risk_pct: float, max_spread_points: float,
+    higher_timeframe: str | None = AUTO_HIGHER_TIMEFRAME,
+) -> dict:
+    """`higher_timeframe` is the context the strategy was measured with:
+    a timeframe, None when HIGHER TF was off, or AUTO_HIGHER_TIMEFRAME
+    when nobody knows. With HIGHER TF off the backtest's HTF bias is
+    neutral on every bar, so the EA's is too - it used to read a real
+    higher-timeframe average and filter trades the backtest had taken."""
     handles: dict[str, str] = {}
+    if higher_timeframe == AUTO_HIGHER_TIMEFRAME:
+        higher_timeframe = HIGHER_TIMEFRAME.get(timeframe, "H4")
+    neutral_htf_bias = genome.bias is not None and genome.bias.name == "HTF" and higher_timeframe is None
 
     def collect(code: GeneCode) -> GeneCode:
         handles.update(code.handles)
@@ -74,7 +83,11 @@ def build_context(genome: Genome, hash_id: str, symbol: str, timeframe: str, ris
 
     try:
         signal = collect(emit("signal", genome.signal.name, genome.signal.params, 0))
-        bias = collect(emit("bias", genome.bias.name, genome.bias.params, 1)) if genome.bias else None
+        bias = (
+            collect(emit("bias", genome.bias.name, genome.bias.params, 1))
+            if genome.bias and not neutral_htf_bias
+            else None
+        )
         filters = [collect(emit("filter", f.name, f.params, 10 + i)) for i, f in enumerate(genome.filters)]
     except KeyError as exc:
         gene = exc.args[0] if exc.args else "unknown"
@@ -110,12 +123,13 @@ def build_context(genome: Genome, hash_id: str, symbol: str, timeframe: str, ris
         # The backtester fills at the open of signal_idx + confirm_bars;
         # the EA used to fill on the very next bar whatever this said.
         "confirm_bars": int(execution_params.get("confirm_bars", 2)),
-        "pending_expiry_seconds": PENDING_ORDER_WINDOW_BARS * TIMEFRAME_SECONDS.get(timeframe, 3600),
+        "pending_bars": PENDING_ORDER_WINDOW_BARS,
+        "max_hold_bars": MAX_HOLD_BARS,
         "management": management,
         "management_params": genome.management.params if genome.management else {},
         "stop_atr_mult": genome.stop_atr_mult,
         "target_atr_mult": genome.target_atr_mult,
-        "higher_timeframe": MQL5_TIMEFRAME[HIGHER_TIMEFRAME.get(timeframe, "H4")],
+        "higher_timeframe": MQL5_TIMEFRAME[higher_timeframe] if higher_timeframe else "PERIOD_CURRENT",
     }
 
 
@@ -138,10 +152,11 @@ def generate_ea(
     timeframe: str,
     risk_pct: float = 0.01,
     max_spread_points: float = 0.0,
+    higher_timeframe: str | None = AUTO_HIGHER_TIMEFRAME,
 ) -> GeneratedEa:
     environment = Environment(
         loader=FileSystemLoader(TEMPLATE_DIR), undefined=StrictUndefined, trim_blocks=False, lstrip_blocks=False
     )
     template = environment.get_template("strategy_ea.mq5.j2")
-    context = build_context(genome, hash_id, symbol, timeframe, risk_pct, max_spread_points)
+    context = build_context(genome, hash_id, symbol, timeframe, risk_pct, max_spread_points, higher_timeframe)
     return GeneratedEa(filename=f"{_safe_name(hash_id)}.mq5", source=template.render(**context))

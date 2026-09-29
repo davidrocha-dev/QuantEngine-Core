@@ -58,6 +58,10 @@ class Strategy(Base):
     # was profitable in, with the per-fold detail behind it.
     persistence_pct: Mapped[float | None]
     walk_forward: Mapped[str | None] = mapped_column(Text)  # JSON
+    # The HIGHER TF context this strategy was measured with: a timeframe,
+    # "OFF" when HIGHER TF was disabled (the HTF bias is then neutral), or
+    # NULL for rows written before this was recorded.
+    higher_timeframe: Mapped[str | None] = mapped_column(String)
     # REQ-PORT-3 — the stage this bot has actually been promoted to. Null
     # means it has never been promoted, i.e. INCUBATION. Kept separate from
     # what its live record would *allow*, so a promotion is a decision that

@@ -21,6 +21,7 @@ it is bounded deliberately:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -75,8 +76,14 @@ def find_replacement(session: Session, degraded: Strategy) -> Strategy | None:
     return candidates[0] if candidates else None
 
 
-def replace_degraded(session: Session, risk_pct: float = 0.01, max_spread_points: float = 0.0) -> list[Replacement]:
-    """Retires every degraded bot that has a qualified successor."""
+def replace_degraded(
+    session: Session, risk_pct: float = 0.01, max_spread_points: float = 0.0,
+    higher_timeframe_for: Callable[[Strategy], str | None] | None = None,
+) -> list[Replacement]:
+    """Retires every degraded bot that has a qualified successor.
+
+    `higher_timeframe_for` gives the HIGHER TF context each replacement
+    was measured with; without it the EA uses the automatic mapping."""
     actions: list[Replacement] = []
 
     for verdict in run_health_check(session):
@@ -106,6 +113,7 @@ def replace_degraded(session: Session, risk_pct: float = 0.01, max_spread_points
                 Genome.from_dict(__import__("json").loads(replacement.genome_json)),
                 replacement.id, replacement.asset, replacement.timeframe,
                 risk_pct=risk_pct, max_spread_points=max_spread_points,
+                **({"higher_timeframe": higher_timeframe_for(replacement)} if higher_timeframe_for else {}),
             )
         except (UnsupportedGeneError, KeyError, TypeError, ValueError) as exc:
             actions.append(

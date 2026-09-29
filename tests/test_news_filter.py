@@ -97,15 +97,34 @@ def test_event_is_not_bred_when_there_is_no_calendar_to_feed_it():
     from app.genome.gene_pool import GenePoolConfig
 
     with patch.object(GenePoolConfig, "load", staticmethod(lambda _path: GenePoolConfig())):
-        without_calendar = main_module._gene_pool_for_campaign(SimpleNamespace(news_events=[]))
+        without_calendar = main_module._gene_pool_for_campaign(SimpleNamespace(news_events=[], htf_df=None))
         with_calendar = main_module._gene_pool_for_campaign(
-            SimpleNamespace(news_events=[object()])
+            SimpleNamespace(news_events=[object()], htf_df=None)
         )
 
     assert without_calendar.is_enabled("filter", "EVENT") is False
     assert with_calendar.is_enabled("filter", "EVENT") is True
     # Nothing else is touched.
     assert without_calendar.is_enabled("filter", "RSI") is True
+
+
+def test_genes_that_would_change_nothing_in_the_backtest_are_not_bred():
+    """HTF with HIGHER TF off is neutral on every bar, and CONSEC has never
+    been applied by the backtester - but both did something in the EA."""
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    import app.main as main_module
+    from app.genome.gene_pool import GenePoolConfig
+
+    with patch.object(GenePoolConfig, "load", staticmethod(lambda _path: GenePoolConfig())):
+        htf_off = main_module._gene_pool_for_campaign(SimpleNamespace(news_events=[], htf_df=None))
+        htf_on = main_module._gene_pool_for_campaign(SimpleNamespace(news_events=[], htf_df=object()))
+
+    assert htf_off.is_enabled("bias", "HTF") is False
+    assert htf_on.is_enabled("bias", "HTF") is True
+    assert htf_off.is_enabled("filter", "CONSEC") is False
+    assert htf_on.is_enabled("filter", "CONSEC") is False
 
 
 def test_the_currency_on_an_event_is_parsed_and_never_used():

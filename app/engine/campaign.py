@@ -33,7 +33,7 @@ from app.engine.phases import (
     run_phase_4_robustness,
     split_is_oos,
 )
-from app.engine.vault_writer import write_vault_candidates
+from app.engine.vault_writer import HIGHER_TF_OFF, write_vault_candidates
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genome import Genome, random_population
 from app.models import Campaign
@@ -87,12 +87,17 @@ class CampaignConfig:
     lot_step: float = 0.0
     min_lot: float = 0.0
     max_lot: float = 0.0
+    # Account currency per unit of the instrument's quote currency, by
+    # timestamp (app/data/conversion.py). None when they are the same.
+    quote_to_account: pd.Series | None = None
     data_source: str = "dukascopy"
     # Smart Mode sampling weights (app/engine/smart_mode.py). Empty means
     # uniform sampling, which is what every campaign did before Smart Mode.
     gene_weights: dict = field(default_factory=dict)
-    # REQ-BREED-2 — higher-timeframe context bars, None when HIGHER TF is off.
+    # REQ-BREED-2 — higher-timeframe context bars, None when HIGHER TF is off,
+    # and the timeframe they are (recorded on every Vault row it produces).
     htf_df: pd.DataFrame | None = None
+    higher_timeframe: str | None = None
     # REQ-ENGINE-2 — economic calendar for the EVENT gene, empty when none is configured.
     news_events: list = field(default_factory=list)
     news_mode: str = "FTMO"
@@ -279,6 +284,7 @@ def run_campaign(
         "lot_step": config.lot_step,
         "min_lot": config.min_lot,
         "max_lot": config.max_lot,
+        "quote_to_account": config.quote_to_account,
         "htf_df": config.htf_df,
         "news_events": config.news_events or None,
         "news_mode": config.news_mode,
@@ -387,6 +393,7 @@ def run_campaign(
         timeframe=campaign.timeframe or config.timeframe,
         data_source=config.data_source,
         oos_bars=oos_df,
+        higher_timeframe=config.higher_timeframe if config.htf_df is not None else HIGHER_TF_OFF,
     )
 
     campaign.status = "completed"

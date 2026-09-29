@@ -16,11 +16,19 @@ from app.engine.scoring import classify_archetype, compute_grade, compute_score
 from app.models import Strategy
 
 
+# Stored in strategies.higher_timeframe when a strategy was bred with
+# HIGHER TF disabled - distinct from NULL, which means "not recorded".
+HIGHER_TF_OFF = "OFF"
+
+
 def _band(candidate: VaultCandidate):
     return robustness_band(candidate.robustness)
 
 
-def vault_candidate_to_row(candidate: VaultCandidate, asset: str, timeframe: str, data_source: str = "dukascopy") -> Strategy:
+def vault_candidate_to_row(
+    candidate: VaultCandidate, asset: str, timeframe: str, data_source: str = "dukascopy",
+    higher_timeframe: str | None = None,
+) -> Strategy:
     """`data_source` records which data the strategy was bred on — the
     Vault's BUILT-IN DATA BRED purge criterion (REQ-SET-4.1) depends on it."""
     score = compute_score(candidate.stats_oos, candidate.robustness)
@@ -48,6 +56,7 @@ def vault_candidate_to_row(candidate: VaultCandidate, asset: str, timeframe: str
         equity_oos=json.dumps(candidate.equity_oos) if candidate.equity_oos else None,
         persistence_pct=candidate.walk_forward.persistence_pct if candidate.walk_forward else None,
         walk_forward=json.dumps(candidate.walk_forward.to_dict()) if candidate.walk_forward else None,
+        higher_timeframe=higher_timeframe,
         deployed=False,
         active_mt5=False,
     )
@@ -71,11 +80,12 @@ def write_vault_candidates(
     timeframe: str,
     data_source: str = "dukascopy",
     oos_bars: pd.DataFrame | None = None,
+    higher_timeframe: str | None = None,
 ) -> list[Strategy]:
     taken: set[str] = set()
     for candidate in candidates:
         candidate.hash_id = _unique_hash_id(session, candidate, taken)
-    rows = [vault_candidate_to_row(c, asset, timeframe, data_source) for c in candidates]
+    rows = [vault_candidate_to_row(c, asset, timeframe, data_source, higher_timeframe) for c in candidates]
     session.add_all(rows)
     session.commit()
 

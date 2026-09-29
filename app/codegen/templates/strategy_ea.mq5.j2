@@ -17,7 +17,9 @@
 
 input double RiskPercent      = {{ risk_pct }};   // % of equity risked per trade
 input string RiskOverrideFile = "quantengine_risk.csv";  // COMMON Files; written by the Incubation ladder
-input double MaxSpreadPoints  = {{ max_spread_points }};  // skip entries above this spread
+// 0 = no ceiling, which is what was backtested: the backtest never skips
+// an entry for its spread. Set one here only on purpose.
+input double MaxSpreadPoints  = {{ max_spread_points }};  // skip entries above this spread (broker points)
 input long   MagicNumber      = {{ magic }};
 input bool   AllowLong        = true;
 input bool   AllowShort       = true;
@@ -28,6 +30,10 @@ input bool   AllowShort       = true;
 // where the engine fires it 12. AUTO reads the terminal, which is right
 // live and can be wrong in the tester: set it by hand when you backtest.
 input int    ServerGmtOffsetHours = 99;   // 99 = auto; else the server's offset from UTC
+// The backtest closes any trade still open this many bars after its entry
+// bar (engine/app/engine/backtest.py MAX_HOLD_BARS). 0 disables it.
+input int    MaxHoldBars      = {{ max_hold_bars }};
+input ulong  MaxSlippagePoints = 50;       // market-order deviation, broker points
 
 CTrade   Trade;
 datetime LastBarTime = 0;
@@ -35,6 +41,12 @@ int GmtOffsetSeconds = 0;   // resolved in OnInit
 
 // Every rule that reads an hour or a weekday goes through this.
 datetime UtcNow() { return TimeCurrent() - GmtOffsetSeconds; }
+
+// A resting LIMIT/STOP order is cancelled after this many bars unfilled,
+// counted by the EA itself on bar opens rather than by a broker expiry
+// time: some brokers refuse ORDER_TIME_SPECIFIED, and a clock expiry
+// counts weekend hours the backtest never sees.
+#define PENDING_BARS {{ pending_bars }}
 {% if execution == "MARKET2" %}
 int    PendingDirection      = 0;   // a MARKET2 signal waiting out confirm_bars
 int    BarsUntilEntry        = 0;
@@ -208,22 +220,18 @@ bool IsFridayAfter(int cutoffHour)
 
 ENUM_TIMEFRAMES HigherTimeframe() { return {{ higher_timeframe }}; }
 
-double HtfClose(int shift) { return iClose(_Symbol, HigherTimeframe(), shift); }
+// The bar that just closed, in UTC. Time-based management judges this bar,
+// as the backtester does, not the clock at the tick that follows it.
+datetime ClosedBarUtc() { return iTime(_Symbol, PERIOD_CURRENT, 1) - GmtOffsetSeconds; }
 
-int ConsecutiveLosses()
+// The backtester never lets a management rule fire on the entry bar
+// itself; it starts looking on the bar after. Call with a position selected.
+bool ClosedBarIsAfterEntry()
 {
-   int losses = 0;
-   if(!HistorySelect(0, TimeCurrent())) return 0;
-   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
-   {
-      ulong ticket = HistoryDealGetTicket(i);
-      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != MagicNumber) continue;
-      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
-      if(HistoryDealGetDouble(ticket, DEAL_PROFIT) >= 0) break;
-      losses++;
-   }
-   return losses;
+   return iTime(_Symbol, PERIOD_CURRENT, 1) > (datetime)PositionGetInteger(POSITION_TIME);
 }
+
+double HtfClose(int shift) { return iClose(_Symbol, HigherTimeframe(), shift); }
 
 bool HasOpenPosition()
 {
@@ -246,8 +254,8 @@ bool HasOpenPosition()
 //| positions at full risk each.                                      |
 //|                                                                   |
 //| The backtester has exactly one order in flight: after a fill it   |
-//| resumes at the bar following the exit, and after an expiry it     |
-//| moves on one bar (app/engine/backtest.py, `i = exit_idx + 1`).    |
+//| reads the next signal on the exit bar, and after an expiry on the |
+//| last bar of the order's window (app/engine/backtest.py).          |
 //+------------------------------------------------------------------+
 bool HasPendingOrder()
 {
@@ -289,6 +297,38 @@ double RiskShare()
    return share;
 }
 
+//--- Prices sent to the server must sit on the symbol's tick grid, or the
+//--- order comes back "invalid price" / "invalid stops" and is lost.
+double NormalizePrice(double price)
+{
+   double tick = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tick <= 0.0) return NormalizeDouble(price, _Digits);
+   return NormalizeDouble(MathRound(price / tick) * tick, _Digits);
+}
+
+int VolumeDigits()
+{
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0.0) return 2;
+   return (int)MathMax(0, MathCeil(-MathLog10(step) - 1e-9));
+}
+
+// The broker refuses a stop or target closer than its stops level. The
+// backtest has no such rule, so the trade is skipped - loudly - rather
+// than sent to be rejected.
+bool StopsAllowed(double stopDistance, double targetDistance)
+{
+   double level = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   if(level <= 0.0) return true;
+   if(stopDistance < level || targetDistance < level)
+   {
+      PrintFormat("QuantEngine: skipped an entry - stop %.5f / target %.5f is inside the broker's stops level %.5f",
+                  stopDistance, targetDistance, level);
+      return false;
+   }
+   return true;
+}
+
 //--- Risk sizing: a full stop-out costs exactly RiskPercent of equity,
 //--- scaled by whatever stage the Incubation ladder has this bot at.
 double LotsForRisk(double stopDistance)
@@ -306,8 +346,10 @@ double LotsForRisk(double stopDistance)
    double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
    double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
-   lots = MathFloor(lots / step) * step;
-   return MathMax(minLot, MathMin(maxLot, lots));
+   if(step <= 0.0) step = minLot;
+   lots = MathFloor(lots / step + 1e-9) * step;
+   lots = MathMax(minLot, MathMin(maxLot, lots));
+   return NormalizeDouble(lots, VolumeDigits());
 }
 
 int Signal()
@@ -339,13 +381,17 @@ void ManageOpenPosition(bool newBar)
 {
 {% if management == "EOD CLOSE" %}
    if(!newBar) return;   // a bar-close decision in the backtester
-   MqlDateTime now; TimeToStruct(UtcNow(), now);
-   if(now.hour >= {{ management_params.close_hour | default(21) }})
+   // The backtester closes at the close of the first bar after the entry
+   // bar whose open hour (UTC) is close_hour or later. That bar is the one
+   // that just closed - shift 1 - and this is its close.
+   MqlDateTime bar; TimeToStruct(ClosedBarUtc(), bar);
+   if(bar.hour >= {{ management_params.close_hour | default(21) }})
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
          ulong ticket = PositionGetTicket(i);
          if(ticket <= 0) continue;
-         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber && PositionGetString(POSITION_SYMBOL) == _Symbol)
+         if(PositionGetInteger(POSITION_MAGIC) == MagicNumber && PositionGetString(POSITION_SYMBOL) == _Symbol
+            && ClosedBarIsAfterEntry())
             Trade.PositionClose(ticket);
       }
 {% elif management == "FRIDAY PROFIT" %}
@@ -355,13 +401,15 @@ void ManageOpenPosition(bool newBar)
    // weekday; the backtest, which only evaluates this gene when a bar
    // closes, put 55 there.
    if(!newBar) return;
-   MqlDateTime now; TimeToStruct(UtcNow(), now);
-   if(now.day_of_week == 5 && now.hour >= {{ management_params.lock_hour | default(18) }})
+   // Judged on the bar that just closed, as the backtester judges it.
+   MqlDateTime bar; TimeToStruct(ClosedBarUtc(), bar);
+   if(bar.day_of_week == 5 && bar.hour >= {{ management_params.lock_hour | default(18) }})
       for(int i = PositionsTotal() - 1; i >= 0; i--)
       {
          ulong ticket = PositionGetTicket(i);
          if(ticket <= 0) continue;
          if(PositionGetInteger(POSITION_MAGIC) != MagicNumber || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+         if(!ClosedBarIsAfterEntry()) continue;
          if(PositionGetDouble(POSITION_PROFIT) > 0)   // only locks a position in profit
             Trade.PositionClose(ticket);
       }
@@ -375,21 +423,25 @@ void ManageOpenPosition(bool newBar)
       double entry = PositionGetDouble(POSITION_PRICE_OPEN);
       double stop  = PositionGetDouble(POSITION_SL);
       double volume = PositionGetDouble(POSITION_VOLUME);
+      double target = PositionGetDouble(POSITION_TP);   // read before the partial close changes the selection
       if(stop <= 0.0) continue;
 
       double stopDistance = MathAbs(entry - stop);
+      // Already at breakeven: the partial has been taken. Checked before
+      // dividing by the distance, which is zero from here on.
+      if(stopDistance <= _Point) continue;
       int direction = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY ? 1 : -1;
       double current = direction > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_BID) : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       double rMultiple = (current - entry) * direction / stopDistance;
 
       // Bank close_fraction at r_multiple R, then move the rest to breakeven.
-      if(rMultiple >= {{ management_params.r_multiple | default(1.0) }} && MathAbs(stop - entry) > _Point)
+      if(rMultiple >= {{ management_params.r_multiple | default(1.0) }})
       {
          double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
-         double partial = MathFloor(volume * {{ management_params.close_fraction | default(0.5) }} / step) * step;
+         double partial = NormalizeDouble(MathFloor(volume * {{ management_params.close_fraction | default(0.5) }} / step + 1e-9) * step, VolumeDigits());
          if(partial >= SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN))
             Trade.PositionClosePartial(ticket, partial);
-         Trade.PositionModify(ticket, entry, PositionGetDouble(POSITION_TP));
+         Trade.PositionModify(ticket, NormalizePrice(entry), target);
       }
    }
 {% else %}
@@ -398,13 +450,78 @@ void ManageOpenPosition(bool newBar)
 
 void PlaceMarketOrder(int direction, double stopDistance, double targetDistance)
 {
+   if(!StopsAllowed(stopDistance, targetDistance)) return;
    double lots = LotsForRisk(stopDistance);
    if(lots <= 0.0) return;
    double price = direction > 0 ? SymbolInfoDouble(_Symbol, SYMBOL_ASK) : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-   double stop   = price - direction * stopDistance;
-   double target = price + direction * targetDistance;
-   if(direction > 0) Trade.Buy(lots, _Symbol, price, stop, target);
-   else              Trade.Sell(lots, _Symbol, price, stop, target);
+   double stop   = NormalizePrice(price - direction * stopDistance);
+   double target = NormalizePrice(price + direction * targetDistance);
+   bool sent = direction > 0 ? Trade.Buy(lots, _Symbol, price, stop, target)
+                             : Trade.Sell(lots, _Symbol, price, stop, target);
+   if(!sent) PrintFormat("QuantEngine: market order refused - %d %s", Trade.ResultRetcode(), Trade.ResultRetcodeDescription());
+}
+
+// A resting order whose price the market has already passed cannot be
+// placed - the server rejects a buy limit above the ask or a buy stop
+// below it. The backtester fills such an order at the open of the bar it
+// was placed on, so the EA does the same: it buys now, at market.
+void PlacePendingOrder(int direction, bool isLimit, double entryPrice, double stopDistance, double targetDistance)
+{
+   entryPrice = NormalizePrice(entryPrice);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK), bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   bool passed;
+   if(isLimit) passed = direction > 0 ? ask <= entryPrice : bid >= entryPrice;
+   else        passed = direction > 0 ? ask >= entryPrice : bid <= entryPrice;
+   if(passed)
+   {
+      PlaceMarketOrder(direction, stopDistance, targetDistance);
+      return;
+   }
+   if(!StopsAllowed(stopDistance, targetDistance)) return;
+   double lots = LotsForRisk(stopDistance);
+   if(lots <= 0.0) return;
+   double stop   = NormalizePrice(entryPrice - direction * stopDistance);
+   double target = NormalizePrice(entryPrice + direction * targetDistance);
+   bool sent;
+   if(isLimit) sent = direction > 0 ? Trade.BuyLimit(lots, entryPrice, _Symbol, stop, target, ORDER_TIME_GTC, 0)
+                                    : Trade.SellLimit(lots, entryPrice, _Symbol, stop, target, ORDER_TIME_GTC, 0);
+   else        sent = direction > 0 ? Trade.BuyStop(lots, entryPrice, _Symbol, stop, target, ORDER_TIME_GTC, 0)
+                                    : Trade.SellStop(lots, entryPrice, _Symbol, stop, target, ORDER_TIME_GTC, 0);
+   if(!sent) PrintFormat("QuantEngine: pending order refused - %d %s", Trade.ResultRetcode(), Trade.ResultRetcodeDescription());
+}
+
+// Cancels our resting order once it has waited PENDING_BARS bars. Runs at
+// a bar open before any new signal is read, so the next signal the EA
+// looks at is the one on the bar the order expired after - exactly where
+// the backtester resumes.
+void ExpirePendingOrders()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket == 0) continue;
+      if(OrderGetInteger(ORDER_MAGIC) != MagicNumber || OrderGetString(ORDER_SYMBOL) != _Symbol) continue;
+      datetime placed = (datetime)OrderGetInteger(ORDER_TIME_SETUP);
+      if(iBarShift(_Symbol, PERIOD_CURRENT, placed) >= PENDING_BARS)
+         Trade.OrderDelete(ticket);
+   }
+}
+
+// MaxHoldBars: the backtester's safety cap on a trade's life.
+void CloseStalePositions()
+{
+   if(MaxHoldBars <= 0) return;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket <= 0) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber || PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
+      // The entry bar has shift MaxHoldBars+1 at the open of the bar after
+      // the backtester's last one, whose close is this price.
+      if(iBarShift(_Symbol, PERIOD_CURRENT, opened) > MaxHoldBars)
+         Trade.PositionClose(ticket);
+   }
 }
 
 void TryEnter()
@@ -426,9 +543,6 @@ void TryEnter()
    double signalPrice = Cl(1);
    double stopDistance = {{ stop_atr_mult }} * atr;
    double targetDistance = {{ target_atr_mult }} * atr;
-   double lots = LotsForRisk(stopDistance);
-   if(lots <= 0.0) return;
-
 {% if execution == "MARKET2" %}
    // MARKET2 - the genome asks for {{ confirm_bars }} bar(s) between the
    // signal and the fill, and the backtester fills at the open of the bar
@@ -443,25 +557,18 @@ void TryEnter()
    if(BarsUntilEntry <= 0) PlaceMarketOrder(direction, stopDistance, targetDistance);
 {% elif execution in ("LIMIT", "LIMIT2") %}
    // {{ execution }} - pullback entry {{ limit_offset_atr }} ATR behind the signal price.
-   double entryPrice = signalPrice - direction * {{ limit_offset_atr }} * atr;
-   double stop   = entryPrice - direction * stopDistance;
-   double target = entryPrice + direction * targetDistance;
-   datetime expiry = TimeCurrent() + {{ pending_expiry_seconds }};
-   if(direction > 0) Trade.BuyLimit(lots, entryPrice, _Symbol, stop, target, ORDER_TIME_SPECIFIED, expiry);
-   else              Trade.SellLimit(lots, entryPrice, _Symbol, stop, target, ORDER_TIME_SPECIFIED, expiry);
+   PlacePendingOrder(direction, true, signalPrice - direction * {{ limit_offset_atr }} * atr, stopDistance, targetDistance);
 {% else %}
    // STOP - breakout entry {{ stop_offset_atr }} ATR beyond the signal price.
-   double entryPrice = signalPrice + direction * {{ stop_offset_atr }} * atr;
-   double stop   = entryPrice - direction * stopDistance;
-   double target = entryPrice + direction * targetDistance;
-   datetime expiry = TimeCurrent() + {{ pending_expiry_seconds }};
-   if(direction > 0) Trade.BuyStop(lots, entryPrice, _Symbol, stop, target, ORDER_TIME_SPECIFIED, expiry);
-   else              Trade.SellStop(lots, entryPrice, _Symbol, stop, target, ORDER_TIME_SPECIFIED, expiry);
+   PlacePendingOrder(direction, false, signalPrice + direction * {{ stop_offset_atr }} * atr, stopDistance, targetDistance);
 {% endif %}}
 
 int OnInit()
 {
    Trade.SetExpertMagicNumber(MagicNumber);
+   // FOK, CTrade's default, is refused outright by many brokers.
+   Trade.SetTypeFillingBySymbol(_Symbol);
+   Trade.SetDeviationInPoints(MaxSlippagePoints);
    GmtOffsetSeconds = ServerGmtOffsetHours == 99
       ? (int)(TimeCurrent() - TimeGMT())
       : ServerGmtOffsetHours * 3600;
@@ -492,10 +599,12 @@ void OnTick()
    datetime currentBar = iTime(_Symbol, PERIOD_CURRENT, 0);
    bool newBar = currentBar != LastBarTime;
 
+   if(newBar) CloseStalePositions();
    ManageOpenPosition(newBar);
 
    if(!newBar) return;
    LastBarTime = currentBar;
+   ExpirePendingOrders();
 
    // One position or one waiting order at a time, as backtested.
    if(HasOpenPosition() || HasPendingOrder()) return;
