@@ -24,6 +24,7 @@ from app.broker.mt5_install import install_compiled_ea, install_ea
 from app.codegen.mql5 import GeneratedEa, UnsupportedGeneError, generate_ea
 from app.config import get_config, set_auto_backup_before_updates, set_built_in_data_only
 from app.data.provider import TIMEFRAME_MINUTES, get_historical_bars
+from app.data.conversion import quote_to_account_series
 from app.data.sync import DeltaSyncRunner, SyncState
 from app.data.symbols import BUNDLED_SYMBOLS, INSTRUMENTS, TIMEFRAMES, get_instrument
 from app.db import make_engine
@@ -50,6 +51,7 @@ from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
 from app.engine.backtest import simulate_trades
 from app.engine.phases import IS_FRACTION, split_is_oos
 from app.engine.auto_deploy import replace_degraded
+from app.engine.vault_writer import HIGHER_TF_OFF
 from app.engine.health import auto_promote, check_all_brokers, ladder, promote, risk_shares, run_health_check
 from app.engine.portfolio import compute_health
 from app.engine import smart_mode
@@ -219,41 +221,46 @@ def _manual_spread_points(costs: dict, symbol: str) -> float:
     return float(configured if configured is not None else costs["manual_spread_points"])
 
 
+class SpreadUnavailable(ValueError):
+    """AUTO SPREAD was asked for and MetaTrader could not provide it.
+
+    A ValueError so every endpoint that already turns a bad configuration
+    into a message for the user does the same with this one.
+    """
+
+
 def _spread_points(costs: dict, symbol: str, instrument) -> float:
-    """AUTO SPREAD reads the live broker spread (the one thing the MT5
-    connection is for besides execution — REQ-DATA-1.3); MANUAL uses the
-    configured value. AUTO with no terminal connected falls back to MANUAL
-    rather than silently backtesting at zero spread."""
+    """The spread every backtest is charged, in the instrument's points.
+
+    AUTO reads it from the broker, and only from the broker: MetaTrader
+    has to be open. It used to fall back to the manual figure when no
+    terminal answered, which meant a campaign labelled AUTO could be
+    charged a number typed in months ago for a different instrument -
+    and nobody could tell afterwards which of the two it had been.
+    MANUAL is the user's number, per symbol when set, the default
+    otherwise.
+    """
     if costs["spread_mode"] != "AUTO":
         return _manual_spread_points(costs, symbol)
-    # AUTO spread is the one thing that actually wants the terminal. It
-    # attaches to a running one if it has not already - never launches,
-    # because a campaign starting is not a reason to open a broker
-    # terminal - and falls back to MANUAL when there is none.
+    # Attach to a running terminal; never launch one - a campaign
+    # starting is not a reason to open a broker terminal.
     if not _mt5_bridge.is_connected():
         _mt5_bridge.connect()
-    quote = _mt5_bridge.get_live_quote(symbol) if _mt5_bridge.is_connected() else None
-    if quote is None:
-        return _manual_spread_points(costs, symbol)
-    live = float(quote.spread_points * instrument.point_divisor)
-    # One quote, taken whenever a campaign happens to start, then charged
-    # against years of history. Campaigns get started in calm moments, and
-    # the spread in a calm moment is not the spread over a news release or
-    # a rollover - so AUTO is optimistic by construction, and silently so.
-    # A campaign bred on 150 points of gold, where the figure configured by
-    # hand for that symbol was 600, produced three strategies whose costs
-    # were a quarter of what the broker charged.
-    manual = _manual_spread_points(costs, symbol)
-    log = logging.getLogger("quantengine")
-    if live < manual:
-        log.warning(
-            "AUTO SPREAD: %s quoted %.0f points live, below the %.0f configured for it. "
-            "Charging %.0f. A single live quote is not what this instrument costs over "
-            "a night or a news release; switch Settings -> Costs to MANUAL to charge %.0f.",
-            symbol, live, manual, live, manual,
+    if not _mt5_bridge.is_connected():
+        raise SpreadUnavailable(
+            "Spread mode is AUTO, which reads the spread from MetaTrader 5, and no terminal is open. "
+            "Open MetaTrader 5 and log in to your broker, or switch Settings -> Costs -> Spread mode to MANUAL."
         )
-    else:
-        log.info("AUTO SPREAD: charging %s %.0f points, read live.", symbol, live)
+    quote = _mt5_bridge.get_live_quote(symbol)
+    if quote is None or quote.spread_points <= 0:
+        raise SpreadUnavailable(
+            f"MetaTrader 5 is open but returned no quote for {symbol}. Check the symbol exists on this broker "
+            "and the market is open, or switch Settings -> Costs -> Spread mode to MANUAL."
+        )
+    live = float(quote.spread_points * instrument.point_divisor)
+    logging.getLogger("quantengine").info(
+        "AUTO SPREAD: charging %s %.1f points, read from MetaTrader (%s).", symbol, live, quote.symbol
+    )
     return live
 
 
@@ -276,7 +283,44 @@ def _gene_pool_for_campaign(config: CampaignConfig) -> GenePoolConfig:
     gene_pool = GenePoolConfig.load(get_config().gene_pool_path)
     if not config.news_events:
         gene_pool.set_enabled("filter", "EVENT", False)
+    # The same reasoning, twice more. HTF with HIGHER TF off is neutral on
+    # every bar; CONSEC has never been applied by the backtester at all.
+    # Either one only spends the search on a gene that changes nothing.
+    if config.htf_df is None:
+        gene_pool.set_enabled("bias", "HTF", False)
+    gene_pool.set_enabled("filter", "CONSEC", False)
     return gene_pool
+
+
+def _strategy_higher_timeframe(settings: dict, strategy) -> str | None:
+    """The HIGHER TF context a Vault strategy is traded and re-checked with.
+
+    What it was bred with, when that was recorded; for older rows the
+    current settings, which is what REASSESS has always used for them.
+    """
+    recorded = getattr(strategy, "higher_timeframe", None)
+    if recorded == HIGHER_TF_OFF:
+        return None
+    if recorded:
+        return recorded
+    campaign_settings = settings["campaign"]
+    if not campaign_settings["higher_tf_enabled"]:
+        return None
+    return _higher_timeframe(strategy.timeframe, campaign_settings)
+
+
+def _config_for_strategy(settings: dict, strategy) -> CampaignConfig:
+    """build_campaign_config, with the strategy's own HIGHER TF context."""
+    config = build_campaign_config(settings, strategy.asset, strategy.timeframe)
+    wanted = _strategy_higher_timeframe(settings, strategy)
+    if wanted != config.higher_timeframe:
+        config.higher_timeframe = wanted
+        config.htf_df = (
+            _load_bars(strategy.asset, wanted, settings["campaign"]["history_depth_years"]) if wanted else None
+        )
+        if config.htf_df is not None and config.htf_df.empty:
+            config.htf_df = None
+    return config
 
 
 def _learned_gene_weights() -> dict[str, float]:
@@ -333,10 +377,13 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
     instrument = get_instrument(symbol)
 
     htf_df = None
+    htf_timeframe = None
     if campaign_settings["higher_tf_enabled"]:
         htf_timeframe = _higher_timeframe(timeframe, campaign_settings)
         if htf_timeframe:
             htf_df = _load_bars(symbol, htf_timeframe, campaign_settings["history_depth_years"])
+            if htf_df.empty:
+                htf_df, htf_timeframe = None, None
 
     # REQ-ENGINE-2 — the EVENT gene needs a calendar; without one it would
     # silently veto nothing, so an absent calendar simply means no events.
@@ -365,12 +412,14 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
         lot_step=float(caps.get("lot_step", 0.0)),
         min_lot=float(caps.get("min_lot_size", 0.0)),
         max_lot=float(caps.get("max_lot_size", 0.0)),
+        quote_to_account=quote_to_account_series(instrument, get_historical_bars),
         max_workers=campaign_settings["cores"] or None,  # 0 = auto
         data_source="bundled" if get_config().built_in_data_only else "dukascopy",
         # SMART MODE (Settings → Campaign) biases which genes get drawn,
         # using what the Vault has already shown to work.
         gene_weights=_learned_gene_weights() if campaign_settings["smart_mode"] else {},
         htf_df=htf_df,
+        higher_timeframe=htf_timeframe,
         news_events=news_events,
     )
 
@@ -553,7 +602,8 @@ async def _scheduler_loop() -> None:
                     actions = replace_degraded(
                         session,
                         risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
-                        max_spread_points=float(settings["costs"]["manual_spread_points"]),
+                        max_spread_points=0.0,
+                        higher_timeframe_for=lambda row: _strategy_higher_timeframe(settings, row),
                     )
                 update_section(config.settings_path, "automation", {"last_auto_deploy_at": now.isoformat()})
                 for action in actions:
@@ -621,6 +671,16 @@ async def lifespan(_: FastAPI):
 # FastAPI engine — design.md B.2, B.7. Bound to 127.0.0.1:7831 only,
 # spawned/managed by the Electron main process as a child process.
 app = FastAPI(title="QuantEngine Engine", lifespan=lifespan)
+
+
+@app.exception_handler(SpreadUnavailable)
+async def _spread_unavailable(_request, exc: SpreadUnavailable):
+    # Any endpoint that prices a backtest can land here (REASSESS, True
+    # Sim, tick verification) - not only campaign launch - and each one
+    # should say why rather than answer 500.
+    from fastapi.responses import JSONResponse
+
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 # The renderer (http://localhost:5173 in dev, file:// once packaged) is a
 # different origin than 127.0.0.1:7831, so the browser's CORS policy blocks
@@ -1156,8 +1216,14 @@ def _generate_ea_for(strategy_id: str) -> tuple[Strategy, "GeneratedEa"]:
             row.timeframe,
             # The EA risks what Settings says, not what the backtest used —
             # position size is the user's decision, the rules are not.
+            # No spread ceiling: the backtest never skipped an entry for
+            # its spread, so an EA that does trades a different strategy.
+            # It passed the *cost* setting (10 points by default) as the
+            # ceiling, which on gold or a standard FX account refused most
+            # entries outright. MaxSpreadPoints stays an EA input for
+            # anyone who wants one on purpose.
             risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
-            max_spread_points=float(settings["costs"]["manual_spread_points"]),
+            higher_timeframe=_strategy_higher_timeframe(settings, row),
         )
     except UnsupportedGeneError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -1244,7 +1310,7 @@ def _revalidate(strategy_id: str, full: bool) -> dict:
             raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
 
         try:
-            config = build_campaign_config(settings, strategy.asset, strategy.timeframe)
+            config = _config_for_strategy(settings, strategy)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1314,7 +1380,7 @@ def recompute_vault(limit: int = 500) -> dict:
                     skipped.append({"strategy_id": strategy.id, "reason": "not enough history cached"})
                     continue
 
-                config = build_campaign_config(settings, strategy.asset, strategy.timeframe)
+                config = _config_for_strategy(settings, strategy)
                 before = strategy.score
                 result = refresh_strategy_engine(strategy, df, gene_pool, config)
                 session.commit()
@@ -1392,7 +1458,7 @@ async def tick_verify_strategy(strategy_id: str, max_trades: int = TICK_VERIFY_M
         genome = Genome.from_dict(json.loads(strategy.genome_json))
 
     try:
-        config = build_campaign_config(settings, asset, timeframe)
+        config = _config_for_strategy(settings, strategy)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -1417,6 +1483,8 @@ async def tick_verify_strategy(strategy_id: str, max_trades: int = TICK_VERIFY_M
         lot_step=config.lot_step,
         min_lot=config.min_lot,
         max_lot=config.max_lot,
+        quote_to_account=config.quote_to_account,
+        htf_df=config.htf_df,
     )
     trades = result.trades[-max(1, min(max_trades, TICK_VERIFY_MAX_TRADES)):]
     if not trades:
@@ -2221,7 +2289,8 @@ def post_run_auto_deploy() -> dict:
         actions = replace_degraded(
             session,
             risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
-            max_spread_points=float(settings["costs"]["manual_spread_points"]),
+            max_spread_points=0.0,
+            higher_timeframe_for=lambda row: _strategy_higher_timeframe(settings, row),
         )
     return {"actions": [action.to_dict() for action in actions]}
 

@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from fastapi.testclient import TestClient
 
 import app.main as main_module
@@ -7,6 +9,23 @@ from app.main import app
 from app.migrations.runner import run_migrations
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def _a_terminal_quoting_a_spread(monkeypatch):
+    """AUTO SPREAD, the default, needs MetaTrader open and no longer falls
+    back to the manual figure. Endpoints that price a backtest are tested
+    here against a terminal that answers; tests about the terminal itself
+    replace these again."""
+    from app.broker.mt5_bridge import LiveQuote
+
+    bridge = main_module._mt5_bridge
+    monkeypatch.setattr(bridge, "is_connected", lambda: True)
+    monkeypatch.setattr(bridge, "connect", lambda *a, **k: True)
+    monkeypatch.setattr(
+        bridge, "get_live_quote", lambda symbol: LiveQuote(symbol, 1.0, 1.0002, 0.0002)
+    )
+    monkeypatch.setattr(bridge, "get_server_info", lambda: None)
 
 
 def test_status():
@@ -1229,3 +1248,19 @@ def test_emptying_the_vault_is_recoverable_and_guarded(tmp_path, monkeypatch):
         )
         session.commit()
     assert client.post("/vault/empty", json={"expected_count": 0}).status_code == 409
+
+
+def test_an_exported_ea_uses_the_htf_context_its_strategy_was_bred_with():
+    from types import SimpleNamespace
+
+    settings = {"campaign": {"higher_tf_enabled": True, "higher_tf_mode": "AUTO", "higher_tf_manual_timeframe": None}}
+    bred_off = SimpleNamespace(higher_timeframe="OFF", timeframe="M15")
+    bred_h4 = SimpleNamespace(higher_timeframe="H4", timeframe="M15")
+    legacy = SimpleNamespace(higher_timeframe=None, timeframe="M15")
+
+    assert main_module._strategy_higher_timeframe(settings, bred_off) is None
+    assert main_module._strategy_higher_timeframe(settings, bred_h4) == "H4"
+    # Rows from before it was recorded follow the settings, as REASSESS does.
+    assert main_module._strategy_higher_timeframe(settings, legacy) == "H1"
+    settings["campaign"]["higher_tf_enabled"] = False
+    assert main_module._strategy_higher_timeframe(settings, legacy) is None

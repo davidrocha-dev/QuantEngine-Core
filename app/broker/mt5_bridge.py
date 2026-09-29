@@ -65,14 +65,35 @@ class MT5Bridge:
     def is_connected(self) -> bool:
         return self._connected
 
+    def resolve_symbol(self, symbol: str) -> str | None:
+        """The broker's name for `symbol`.
+
+        Brokers decorate names - EURUSD.r, EURUSDm, XAUUSD.pro - and an
+        exact lookup against those returns nothing. Exact first, then the
+        shortest broker symbol that starts with the plain name, which is
+        the undecorated variant when a broker lists several.
+        """
+        if mt5 is None or not self._connected:
+            return None
+        if mt5.symbol_info(symbol) is not None:
+            return symbol
+        candidates = mt5.symbols_get(f"{symbol}*") or ()
+        names = sorted((c.name for c in candidates), key=len)
+        return names[0] if names else None
+
     def get_live_quote(self, symbol: str) -> LiveQuote | None:
         if mt5 is None or not self._connected:
             return None
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None:
+        name = self.resolve_symbol(symbol)
+        if name is None:
+            return None
+        # A symbol outside Market Watch has no ticks streaming to it.
+        mt5.symbol_select(name, True)
+        tick = mt5.symbol_info_tick(name)
+        if tick is None or tick.bid <= 0 or tick.ask <= 0:
             return None
         return LiveQuote(
-            symbol=symbol,
+            symbol=name,
             bid=tick.bid,
             ask=tick.ask,
             spread_points=(tick.ask - tick.bid),

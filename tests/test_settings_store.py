@@ -90,27 +90,36 @@ def test_the_account_size_and_the_volume_ladder_reach_the_engine():
     assert defaults["broker_caps"]["lot_step"] == 0.01
 
 
-def test_auto_spread_says_when_it_undercuts_the_configured_one(caplog):
-    """AUTO reads one live quote and charges it against years of history.
+_COSTS = {
+    "spread_mode": "AUTO",
+    "manual_spread_points": 10.0,
+    "manual_spread_by_symbol": {"XAUUSD": 600},
+    "commission_per_lot": 7.0,
+    "slippage_points": 2.0,
+}
 
-    Campaigns get started in calm moments, and the spread in a calm moment
-    is not the spread over a news release or a rollover, so AUTO is
-    optimistic by construction. It was also silent: the owner configured
-    600 points for XAUUSD, AUTO read 0.15 of a dollar off a connected
-    terminal, and the campaign that produced three GOOD strategies charged
-    150 - a quarter of what the broker had actually been measured taking.
-    """
+
+class _Instrument:
+    point_divisor = 1000
+
+
+def _with_bridge(bridge, fn):
+    import app.main as main
+
+    original = main._mt5_bridge
+    main._mt5_bridge = bridge
+    try:
+        return fn()
+    finally:
+        main._mt5_bridge = original
+
+
+def test_auto_spread_is_read_from_metatrader():
+    """AUTO charges what the broker quotes, whatever the manual figure says."""
     from app.main import _spread_points
 
-    costs = {
-        "spread_mode": "AUTO",
-        "manual_spread_points": 10.0,
-        "manual_spread_by_symbol": {"XAUUSD": 600},
-        "commission_per_lot": 7.0,
-        "slippage_points": 2.0,
-    }
-
     class _Quote:
+        symbol = "XAUUSD.pro"
         spread_points = 0.15
 
     class _Bridge:
@@ -123,19 +132,53 @@ def test_auto_spread_says_when_it_undercuts_the_configured_one(caplog):
         def get_live_quote(self, symbol):
             return _Quote()
 
-    class _Instrument:
-        point_divisor = 1000
-
-    import app.main as main
-
-    original = main._mt5_bridge
-    main._mt5_bridge = _Bridge()
-    try:
-        with caplog.at_level("WARNING", logger="quantengine"):
-            charged = _spread_points(costs, "XAUUSD", _Instrument())
-    finally:
-        main._mt5_bridge = original
-
-    # AUTO still wins - it is what the setting asks for - but not quietly.
+    charged = _with_bridge(_Bridge(), lambda: _spread_points(_COSTS, "XAUUSD", _Instrument()))
     assert charged == pytest.approx(150.0)
-    assert any("below the 600" in record.getMessage() for record in caplog.records)
+
+
+def test_auto_spread_refuses_without_a_terminal_instead_of_using_the_manual_one():
+    """AUTO used to fall back to the manual figure with MetaTrader closed,
+    so a campaign labelled AUTO could be charged a number nobody chose for it."""
+    from app.main import SpreadUnavailable, _spread_points
+
+    class _Closed:
+        def is_connected(self):
+            return False
+
+        def connect(self):
+            return False
+
+        def get_live_quote(self, symbol):
+            return None
+
+    with pytest.raises(SpreadUnavailable, match="MetaTrader 5"):
+        _with_bridge(_Closed(), lambda: _spread_points(_COSTS, "XAUUSD", _Instrument()))
+
+
+def test_auto_spread_refuses_when_the_broker_has_no_quote_for_the_symbol():
+    from app.main import SpreadUnavailable, _spread_points
+
+    class _NoQuote:
+        def is_connected(self):
+            return True
+
+        def connect(self):
+            return True
+
+        def get_live_quote(self, symbol):
+            return None
+
+    with pytest.raises(SpreadUnavailable, match="XAUUSD"):
+        _with_bridge(_NoQuote(), lambda: _spread_points(_COSTS, "XAUUSD", _Instrument()))
+
+
+def test_manual_spread_is_the_users_number_per_symbol_and_never_touches_the_terminal():
+    from app.main import _spread_points
+
+    class _Untouchable:
+        def __getattr__(self, name):
+            raise AssertionError("MANUAL must not talk to MetaTrader")
+
+    manual = {**_COSTS, "spread_mode": "MANUAL"}
+    assert _with_bridge(_Untouchable(), lambda: _spread_points(manual, "XAUUSD", _Instrument())) == 600
+    assert _with_bridge(_Untouchable(), lambda: _spread_points(manual, "EURUSD", _Instrument())) == 10.0
