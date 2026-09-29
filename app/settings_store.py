@@ -71,6 +71,13 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
         "max_lot_size": 10.0,
         "max_open_positions": 20,
         "margin_call_pct": 100.0,
+        # The broker's server clock. History is cut into days, H4/D1 bars
+        # and hours on this clock, because that is what the EA sees in
+        # MetaTrader. NY_CLOSE (UTC+2 winter / UTC+3 summer, switching
+        # with US daylight saving) is what nearly every retail broker
+        # runs; FIXED uses `server_gmt_offset_hours` all year.
+        "server_time": "NY_CLOSE",
+        "server_gmt_offset_hours": 2.0,
     },
     "vault_maintenance": {
         "protect_portfolio": True,

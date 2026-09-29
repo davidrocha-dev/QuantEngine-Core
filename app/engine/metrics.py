@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+from app.data.broker_clock import bar_clock
 from app.engine.backtest import BacktestResult, Trade
 
 TRADING_DAYS_PER_YEAR = 252
@@ -257,8 +258,10 @@ def compute_trade_stats(result: BacktestResult, df: pd.DataFrame, initial_balanc
         win_rate=win_rate(result.trades),
         sharpe_ratio=sharpe_ratio(result.equity_curve, pd.DatetimeIndex(df["timestamp"]) if "timestamp" in df else None),
         max_dd_pct=max_drawdown_pct(result.equity_curve),
+        # The broker's day: prop firms reset the daily allowance at server
+        # midnight, not UTC's.
         max_daily_dd_pct=max_daily_drawdown_pct(
-            result.equity_curve, pd.DatetimeIndex(df["timestamp"]) if "timestamp" in df else None
+            result.equity_curve, bar_clock(df) if "timestamp" in df else None
         ),
         net_profit_pct=net_profit_pct(result.equity_curve, initial_balance),
         cagr_pct=cagr_pct(

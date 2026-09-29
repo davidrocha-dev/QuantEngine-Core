@@ -24,6 +24,7 @@ import numba
 import numpy as np
 import pandas as pd
 
+from app.data.broker_clock import bar_clock
 from app.engine.news_filter import EconomicEvent, NewsMode, apply_news_filter
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genes import ALL_GENES
@@ -244,7 +245,8 @@ def simulate_trades(
     # Only the Management genes need these, but deriving them here costs
     # one pass over the series instead of one per trade.
     if genome.management is not None and genome.management.name in ("EOD CLOSE", "FRIDAY PROFIT"):
-        _timestamps = pd.DatetimeIndex(df["timestamp"])
+        # The broker's clock: the hours the EA reads off its own bars.
+        _timestamps = bar_clock(df)
         bar_hours = _timestamps.hour.to_numpy()
         bar_weekdays = _timestamps.dayofweek.to_numpy()
     else:

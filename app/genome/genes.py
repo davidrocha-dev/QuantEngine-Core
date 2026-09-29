@@ -26,6 +26,7 @@ from typing import Callable, Literal
 import numpy as np
 import pandas as pd
 
+from app.data.broker_clock import bar_clock, broker_dates
 from app.indicators import ta
 
 Layer = Literal["signal", "bias", "filter", "execution", "management"]
@@ -188,11 +189,10 @@ def _signal_mom_break(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dic
 
 def _signal_orb(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict) -> pd.Series:
     """ORB — Opening Range Breakout: the opening range is the first
-    `range_bars` bars of each UTC day; a close beyond that range's high/low
+    `range_bars` bars of each broker day; a close beyond that range's high/low
     later in the day fires the breakout direction. Default range_bars=4."""
     range_bars = params.get("range_bars", 4)
-    day = pd.DatetimeIndex(df["timestamp"]).date
-    day_series = pd.Series(day, index=df.index)
+    day_series = broker_dates(df)
     bar_in_day = day_series.groupby(day_series).cumcount()
 
     or_high = df["high"].where(bar_in_day < range_bars).groupby(day_series).transform("max")
@@ -287,11 +287,13 @@ def _bias_chandelier(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict
 
 
 def _bias_daily_mid(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict) -> pd.Series:
-    """DAILY MID — bullish above yesterday's (high+low)/2 midpoint, bearish below."""
-    # dropna: weekend days have no bars — without it, Monday's "yesterday" is an empty Saturday.
-    daily = df.set_index(pd.DatetimeIndex(df["timestamp"])).resample("1D").agg({"high": "max", "low": "min"}).dropna()
+    """DAILY MID — bullish above the previous broker day's (high+low)/2
+    midpoint, bearish below: the EA's D1 bar 1."""
+    # Grouped by the days that have bars, so Monday's "yesterday" is Friday.
+    dates = broker_dates(df)
+    daily = df.groupby(dates).agg(high=("high", "max"), low=("low", "min")).sort_index()
     daily_mid = ((daily["high"] + daily["low"]) / 2).shift(1)
-    mid_series = daily_mid.reindex(pd.DatetimeIndex(df["timestamp"]), method="ffill").set_axis(df.index)
+    mid_series = dates.map(daily_mid).astype(float)
     return pd.Series(np.select([df["close"] > mid_series, df["close"] < mid_series], [1, -1], default=0), index=df.index)
 
 
@@ -384,8 +386,7 @@ def _filter_adr_exhaust(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: d
     move). Default exhaust_pct=0.8 (80%)."""
     exhaust_pct = params.get("exhaust_pct", 0.8)
     adr = ta.average_daily_range(df, params.get("period", 14))
-    day = pd.DatetimeIndex(df["timestamp"]).date
-    day_series = pd.Series(day, index=df.index)
+    day_series = broker_dates(df)
     today_high = df["high"].groupby(day_series).cummax()
     today_low = df["low"].groupby(day_series).cummin()
     today_range = today_high - today_low
@@ -427,9 +428,9 @@ def _filter_keltner(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict)
 
 
 def _filter_no_fri_open(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict) -> pd.Series:
-    """NO FRI OPEN — blocks new entries on Fridays after `cutoff_hour` UTC
-    (avoid weekend gap risk). Default cutoff_hour=18."""
-    timestamps = pd.DatetimeIndex(df["timestamp"])
+    """NO FRI OPEN — blocks new entries on Fridays after `cutoff_hour`
+    broker time (avoid weekend gap risk). Default cutoff_hour=18."""
+    timestamps = bar_clock(df)
     is_friday = timestamps.dayofweek == 4
     after_cutoff = timestamps.hour >= params.get("cutoff_hour", 18)
     return pd.Series(is_friday & after_cutoff, index=df.index)
@@ -519,9 +520,9 @@ EXECUTION_GENES: dict[str, GeneSpec] = {
 # ---------------------------------------------------------------------------
 
 MANAGEMENT_GENES: dict[str, GeneSpec] = {
-    # EOD CLOSE — force-close any open position at `close_hour` UTC.
+    # EOD CLOSE — force-close any open position at `close_hour`, broker time.
     "EOD CLOSE": GeneSpec("EOD CLOSE", "management", {"close_hour": 21}, None, {"close_hour": ("int", 15, 23)}),
-    # FRIDAY PROFIT — if a position is in profit after `lock_hour` UTC on
+    # FRIDAY PROFIT — if a position is in profit after `lock_hour` (broker time) on
     # Friday, close it to avoid weekend gap risk.
     "FRIDAY PROFIT": GeneSpec("FRIDAY PROFIT", "management", {"lock_hour": 18}, None, {"lock_hour": ("int", 12, 21)}),
     # PARTIAL TP — close `close_fraction` of the position at `r_multiple` R

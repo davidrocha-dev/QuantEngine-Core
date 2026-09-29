@@ -14,6 +14,8 @@ import numba
 import numpy as np
 import pandas as pd
 
+from app.data.broker_clock import broker_dates
+
 
 @numba.njit(cache=True)
 def _rolling_mean_abs_deviation(values: np.ndarray, period: int) -> np.ndarray:
@@ -180,10 +182,11 @@ def keltner(df: pd.DataFrame, period: int = 20, atr_mult: float = 2.0) -> tuple[
 
 
 def vwap(df: pd.DataFrame) -> pd.Series:
-    """Session-anchored VWAP, reset at each UTC day boundary."""
+    """Session-anchored VWAP, reset at the broker's midnight - the day
+    boundary MetaTrader's own bars use."""
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
     pv = typical_price * df["volume"]
-    day = pd.DatetimeIndex(df["timestamp"]).date
+    day = broker_dates(df)
     cum_pv = pv.groupby(day).cumsum()
     cum_vol = df["volume"].groupby(day).cumsum()
     return cum_pv / cum_vol.replace(0, np.nan)
@@ -239,12 +242,18 @@ def chandelier_exit(df: pd.DataFrame, period: int = 22, atr_mult: float = 3.0) -
 
 
 def average_daily_range(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """Average Daily Range as a fraction of a resampled daily series, ffilled to bar granularity."""
-    daily = df.set_index(pd.DatetimeIndex(df["timestamp"])).resample("1D").agg({"high": "max", "low": "min"}).dropna()
+    """Average range of the last `period` completed broker days - the D1
+    bars MetaTrader would show - mapped onto every bar of the next day.
+
+    Days are the broker's, not UTC's: a UTC day on a New York close feed
+    includes a two-hour Sunday stub whose tiny range dragged the average
+    down, and the EA reads real D1 bars that have no such day."""
+    dates = broker_dates(df)
+    daily = df.groupby(dates).agg(high=("high", "max"), low=("low", "min")).sort_index()
     # shift(1): a bar only knows *completed* days — today's final range is
     # not known until the day closes (using it would be look-ahead bias).
     daily_range = (daily["high"] - daily["low"]).rolling(period).mean().shift(1)
-    return daily_range.reindex(pd.DatetimeIndex(df["timestamp"]), method="ffill").set_axis(df.index)
+    return dates.map(daily_range).astype(float)
 
 
 def is_bullish_engulfing(df: pd.DataFrame) -> pd.Series:
