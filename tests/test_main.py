@@ -5,8 +5,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 import app.main as main_module
+from app.api import scheduler as api_scheduler
+from app.api.routes import data as data_routes
 from app.main import app
 from app.migrations.runner import run_migrations
+from tests.helpers import patch_api
 
 client = TestClient(app)
 
@@ -44,7 +47,7 @@ def test_vault_empty(tmp_path, monkeypatch):
     from app.migrations.runner import run_migrations
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     response = client.get("/vault")
@@ -107,7 +110,7 @@ def test_data_instruments_lists_full_catalog():
 
 def test_vault_purge_reports_zero_on_empty_vault(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     response = client.post("/vault/purge")
@@ -121,7 +124,7 @@ def test_vault_purge_reports_zero_on_empty_vault(tmp_path, monkeypatch):
 
 def test_recycle_bin_is_empty_by_default(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     response = client.get("/vault/recycle-bin")
@@ -151,7 +154,7 @@ class _FakeConfig:
 
 def test_app_settings_defaults_and_patch_round_trip(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
 
     defaults = client.get("/settings/app")
     assert defaults.status_code == 200
@@ -168,7 +171,7 @@ def test_app_settings_defaults_and_patch_round_trip(tmp_path, monkeypatch):
 
 def test_app_settings_patch_unknown_section_404(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
 
     response = client.post("/settings/app/not_a_section", json={})
     assert response.status_code == 404
@@ -176,7 +179,7 @@ def test_app_settings_patch_unknown_section_404(tmp_path, monkeypatch):
 
 def test_gene_pool_defaults_all_enabled_46_genes(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
 
     response = client.get("/settings/gene-pool")
     assert response.status_code == 200
@@ -188,7 +191,7 @@ def test_gene_pool_defaults_all_enabled_46_genes(tmp_path, monkeypatch):
 
 def test_gene_pool_toggle_persists(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
 
     response = client.post("/settings/gene-pool", json={"genes": {"signal::MACD": False}})
     assert response.status_code == 200
@@ -201,7 +204,7 @@ def test_gene_pool_toggle_persists(tmp_path, monkeypatch):
 
 def test_gene_pool_unknown_gene_400(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
 
     response = client.post("/settings/gene-pool", json={"genes": {"signal::NOT_A_GENE": False}})
     assert response.status_code == 400
@@ -223,9 +226,11 @@ def test_campaign_start_creates_running_campaign_row(tmp_path, monkeypatch):
     from app.migrations.runner import run_migrations
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
-    monkeypatch.setattr(main_module, "_active_campaign_id", None)
-    monkeypatch.setattr(main_module.threading, "Thread", _NoOpThread)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "_active_campaign_id", None)
+    import threading
+
+    monkeypatch.setattr(threading, "Thread", _NoOpThread)
     run_migrations(fake_config.vault_db_path)
 
     response = client.post("/campaign/start")
@@ -242,8 +247,8 @@ def test_campaign_start_creates_running_campaign_row(tmp_path, monkeypatch):
 
 def test_campaign_start_409_when_already_running(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
-    monkeypatch.setattr(main_module, "_active_campaign_id", "already-running-id")
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "_active_campaign_id", "already-running-id")
 
     response = client.post("/campaign/start")
     assert response.status_code == 409
@@ -253,14 +258,14 @@ def test_pausing_when_nothing_is_running_says_so(monkeypatch):
     # Both of these used to answer "not supported" while the campaign
     # carried on regardless. They do the job now; asking with no campaign
     # running is the one case where refusing is still right.
-    monkeypatch.setattr(main_module, "_active_campaign_id", None)
+    patch_api(monkeypatch, "_active_campaign_id", None)
 
     assert client.post("/campaign/pause").status_code == 409
     assert client.post("/campaign/skip").status_code == 409
 
 
 def test_pause_and_skip_raise_the_flags_the_engine_reads(monkeypatch):
-    monkeypatch.setattr(main_module, "_active_campaign_id", "campaign-1")
+    patch_api(monkeypatch, "_active_campaign_id", "campaign-1")
     main_module._campaign_control.clear()
 
     paused = client.post("/campaign/pause").json()
@@ -279,7 +284,7 @@ def test_vault_lists_strategies(tmp_path, monkeypatch):
     from app.models import Strategy
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     engine = main_module.make_engine(fake_config.vault_db_path)
@@ -317,7 +322,7 @@ def test_neural_map_reports_not_ready_below_minimum_population(tmp_path, monkeyp
     from app.models import Strategy
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     engine = main_module.make_engine(fake_config.vault_db_path)
@@ -373,7 +378,7 @@ def test_vault_full_shape_includes_mechanism_and_active_genes(tmp_path, monkeypa
     from sqlalchemy.orm import Session as OrmSession
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     with OrmSession(main_module.make_engine(fake_config.vault_db_path)) as session:
@@ -390,7 +395,7 @@ def test_delete_strategy_removes_row(tmp_path, monkeypatch):
     from sqlalchemy.orm import Session as OrmSession
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     with OrmSession(main_module.make_engine(fake_config.vault_db_path)) as session:
@@ -405,7 +410,7 @@ def test_delete_unknown_strategy_404(tmp_path, monkeypatch):
     from app.migrations.runner import run_migrations
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     assert client.delete("/vault/nope").status_code == 404
@@ -418,7 +423,7 @@ def test_parity_test_on_a_strategy_that_does_not_exist(tmp_path, monkeypatch):
     from app.migrations.runner import run_migrations
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     assert client.post("/vault/nope/parity-test").status_code == 404
@@ -429,7 +434,7 @@ def test_portfolio_create_list_and_add_strategy(tmp_path, monkeypatch):
     from sqlalchemy.orm import Session as OrmSession
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     with OrmSession(main_module.make_engine(fake_config.vault_db_path)) as session:
@@ -455,7 +460,7 @@ def test_add_to_portfolio_unknown_strategy_404(tmp_path, monkeypatch):
     from app.migrations.runner import run_migrations
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     created = client.post("/portfolios", json={"name": "Core"})
@@ -511,7 +516,7 @@ def _simple_genome(**overrides) -> dict:
 
 def test_export_mql5_writes_the_ea_to_the_chosen_folder(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     _seed_deployable_strategy(fake_config, _simple_genome())
     destination = tmp_path / "exports"
 
@@ -525,7 +530,7 @@ def test_export_mql5_writes_the_ea_to_the_chosen_folder(tmp_path, monkeypatch):
 
 def test_export_refuses_a_genome_whose_gene_has_no_mql5_equivalent(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     _seed_deployable_strategy(fake_config, _simple_genome(filters=[{"name": "EVENT", "params": {"mode": "FTMO"}}]))
 
     response = client.post("/vault/%23DEP001/export-mql5", json={"destination_dir": str(tmp_path / "out")})
@@ -542,7 +547,7 @@ def test_deploy_installs_the_ea_and_marks_the_strategy_deployed(tmp_path, monkey
     from app.models import Strategy
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     _seed_deployable_strategy(fake_config, _simple_genome())
 
     captured = {}
@@ -551,7 +556,7 @@ def test_deploy_installs_the_ea_and_marks_the_strategy_deployed(tmp_path, monkey
         captured["filename"], captured["source"] = filename, source
         return InstallResult(installed_paths=["C:/fake/QE_DEP001.mq5"], detail="Installed into 1 terminal(s).")
 
-    monkeypatch.setattr(main_module, "install_ea", fake_install)
+    patch_api(monkeypatch, "install_ea", fake_install)
 
     response = client.post("/deploy/%23DEP001")
 
@@ -573,10 +578,10 @@ def test_deploy_reports_a_conflict_when_no_terminal_is_installed(tmp_path, monke
     from app.broker.mt5_install import InstallResult
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     _seed_deployable_strategy(fake_config, _simple_genome())
-    monkeypatch.setattr(
-        main_module, "install_ea", lambda *a, **k: InstallResult(detail="No MetaTrader 5 terminal data directory was found.")
+    patch_api(
+        monkeypatch, "install_ea", lambda *a, **k: InstallResult(detail="No MetaTrader 5 terminal data directory was found.")
     )
 
     response = client.post("/deploy/%23DEP001")
@@ -587,7 +592,7 @@ def test_deploy_reports_a_conflict_when_no_terminal_is_installed(tmp_path, monke
 
 def test_deploy_unknown_strategy_404(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     assert client.post("/deploy/%23NOPE").status_code == 404
@@ -640,7 +645,7 @@ def _seed_portfolio_with_members(config, member_count: int = 2) -> str:
 
 def test_portfolio_detail_lists_its_members(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     portfolio_id = _seed_portfolio_with_members(fake_config)
 
     response = client.get(f"/portfolios/{portfolio_id}")
@@ -653,7 +658,7 @@ def test_portfolio_detail_lists_its_members(tmp_path, monkeypatch):
 
 def test_portfolio_health_reports_correlation_and_a_grade(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     portfolio_id = _seed_portfolio_with_members(fake_config)
 
     response = client.get(f"/portfolios/{portfolio_id}/health")
@@ -668,7 +673,7 @@ def test_portfolio_health_reports_correlation_and_a_grade(tmp_path, monkeypatch)
 
 def test_portfolio_list_reports_member_counts(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     _seed_portfolio_with_members(fake_config, member_count=2)
 
     body = client.get("/portfolios").json()
@@ -678,7 +683,7 @@ def test_portfolio_list_reports_member_counts(tmp_path, monkeypatch):
 
 def test_removing_a_member_leaves_the_strategy_in_the_vault(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     portfolio_id = _seed_portfolio_with_members(fake_config)
 
     removed = client.delete(f"/portfolios/{portfolio_id}/members/%23MEM0")
@@ -691,7 +696,7 @@ def test_removing_a_member_leaves_the_strategy_in_the_vault(tmp_path, monkeypatc
 
 def test_deleting_a_portfolio_keeps_its_strategies(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     portfolio_id = _seed_portfolio_with_members(fake_config)
 
     assert client.delete(f"/portfolios/{portfolio_id}").status_code == 200
@@ -701,7 +706,7 @@ def test_deleting_a_portfolio_keeps_its_strategies(tmp_path, monkeypatch):
 
 def test_unknown_portfolio_health_404(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     assert client.get("/portfolios/nope/health").status_code == 404
@@ -734,7 +739,7 @@ def _seed_vault_for_analytics(config) -> None:
 
 def test_analytics_reports_vault_wide_kpis(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     _seed_vault_for_analytics(fake_config)
 
     body = client.get("/analytics").json()
@@ -748,7 +753,7 @@ def test_analytics_reports_vault_wide_kpis(tmp_path, monkeypatch):
 
 def test_analytics_breakdowns_group_and_rank_by_size(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     _seed_vault_for_analytics(fake_config)
 
     body = client.get("/analytics").json()
@@ -762,7 +767,7 @@ def test_analytics_breakdowns_group_and_rank_by_size(tmp_path, monkeypatch):
 
 def test_analytics_top_performers_are_ranked_by_score(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     _seed_vault_for_analytics(fake_config)
 
     top = client.get("/analytics?top=2").json()["top_performers"]
@@ -774,7 +779,7 @@ def test_analytics_on_an_empty_vault_is_all_nulls_not_zeros(tmp_path, monkeypatc
     # An empty Vault has no average return; reporting 0.0% would read as a
     # measured result.
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     body = client.get("/analytics").json()
@@ -789,10 +794,9 @@ def _seed_strategy_for_revalidation(config, monkeypatch, bars: int = 6_000) -> N
     """A Vault row plus enough synthetic history for a re-check to run."""
     from sqlalchemy.orm import Session
 
-    import app.main as main
     from app.db import make_engine
     from app.models import Strategy
-    from tests.helpers import make_synthetic_ohlc
+    from tests.helpers import make_synthetic_ohlc, patch_api
 
     run_migrations(config.vault_db_path)
     genome = {
@@ -816,12 +820,12 @@ def _seed_strategy_for_revalidation(config, monkeypatch, bars: int = 6_000) -> N
         session.commit()
 
     df = make_synthetic_ohlc(bars, seed=12, drift=0.0004, volatility=0.002)
-    monkeypatch.setattr(main, "_load_bars", lambda *a, **k: df)
+    patch_api(monkeypatch, "_load_bars", lambda *a, **k: df)
 
 
 def test_refresh_restates_the_strategy_against_current_data(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     _seed_strategy_for_revalidation(fake_config, monkeypatch)
 
     response = client.post("/vault/%23REV001/refresh")
@@ -837,7 +841,7 @@ def test_refresh_restates_the_strategy_against_current_data(tmp_path, monkeypatc
 
 def test_reassess_reapplies_the_phase_4_gates_and_rescores(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     _seed_strategy_for_revalidation(fake_config, monkeypatch)
 
     body = client.post("/vault/%23REV001/reassess").json()
@@ -851,13 +855,12 @@ def test_reassess_reapplies_the_phase_4_gates_and_rescores(tmp_path, monkeypatch
 
 
 def test_revalidation_refuses_when_there_is_not_enough_history(tmp_path, monkeypatch):
-    import app.main as main
     from tests.helpers import make_synthetic_ohlc
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     _seed_strategy_for_revalidation(fake_config, monkeypatch)
-    monkeypatch.setattr(main, "_load_bars", lambda *a, **k: make_synthetic_ohlc(500))
+    patch_api(monkeypatch, "_load_bars", lambda *a, **k: make_synthetic_ohlc(500))
 
     response = client.post("/vault/%23REV001/reassess")
 
@@ -867,22 +870,21 @@ def test_revalidation_refuses_when_there_is_not_enough_history(tmp_path, monkeyp
 
 def test_revalidating_an_unknown_strategy_404(tmp_path, monkeypatch):
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     assert client.post("/vault/%23NOPE/refresh").status_code == 404
 
 
 def test_true_sim_replays_the_members_on_one_account(tmp_path, monkeypatch):
-    import app.main as main
     from tests.helpers import make_synthetic_ohlc
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     portfolio_id = _seed_portfolio_with_members(fake_config)
     # Members seeded for health tests carry "{}" genomes; give them real ones.
     _give_members_real_genomes(fake_config)
-    monkeypatch.setattr(main, "_load_bars", lambda *a, **k: make_synthetic_ohlc(3_000, seed=31, drift=0.0004))
+    patch_api(monkeypatch, "_load_bars", lambda *a, **k: make_synthetic_ohlc(3_000, seed=31, drift=0.0004))
 
     response = client.post(f"/portfolios/{portfolio_id}/true-sim", json={"sizing": "COMPOUNDING", "max_aggregate_risk_pct": 5.0})
 
@@ -927,7 +929,7 @@ def test_true_sim_on_an_empty_portfolio_is_a_conflict(tmp_path, monkeypatch):
     from app.models import Portfolio
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
     engine = make_engine(fake_config.vault_db_path)
     with Session(engine) as session:
@@ -954,7 +956,7 @@ def test_deleting_a_strategy_by_hand_is_recoverable(tmp_path, monkeypatch):
     from app.models import Strategy
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     engine = main_module.make_engine(fake_config.vault_db_path)
@@ -1005,7 +1007,7 @@ def test_sync_now_accepts_the_body_the_app_actually_sends():
             captured["symbols"] = symbols
             return {}
 
-    with patch.object(main_module, "DeltaSyncRunner", FakeRunner):
+    with patch.object(data_routes, "DeltaSyncRunner", FakeRunner), patch.object(api_scheduler, "DeltaSyncRunner", FakeRunner):
         with TestClient(main_module.app) as client:
             main_module._sync_state.running = False
             response = client.post("/data/sync", json={})
@@ -1042,7 +1044,7 @@ def test_a_running_sync_can_be_stopped():
             finally:
                 main_module._sync_state.running = False
 
-    with patch.object(main_module, "DeltaSyncRunner", SlowRunner):
+    with patch.object(data_routes, "DeltaSyncRunner", SlowRunner), patch.object(api_scheduler, "DeltaSyncRunner", SlowRunner):
         with TestClient(main_module.app) as client:
             main_module._sync_state.running = False
             assert client.post("/data/sync", json={"symbols": ["XAUUSD"]}).status_code == 200
@@ -1082,9 +1084,9 @@ def test_status_keeps_the_last_campaign_once_it_finishes(tmp_path, monkeypatch):
     from app.models import Campaign
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
-    monkeypatch.setattr(main_module, "_active_campaign_id", None)
+    patch_api(monkeypatch, "_active_campaign_id", None)
 
     started = datetime.now(timezone.utc) - timedelta(minutes=5)
     with Session(make_engine(fake_config.vault_db_path)) as session:
@@ -1124,7 +1126,7 @@ def test_true_sim_replays_the_same_window_the_combined_curve_describes(tmp_path,
     from tests.helpers import make_synthetic_ohlc
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     portfolio_id = _seed_portfolio_with_members(fake_config, member_count=2)
 
     full = make_synthetic_ohlc(4_000, seed=5)
@@ -1139,8 +1141,8 @@ def test_true_sim_replays_the_same_window_the_combined_curve_describes(tmp_path,
             blocked_by_symbol_lock=0, blocked_by_aggregate_risk=0,
         )
 
-    monkeypatch.setattr(main_module, "_load_bars", lambda *a, **k: full)
-    monkeypatch.setattr(main_module, "run_true_sim", capture)
+    patch_api(monkeypatch, "_load_bars", lambda *a, **k: full)
+    patch_api(monkeypatch, "run_true_sim", capture)
 
     response = client.post(f"/portfolios/{portfolio_id}/true-sim", json={})
     assert response.status_code == 200, response.text
@@ -1167,7 +1169,7 @@ def test_a_stale_campaign_id_does_not_report_a_phantom_run(tmp_path, monkeypatch
     from app.models import Campaign
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
 
     campaign_id = uuid.uuid4().hex
@@ -1182,7 +1184,7 @@ def test_a_stale_campaign_id_does_not_report_a_phantom_run(tmp_path, monkeypatch
         session.commit()
 
     # The global still points at it, as it would after a crash.
-    monkeypatch.setattr(main_module, "_active_campaign_id", campaign_id)
+    patch_api(monkeypatch, "_active_campaign_id", campaign_id)
 
     body = client.get("/status").json()
 
@@ -1211,9 +1213,9 @@ def test_emptying_the_vault_is_recoverable_and_guarded(tmp_path, monkeypatch):
     from app.models import Campaign, Strategy
 
     fake_config = _FakeConfig(tmp_path)
-    monkeypatch.setattr(main_module, "get_config", lambda: fake_config)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
     run_migrations(fake_config.vault_db_path)
-    monkeypatch.setattr(main_module, "_active_campaign_id", None)
+    patch_api(monkeypatch, "_active_campaign_id", None)
 
     engine = make_engine(fake_config.vault_db_path)
     with Session(engine) as session:

@@ -137,10 +137,12 @@ def test_the_two_signals_multiply(tmp_path, monkeypatch):
     failing. A gene can be absent from the Vault for either reason."""
     from app.config import EngineConfig
     import app.main as main_module
+    from app.engine import smart_mode
+    from tests.helpers import patch_api
 
-    monkeypatch.setattr(main_module, "get_config", lambda: EngineConfig(data_dir=tmp_path))
+    patch_api(monkeypatch, "get_config", lambda: EngineConfig(data_dir=tmp_path))
     monkeypatch.setattr(
-        main_module.smart_mode, "load", lambda _dir: type("F", (), {"weights": {"signal::BAD": 2.0}})()
+        smart_mode, "load", lambda _dir: type("F", (), {"weights": {"signal::BAD": 2.0}})()
     )
     save(
         tmp_path,

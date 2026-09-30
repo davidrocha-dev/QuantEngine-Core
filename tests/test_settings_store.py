@@ -104,14 +104,14 @@ class _Instrument:
 
 
 def _with_bridge(bridge, fn):
-    import app.main as main
+    import app.api.costs as costs
 
-    original = main._mt5_bridge
-    main._mt5_bridge = bridge
+    original = costs._mt5_bridge
+    costs._mt5_bridge = bridge
     try:
         return fn()
     finally:
-        main._mt5_bridge = original
+        costs._mt5_bridge = original
 
 
 def test_auto_spread_is_read_from_metatrader():

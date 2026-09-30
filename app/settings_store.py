@@ -128,7 +128,7 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
         "crash_reporting_enabled": False,
     },
     # AUTOMATION (Elite) — tasks.md 12.2/12.6. The scheduler in
-    # app/main.py reads these; `last_*_at` are written by it, not by the UI.
+    # app/api/scheduler.py reads these; `last_*_at` are written by it, not by the UI.
     "automation": {
         "recurring_campaigns_enabled": False,
         "recurring_interval_hours": 24,

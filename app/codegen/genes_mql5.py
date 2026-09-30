@@ -276,7 +276,7 @@ def _filter(name: str, params: dict, index: int) -> GeneCode:
         # without it, and that is what the EA must trade. It used to veto
         # on the EA's own losing streak, which never resets once trading
         # stops: after N losses in a row the EA was switched off for good.
-        # Campaigns no longer draw it (main._gene_pool_for_campaign).
+        # Campaigns no longer draw it (app/api/campaign_setup.py, _gene_pool_for_campaign).
         return GeneCode(veto_expr="false")
 
     if name == "DOJI":
