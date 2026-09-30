@@ -1,4 +1,5 @@
 import random
+import re
 
 import pytest
 
@@ -314,3 +315,88 @@ def test_htf_bias_follows_the_context_the_strategy_was_bred_with():
     manual = generate_ea(genome, "#HTF", "EURUSD", "M15", higher_timeframe="H4").source
     assert "ENUM_TIMEFRAMES HigherTimeframe() { return PERIOD_H4; }" in manual
     assert "HtfClose(1) > Val(" in manual
+
+
+# --- Structural checks on every gene's code ------------------------------
+#
+# The template is only ever compiled by MetaEditor on the user's machine,
+# so a slip in it (an unbalanced brace, a Python value rendered into C,
+# a function called that is never defined) surfaces there, after the
+# strategy has been bred. These catch those shapes here, for every gene
+# in every layer and every execution x management pair.
+
+_MQL5_BUILTINS = {
+    "if", "for", "while", "switch", "return", "sizeof", "PrintFormat", "Print", "Alert", "Comment",
+}
+
+
+def _strip_comments_and_strings(source: str) -> str:
+    source = re.sub(r"//[^\n]*", "", source)
+    source = re.sub(r"/\*.*?\*/", "", source, flags=re.S)
+    return re.sub(r'"(?:\\.|[^"\\])*"', '""', source)
+
+
+def _structural_problems(source: str) -> list[str]:
+    problems = []
+    code = _strip_comments_and_strings(source)
+    for opening, closing in ("()", "{}", "[]"):
+        if code.count(opening) != code.count(closing):
+            problems.append(f"unbalanced {opening}{closing}: {code.count(opening)} vs {code.count(closing)}")
+    for leftover in ("{{", "}}", "{%", "%}", "None", "True", "False", "nan", "inf"):
+        if re.search(rf"(?<![A-Za-z_]){re.escape(leftover)}(?![A-Za-z_])", code):
+            problems.append(f"template or Python leftover: {leftover}")
+    defined = set(re.findall(r"^\s*(?:static\s+)?[A-Za-z_][\w]*\s+([A-Z][A-Za-z0-9_]*)\s*\(", code, flags=re.M))
+    called = set(re.findall(r"(?<![\w.])([A-Z][A-Za-z0-9_]*)\s*\(", code))
+    # MQL5's own functions (iMA, SymbolInfoDouble, Trade.Buy via member
+    # access, ...) are excluded by the patterns: calls starting with a
+    # capital that the EA itself must define are what is checked.
+    mql5_api = {
+        "AccountInfoDouble", "SymbolInfoDouble", "SymbolInfoInteger", "SymbolInfoString", "PositionGetTicket",
+        "PositionGetDouble", "PositionGetInteger", "PositionGetString", "PositionSelectByTicket", "PositionsTotal",
+        "OrderGetTicket", "OrderGetInteger", "OrderGetDouble", "OrderGetString", "OrdersTotal", "OrderSelect",
+        "HistorySelect", "HistoryDealsTotal", "HistoryDealGetTicket", "HistoryDealGetInteger",
+        "HistoryDealGetDouble", "HistoryDealGetString", "CopyBuffer", "CopyRates", "CopyClose", "CopyHigh",
+        "CopyLow", "CopyOpen", "CopyTime", "IndicatorRelease", "TimeCurrent", "TimeTradeServer", "TimeGMT",
+        "TimeToStruct", "StructToTime", "TimeToString", "MathAbs", "MathMax", "MathMin", "MathFloor", "MathCeil",
+        "MathRound", "MathLog10", "MathPow", "MathSqrt", "NormalizeDouble", "DoubleToString", "IntegerToString",
+        "StringToInteger", "StringToDouble", "StringFormat", "StringLen", "StringFind", "StringSubstr",
+        "FileOpen", "FileClose", "FileIsEnding", "FileReadString", "FileWriteString", "FileWrite",
+        "GetLastError", "ResetLastError", "EventSetTimer", "EventKillTimer", "ArraySetAsSeries", "ArrayResize",
+        "ArraySize", "ArrayInitialize", "SeriesInfoInteger", "Bars", "MQLInfoInteger", "TerminalInfoInteger",
+        "AccountInfoInteger", "AccountInfoString", "PeriodSeconds", "Period", "Symbol", "ChartID",
+        "SymbolSelect", "OrderCalcMargin", "OrderCheck", "OrderSend", "ZeroMemory", "IsStopped",
+    }
+    missing = sorted(called - defined - mql5_api - _MQL5_BUILTINS)
+    if missing:
+        problems.append(f"called but never defined: {missing}")
+    return problems
+
+
+def _every_gene_genome():
+    base = make_genome()
+    for (layer, name), spec in ALL_GENES.items():
+        if (layer, name) == ("filter", "EVENT"):
+            continue  # refused on purpose (test above)
+        choice = GeneChoice(name, dict(spec.default_params))
+        if layer == "signal":
+            yield f"{layer}:{name}", Genome(**{**vars(base), "signal": choice})
+        elif layer == "bias":
+            yield f"{layer}:{name}", Genome(**{**vars(base), "bias": choice})
+        elif layer == "filter":
+            yield f"{layer}:{name}", Genome(**{**vars(base), "filters": [choice]})
+    for execution in ("MARKET2", "LIMIT", "LIMIT2", "STOP"):
+        for management in (None, "EOD CLOSE", "FRIDAY PROFIT", "PARTIAL TP"):
+            yield f"{execution}+{management}", Genome(**{
+                **vars(base),
+                "execution": GeneChoice(execution, dict(ALL_GENES[("execution", execution)].default_params)),
+                "management": (
+                    GeneChoice(management, dict(ALL_GENES[("management", management)].default_params))
+                    if management else None
+                ),
+            })
+
+
+@pytest.mark.parametrize("label,genome", list(_every_gene_genome()), ids=lambda value: value if isinstance(value, str) else "")
+def test_every_gene_renders_structurally_sound_mql5(label, genome):
+    source = generate_ea(genome, "#SHAPE", "EURUSD", "H1", default_risk_share=0.25).source
+    assert _structural_problems(source) == [], label

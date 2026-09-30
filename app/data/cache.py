@@ -78,7 +78,20 @@ class LocalCache:
         return json.loads(self._config.manifest_path.read_text())
 
     def write_manifest(self, manifest: dict[str, dict | str]) -> None:
-        self._config.manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        # Through a temporary file, like the bars: written in place, a
+        # crash or a closed laptop mid-write left half a JSON document, and
+        # every sync after that failed on reading it.
+        path = self._config.manifest_path
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+        for attempt in range(WRITE_REPLACE_RETRIES):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == WRITE_REPLACE_RETRIES - 1:
+                    raise
+                time.sleep(WRITE_REPLACE_BACKOFF_SECONDS)
 
     def _entry(self, symbol: str) -> dict[str, str]:
         """One symbol's synced range.
