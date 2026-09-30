@@ -1017,6 +1017,12 @@ def _serialize_strategy(row: Strategy, *, full: bool) -> dict:
         # placeholder: the share of test windows the strategy was
         # profitable in (null when the history was too short to fold).
         "persistence_pct": row.persistence_pct,
+        # The final holdout: never seen by the search, never gated on.
+        "holdout_return_pct": row.holdout_return_pct,
+        "holdout_trades": row.holdout_trades,
+        "holdout_profit_factor": row.holdout_profit_factor,
+        "holdout_max_dd_pct": row.holdout_max_dd_pct,
+        "holdout_start": row.holdout_start,
         "icir": row.icir,
         "avg_hold_hours": row.avg_hold_hours,
         "score": row.score,

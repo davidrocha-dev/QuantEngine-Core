@@ -315,8 +315,15 @@ def evaluate_robustness(
     # reported: p10 and p90 travel with the result and reach the
     # Inspector, where a range of 15 to 88 says something about a
     # strategy that "72%" on its own hides.
+    # The median of a bootstrap sits on the baseline by construction, so
+    # the degradation test above almost never fails - it could not tell a
+    # real edge from a handful of lucky trades. The 5th percentile can:
+    # when one resample in twenty loses money, the out-of-sample return is
+    # not distinguishable from zero at 95%, whatever its median says.
+    mc_significant = mc_p5 > 0
     passed = (
         baseline_return > 0
+        and mc_significant
         and mc_degradation <= DEGRADATION_DISCARD_THRESHOLD_PCT
         and noise_degradation <= DEGRADATION_DISCARD_THRESHOLD_PCT
     )
@@ -324,6 +331,8 @@ def evaluate_robustness(
     if not passed:
         if baseline_return <= 0:
             fail_reason = "no out-of-sample edge (baseline OOS return is not positive)"
+        elif not mc_significant:
+            fail_reason = "Monte Carlo: 1 in 20 resampled trade sequences loses money (edge not significant at 95%)"
         else:
             worst = "Monte Carlo" if mc_degradation > noise_degradation else "noise injection"
             fail_reason = f"{worst} degradation exceeds {DEGRADATION_DISCARD_THRESHOLD_PCT}% threshold"

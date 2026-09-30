@@ -155,6 +155,17 @@ MIGRATIONS: tuple[Migration, ...] = (
         description="The higher-timeframe context a strategy was bred with, so its EA reads the same one",
         statements=("ALTER TABLE strategies ADD COLUMN higher_timeframe TEXT",),
     ),
+    Migration(
+        version=12,
+        description="The final holdout: history no phase saw and nothing gated on, measured once after approval",
+        statements=(
+            "ALTER TABLE strategies ADD COLUMN holdout_return_pct REAL",
+            "ALTER TABLE strategies ADD COLUMN holdout_trades INTEGER",
+            "ALTER TABLE strategies ADD COLUMN holdout_profit_factor REAL",
+            "ALTER TABLE strategies ADD COLUMN holdout_max_dd_pct REAL",
+            "ALTER TABLE strategies ADD COLUMN holdout_start TEXT",
+        ),
+    ),
 )
 
 CURRENT_SCHEMA_VERSION = max(m.version for m in MIGRATIONS)

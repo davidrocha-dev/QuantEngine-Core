@@ -5,6 +5,7 @@ from app.engine.phases import (
     run_phase_1_stability,
     run_phase_2_expansion,
     run_phase_3_hybridization,
+    passes_phase_0_screening,
     run_phase_4_robustness,
     split_is_oos,
 )
@@ -91,8 +92,13 @@ def test_phase_3_produces_tribe_c_children():
     outcome = run_phase_3_hybridization(candidates[:5], candidates[5:], pool, df, num_children=6, timeframe="H1")
 
     assert outcome.passed
-    assert len(outcome.survivors) == 6
-    assert all(c.tribe == "C" for c in outcome.survivors)
+    hybrids = [c for c in outcome.survivors if c.tribe == "C"]
+    elites = [c for c in outcome.survivors if c.tribe != "C"]
+    # Every hybrid is either screened in or rejected with a reason...
+    assert len(hybrids) + len(outcome.rejected) == 6
+    assert all(passes_phase_0_screening(c.stats, c.result)[0] for c in hybrids)
+    # ...and both tribes' best go to Phase 4 beside them.
+    assert [c.genome for c in elites] == [c.genome for c in candidates]
 
 
 def test_phase_4_returns_vault_candidates_with_hash_ids():

@@ -218,3 +218,43 @@ def test_phase_4_reports_every_gate_it_rejected_on_not_just_two():
 
 def test_an_outcome_with_nothing_to_explain_carries_no_rejections():
     assert PhaseOutcome(passed=True).rejections == {}
+
+
+def test_the_newest_history_is_kept_back_from_the_whole_search(session, monkeypatch):
+    """The final holdout: screening, breeding and every Phase 4 gate run on
+    the older 85%; the newest 15% is only ever measured, after approval."""
+    import app.engine.campaign as campaign_module
+    from app.engine.phases import HOLDOUT_FRACTION, IS_FRACTION
+
+    make_campaign_row(session, "c1")
+    df = make_synthetic_ohlc(6000, seed=3)
+    seen = {}
+
+    def screening(population, is_df, gene_pool, **kwargs):
+        seen["last_bar"] = is_df["timestamp"].iloc[-1]
+        seen["bars"] = len(is_df)
+        return PhaseOutcome(passed=True, survivors=[])
+
+    monkeypatch.setattr(campaign_module, "run_phase_0_screening", screening)
+    run_campaign(session, "c1", df, GenePoolConfig(), CampaignConfig(population_size=5))
+
+    search_bars = int(len(df) * (1 - HOLDOUT_FRACTION))
+    assert seen["bars"] == int(search_bars * IS_FRACTION)
+    assert seen["last_bar"] < df["timestamp"].iloc[search_bars]
+
+
+def test_a_short_history_keeps_no_holdout_rather_than_starving_the_search(session, monkeypatch):
+    import app.engine.campaign as campaign_module
+    from app.engine.phases import IS_FRACTION
+
+    make_campaign_row(session, "c1")
+    df = make_synthetic_ohlc(4500, seed=3)  # 85% of it would leave too few in-sample bars
+    seen = {}
+
+    def screening(population, is_df, gene_pool, **kwargs):
+        seen["bars"] = len(is_df)
+        return PhaseOutcome(passed=True, survivors=[])
+
+    monkeypatch.setattr(campaign_module, "run_phase_0_screening", screening)
+    run_campaign(session, "c1", df, GenePoolConfig(), CampaignConfig(population_size=5))
+    assert seen["bars"] == int(len(df) * IS_FRACTION)

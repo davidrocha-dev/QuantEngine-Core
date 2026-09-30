@@ -35,6 +35,13 @@ from app.genome.genome import Genome, crossover, mutate
 logger = logging.getLogger(__name__)
 
 IS_FRACTION = 0.7
+# The most recent share of history, kept back from the whole search -
+# screening, breeding and the Phase 4 gates alike. See run_campaign.
+HOLDOUT_FRACTION = 0.15
+# Tribe A and B's best, sent to Phase 4 beside the hybrids. They are the
+# strongest strategies the search produced, and until now only their
+# children were ever tested out of sample.
+PHASE_4_ELITES_PER_TRIBE = 20
 DEFAULT_INITIAL_BALANCE = 10_000.0
 DEFAULT_RISK_PCT = 0.01
 DEFAULT_ELITE_FRACTION = 0.2
@@ -90,6 +97,11 @@ class VaultCandidate:
     # aggregates and a curve, which ranks a strategy but cannot answer a
     # question about it without re-simulating the whole window.
     trades: list = field(default_factory=list)
+    # The final holdout: the most recent slice of history, which no phase
+    # ever sees and nothing gates on. Measured once, after approval, so it
+    # is the one number about this strategy that selection has not touched.
+    stats_holdout: TradeStats | None = None
+    holdout_start: str | None = None
 
 
 EQUITY_CURVE_MAX_POINTS = 500
@@ -111,6 +123,13 @@ def serialize_equity_curve(df: pd.DataFrame, curve, max_points: int = EQUITY_CUR
     if indices[-1] != length - 1:
         indices.append(length - 1)
     return [{"t": timestamps[i].isoformat(), "equity": round(float(curve[i]), 2)} for i in indices]
+
+
+def split_holdout(df: pd.DataFrame, holdout_fraction: float = HOLDOUT_FRACTION) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Search history and final holdout, chronologically: the holdout is
+    the most recent `holdout_fraction` of bars."""
+    cut = int(len(df) * (1 - holdout_fraction))
+    return df.iloc[:cut].reset_index(drop=True), df.iloc[cut:].reset_index(drop=True)
 
 
 def split_is_oos(df: pd.DataFrame, is_fraction: float = IS_FRACTION) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -237,6 +256,17 @@ def run_phase_0_screening(
 GenerationCheckpointCallback = Callable[[int, list[CandidateResult]], None]
 
 
+def _unique(candidates: list[CandidateResult]) -> list[CandidateResult]:
+    seen: set[str] = set()
+    unique = []
+    for candidate in candidates:
+        key = candidate.genome.fingerprint()
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return unique
+
+
 def run_generational_phase(
     seed_survivors: list[CandidateResult],
     fitness_fn: Callable[[TradeStats], float],
@@ -271,6 +301,7 @@ def run_generational_phase(
         for candidate in population:
             candidate.fitness = fitness_fn(candidate.stats)
             candidate.tribe = tribe_label
+    population = _unique(population)
     population.sort(key=lambda c: c.fitness, reverse=True)
     population = population[:max_population]
 
@@ -328,7 +359,11 @@ def run_generational_phase(
                 candidate.fitness = fitness_fn(candidate.stats)
                 candidate.tribe = tribe_label
 
-            population = elites + children
+            # One copy of each strategy. Crossover of a small elite makes
+            # exact clones, and every clone took an elite slot: within a
+            # few generations the parents were mostly the same genome and
+            # the tribe had stopped searching.
+            population = _unique(elites + children)
             population.sort(key=lambda c: c.fitness, reverse=True)
 
             if on_generation_complete is not None:
@@ -358,7 +393,7 @@ def run_phase_1_stability(
     control: "CampaignControl | None" = None,
     **eval_kwargs,
 ) -> PhaseOutcome:
-    """REQ-ENGINE-3.3 — Tribe A, ranked by F1 = (Net Profit / Max DD%) × Win Rate × Sharpe."""
+    """REQ-ENGINE-3.3 — Tribe A, ranked by F1 = (Net Profit / Max DD%) × SQN (see fitness.py)."""
     return run_generational_phase(
         phase_0_survivors, fitness_f1_stability, "A", gene_pool, df, generations, top_n,
         on_generation_complete=on_generation_complete, start_generation=start_generation,
@@ -379,7 +414,7 @@ def run_phase_2_expansion(
     control: "CampaignControl | None" = None,
     **eval_kwargs,
 ) -> PhaseOutcome:
-    """REQ-ENGINE-3.4 — Tribe B, ranked by F2 = CAGR% × Profit Factor × Payoff Ratio.
+    """REQ-ENGINE-3.4 — Tribe B, ranked by F2 = CAGR% × min(Profit Factor, 3) (see fitness.py).
     Runs on the same Phase 0 survivor pool as Phase 1, independently (design.md B.5: "parallel with Phase 1")."""
     return run_generational_phase(
         phase_0_survivors, fitness_f2_expansion, "B", gene_pool, df, generations, top_n,
@@ -413,10 +448,27 @@ def run_phase_3_hybridization(
         crossover(tribe_a[i % len(tribe_a)].genome, tribe_b[i % len(tribe_b)].genome) for i in range(num_children)
     ]
     children = evaluate_population(child_genomes, df, gene_pool, max_workers=max_workers, **eval_kwargs)
+
+    # Hybrids used to go to Phase 4 unscreened: a cross of one tribe's
+    # signal with the other's exit could lose money in-sample and still be
+    # approved on the out-of-sample window alone - selection on OOS, which
+    # makes the OOS figures in the Vault a best-of-N rather than a test.
+    # A hybrid now has to clear the same bar every Phase 0 candidate did.
+    survivors, rejected = [], []
     for candidate in children:
         candidate.tribe = "C"
+        ok, reason = passes_phase_0_screening(candidate.stats, candidate.result)
+        if ok:
+            survivors.append(candidate)
+        else:
+            rejected.append((candidate.genome, reason or "screening failed"))
 
-    return PhaseOutcome(passed=True, survivors=children)
+    # And the tribes' own best go too. Phase 4 deduplicates by content,
+    # so a hybrid identical to a parent is only tested once.
+    for tribe in (tribe_a, tribe_b):
+        survivors.extend(tribe[:PHASE_4_ELITES_PER_TRIBE])
+
+    return PhaseOutcome(passed=True, survivors=survivors, rejected=rejected)
 
 
 def run_phase_4_robustness(

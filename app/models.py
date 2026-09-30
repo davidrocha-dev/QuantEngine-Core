@@ -62,6 +62,14 @@ class Strategy(Base):
     # "OFF" when HIGHER TF was disabled (the HTF bias is then neutral), or
     # NULL for rows written before this was recorded.
     higher_timeframe: Mapped[str | None] = mapped_column(String)
+    # The final holdout (app/engine/campaign.py): the newest slice of
+    # history, never seen by the search and never used to decide anything.
+    # NULL when the history was too short to keep one back.
+    holdout_return_pct: Mapped[float | None]
+    holdout_trades: Mapped[int | None] = mapped_column(Integer)
+    holdout_profit_factor: Mapped[float | None]
+    holdout_max_dd_pct: Mapped[float | None]
+    holdout_start: Mapped[str | None] = mapped_column(String)
     # REQ-PORT-3 — the stage this bot has actually been promoted to. Null
     # means it has never been promoted, i.e. INCUBATION. Kept separate from
     # what its live record would *allow*, so a promotion is a decision that

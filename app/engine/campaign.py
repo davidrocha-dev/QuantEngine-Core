@@ -14,8 +14,9 @@ import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.engine.backtest import simulate_trades
 from app.engine.fitness import PHASE_0_MIN_TRADES
-from app.engine.metrics import TradeStats
+from app.engine.metrics import TradeStats, compute_trade_stats
 from app.config import get_config
 from app.engine.control import CampaignControl, CampaignPaused
 from app.engine.failure_signal import load as load_gene_outcomes
@@ -31,6 +32,7 @@ from app.engine.phases import (
     run_phase_2_expansion,
     run_phase_3_hybridization,
     run_phase_4_robustness,
+    split_holdout,
     split_is_oos,
 )
 from app.engine.vault_writer import HIGHER_TF_OFF, write_vault_candidates
@@ -247,6 +249,18 @@ def run_campaign(
     campaign.status = "running"
     session.commit()
 
+    # The final holdout. Everything from screening to the Phase 4 gates
+    # runs on the older part of history; the newest slice is measured once,
+    # after approval, and decides nothing. With OOS as the last gate, the
+    # OOS numbers in the Vault are the best of dozens of candidates on that
+    # window - the holdout is the one figure selection never saw. Only
+    # taken when what remains can still hold a full campaign.
+    full_df = df
+    search_df, holdout_df = split_holdout(full_df)
+    if len(split_is_oos(search_df)[0]) < MIN_IS_BARS:
+        search_df, holdout_df = full_df, None
+    df = search_df
+
     is_df, _ = split_is_oos(df)
     span_days = _history_span_days(df)
     if span_days < MIN_HISTORY_DAYS:
@@ -383,6 +397,15 @@ def run_campaign(
         rejections=rejections, **eval_kwargs,
     )
     _set_survivors_per_phase(session, campaign_id, PHASE_ROBUSTNESS, len(vault_candidates))
+
+    if holdout_df is not None and not holdout_df.empty:
+        backtest_kwargs = {k: v for k, v in eval_kwargs.items() if k not in ("timeframe", "initial_balance")}
+        for candidate in vault_candidates:
+            result = simulate_trades(
+                holdout_df, candidate.genome, gene_pool, initial_balance=config.initial_balance, **backtest_kwargs
+            )
+            candidate.stats_holdout = compute_trade_stats(result, holdout_df, config.initial_balance, config.timeframe)
+            candidate.holdout_start = pd.Timestamp(holdout_df["timestamp"].iloc[0]).isoformat()
 
     # The out-of-sample slice is the window Phase 4 judged these on, so it
     # is the one their trade timestamps belong to.

@@ -102,8 +102,10 @@ def test_evaluate_robustness_wipeout_fails():
     trades = [make_trade_from_df(df, 0, 2, 1000)] + [make_trade_from_df(df, i, i + 1, -5) for i in range(1, 50)]
     result = evaluate_robustness(trades, df, initial_balance=10_000, point_size=0.01, rng=np.random.default_rng(0))
     assert result.baseline_return_pct > 0
-    # Not asserting pass/fail (depends on RNG draw) — just that the fields are populated sanely.
-    assert result.fail_reason is None or "degradation" in result.fail_reason
+    # One trade carries the whole return: a third of all resamples leave it
+    # out, so the 5th percentile loses money and the edge is not significant.
+    assert result.passed is False
+    assert "Monte Carlo" in result.fail_reason
 
 
 # --- Sampling the noise distribution instead of one point ---------------

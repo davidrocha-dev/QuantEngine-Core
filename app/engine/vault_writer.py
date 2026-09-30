@@ -32,6 +32,7 @@ def vault_candidate_to_row(
     """`data_source` records which data the strategy was bred on — the
     Vault's BUILT-IN DATA BRED purge criterion (REQ-SET-4.1) depends on it."""
     score = compute_score(candidate.stats_oos, candidate.robustness)
+    holdout = candidate.stats_holdout
     return Strategy(
         id=candidate.hash_id,
         data_source=data_source,
@@ -57,6 +58,12 @@ def vault_candidate_to_row(
         persistence_pct=candidate.walk_forward.persistence_pct if candidate.walk_forward else None,
         walk_forward=json.dumps(candidate.walk_forward.to_dict()) if candidate.walk_forward else None,
         higher_timeframe=higher_timeframe,
+        holdout_return_pct=holdout.net_profit_pct if holdout else None,
+        holdout_trades=holdout.trade_count if holdout else None,
+        # inf (no losing trade) does not store; the cap is what fitness uses.
+        holdout_profit_factor=min(holdout.profit_factor, 10.0) if holdout else None,
+        holdout_max_dd_pct=holdout.max_dd_pct if holdout else None,
+        holdout_start=candidate.holdout_start,
         deployed=False,
         active_mt5=False,
     )
