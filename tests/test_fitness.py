@@ -51,46 +51,63 @@ def test_boundary_values_pass():
 
 
 def test_fitness_f1_formula():
-    stats = make_stats(net_profit_pct=30.0, max_dd_pct=10.0, win_rate=0.5, sharpe_ratio=2.0)
-    assert fitness_f1_stability(stats) == (30.0 / 10.0) * 0.5 * 2.0
+    stats = make_stats(net_profit_pct=30.0, max_dd_pct=10.0, sqn=2.5)
+    assert fitness_f1_stability(stats) == (30.0 / 10.0) * 2.5
+
+
+def test_fitness_f1_no_longer_pays_for_win_rate():
+    """Win rate paid for winning often, not for winning more than was lost,
+    and bred small targets behind wide stops that MetaTrader's costs erase."""
+    often = make_stats(win_rate=0.9, sqn=1.0)
+    rarely = make_stats(win_rate=0.3, sqn=1.0)
+    assert fitness_f1_stability(often) == fitness_f1_stability(rarely)
 
 
 def test_fitness_f1_losing_strategy_ranks_below_winners():
-    # Negative Net Profit x negative Sharpe must not multiply out positive.
-    loser = make_stats(net_profit_pct=-30.0, max_dd_pct=10.0, win_rate=0.4, sharpe_ratio=-2.0)
-    winner = make_stats(net_profit_pct=1.0, max_dd_pct=10.0, win_rate=0.4, sharpe_ratio=0.1)
+    # Negative Net Profit x negative SQN must not multiply out positive.
+    loser = make_stats(net_profit_pct=-30.0, max_dd_pct=10.0, sqn=-2.0)
+    winner = make_stats(net_profit_pct=1.0, max_dd_pct=10.0, sqn=0.1)
     assert fitness_f1_stability(loser) < 0 < fitness_f1_stability(winner)
 
 
 def test_fitness_f1_zero_drawdown_is_zero_not_infinite():
-    stats = make_stats(max_dd_pct=0.0)
+    stats = make_stats(max_dd_pct=0.0, sqn=2.0)
     assert fitness_f1_stability(stats) == 0.0
 
 
 def test_fitness_f2_formula():
     stats = make_stats(cagr_pct=20.0, profit_factor=1.5, payoff_ratio=2.0)
-    assert fitness_f2_expansion(stats) == 20.0 * 1.5 * 2.0
+    assert fitness_f2_expansion(stats) == 20.0 * 1.5
+
+
+def test_fitness_f2_caps_the_profit_factor_and_ignores_payoff():
+    from app.engine.fitness import FITNESS_MAX_PROFIT_FACTOR
+
+    lucky = make_stats(cagr_pct=20.0, profit_factor=8.0, payoff_ratio=6.0)
+    assert fitness_f2_expansion(lucky) == 20.0 * FITNESS_MAX_PROFIT_FACTOR
 
 
 def test_a_candidate_with_no_losing_trades_ranks_at_the_top_not_the_bottom():
-    """Both terms are divisions by zero when nothing lost, and both used
-    to arrive as values that sorted the candidate last: profit_factor as
-    inf, mapped to 0, and payoff_ratio already 0 for the same reason.
-
-    Measured: 120 trades with no losers passes Phase 0 screening, because
-     is False, and then scored 0.0 in F2 against a mediocre
-    rival's 11.44. compute_score already gives an infinite profit factor
-    full marks (scoring.pf_component); F2 did the opposite.
-    """
-    from app.engine.fitness import FITNESS_MAX_PAYOFF_RATIO, FITNESS_MAX_PROFIT_FACTOR
+    from app.engine.fitness import FITNESS_MAX_PROFIT_FACTOR
 
     flawless = make_stats(cagr_pct=20.0, profit_factor=float("inf"), payoff_ratio=0.0)
     mediocre = make_stats(cagr_pct=8.0, profit_factor=1.3, payoff_ratio=1.1)
 
-    assert fitness_f2_expansion(flawless) == 20.0 * FITNESS_MAX_PROFIT_FACTOR * FITNESS_MAX_PAYOFF_RATIO
+    assert fitness_f2_expansion(flawless) == 20.0 * FITNESS_MAX_PROFIT_FACTOR
     assert fitness_f2_expansion(flawless) > fitness_f2_expansion(mediocre)
 
 
-def test_a_finite_profit_factor_is_used_as_measured():
-    stats = make_stats(cagr_pct=20.0, profit_factor=1.5, payoff_ratio=2.0)
-    assert fitness_f2_expansion(stats) == 20.0 * 1.5 * 2.0
+def test_sqn_is_edge_per_trade_scaled_by_a_capped_sample():
+    import math
+
+    from app.engine.backtest import Trade
+    from app.engine.metrics import system_quality_number
+
+    def trades(rs):
+        return [Trade(0, 1, 1, 1.0, 1.0, 0.9, 1.1, r, r * 100, "target") for r in rs]
+
+    # mean 0.5, sample std 1.0 (alternating 1.5 / -0.5), 400 trades -> capped at 100
+    rs = [1.5, -0.5] * 200
+    expected = 0.5 / float(__import__("numpy").std(rs, ddof=1)) * math.sqrt(100)
+    assert system_quality_number(trades(rs)) == __import__("pytest").approx(expected)
+    assert system_quality_number(trades([-1.0, 0.2] * 50)) < 0

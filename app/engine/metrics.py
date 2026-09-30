@@ -45,6 +45,11 @@ class TradeStats:
     # a prop firm closes an account over. Last and defaulted so callers
     # that build a TradeStats positionally keep working.
     max_daily_dd_pct: float = 0.0
+    # System Quality Number: mean R over its spread, scaled by the square
+    # root of the sample (capped at 100 trades). An edge per trade, and
+    # how much evidence there is for it - what win rate was standing in
+    # for, without rewarding a 1R stop against a 0.38R target.
+    sqn: float = 0.0
 
 
 def profit_factor(trades: list[Trade]) -> float:
@@ -238,6 +243,30 @@ def information_coefficient_information_ratio(trades: list[Trade]) -> float:
     return float(max(-MAX_REPORTED_ICIR, min(MAX_REPORTED_ICIR, mean / spread)))
 
 
+SQN_SAMPLE_CAP = 100
+MAX_REPORTED_SQN = 10.0
+
+
+def system_quality_number(trades: list[Trade]) -> float:
+    """Van Tharp's SQN: mean(R) / std(R) x sqrt(min(N, 100)).
+
+    Rewards a steady edge per trade over a lucky few big ones, and a large
+    sample over a small one, and is negative for a strategy that loses on
+    average. The sample is capped so a strategy cannot score by trading
+    more rather than better.
+    """
+    r = np.array([t.r_multiple for t in trades], dtype=float)
+    r = r[np.isfinite(r)]
+    if len(r) < 2:
+        return 0.0
+    spread = float(r.std(ddof=1))
+    mean = float(r.mean())
+    if spread == 0:
+        return 0.0 if mean == 0 else math.copysign(MAX_REPORTED_SQN, mean)
+    value = mean / spread * math.sqrt(min(len(r), SQN_SAMPLE_CAP))
+    return float(max(-MAX_REPORTED_SQN, min(MAX_REPORTED_SQN, value)))
+
+
 def avg_hold_hours(trades: list[Trade], df: pd.DataFrame) -> float:
     if not trades:
         return 0.0
@@ -271,4 +300,5 @@ def compute_trade_stats(result: BacktestResult, df: pd.DataFrame, initial_balanc
         payoff_ratio=payoff_ratio(result.trades),
         icir=information_coefficient_information_ratio(result.trades),
         avg_hold_hours=avg_hold_hours(result.trades, df),
+        sqn=system_quality_number(result.trades),
     )

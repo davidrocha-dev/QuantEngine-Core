@@ -155,3 +155,13 @@ def test_breakeven_earns_nothing_on_the_profit_factor_component():
     assert compute_score(losing, flawless) == compute_score(breakeven, flawless)
     assert compute_score(losing, flawless) < GOOD_GRADE_THRESHOLD
     assert compute_score(good, flawless) > compute_score(breakeven, flawless)
+
+
+def test_the_score_rewards_edge_per_trade_not_how_often_it_wins():
+    """A 90% win rate at a tenth of the risk used to take full marks on
+    one of six components; the component is now SQN."""
+    from app.engine.scoring import compute_score
+
+    often_small = make_stats(win_rate=0.9, sqn=0.5)
+    rarely_large = make_stats(win_rate=0.35, sqn=2.8)
+    assert compute_score(rarely_large, make_robustness()) > compute_score(often_small, make_robustness())

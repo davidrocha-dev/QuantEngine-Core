@@ -52,8 +52,8 @@ def _clamp01(value: float) -> float:
 
 
 def compute_score(stats_oos: TradeStats, robustness: RobustnessResult) -> int:
-    """0-100 composite, six equally weighted parts: profit factor, win
-    rate, Sharpe, drawdown control, Phase 4 robustness margin, and how
+    """0-100 composite, six equally weighted parts: profit factor, edge
+    per trade (SQN), Sharpe, drawdown control, Phase 4 robustness margin, and how
     much out-of-sample evidence there is behind all five.
 
     The sixth is the one that was missing. Without it a strategy with 30
@@ -73,7 +73,11 @@ def compute_score(stats_oos: TradeStats, robustness: RobustnessResult) -> int:
         1.0 if stats_oos.profit_factor == float("inf")
         else _clamp01(stats_oos.profit_factor - 1.0)
     )
-    win_rate_component = _clamp01(stats_oos.win_rate)
+    # Edge per trade and the evidence for it (SQN 3 is excellent), where
+    # this used to be the win rate: a strategy winning 90% of the time at
+    # a tenth of its risk scored top marks on a component meant to reward
+    # quality.
+    edge_component = _clamp01(getattr(stats_oos, "sqn", 0.0) / 3.0)
     sharpe_component = _clamp01(stats_oos.sharpe_ratio / 2.0)
     drawdown_component = _clamp01(1 - stats_oos.max_dd_pct / 50.0)
     worst_degradation = max(robustness.monte_carlo_degradation_pct, robustness.noise_degradation_pct)
@@ -82,7 +86,7 @@ def compute_score(stats_oos: TradeStats, robustness: RobustnessResult) -> int:
 
     composite = (
         pf_component
-        + win_rate_component
+        + edge_component
         + sharpe_component
         + drawdown_component
         + robustness_component

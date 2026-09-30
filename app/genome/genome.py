@@ -238,5 +238,7 @@ def mutate(genome: Genome, pool: GenePoolConfig, mutation_rate: float = 0.1) -> 
         filter_pool = pool.enabled_names("filter")
         num_filters = random.randint(0, min(MAX_FILTERS_PER_GENOME, len(filter_pool))) if filter_pool else 0
         names = random.sample(filter_pool, num_filters) if filter_pool else []
-        mutated.filters = [GeneChoice(n, copy.deepcopy(FILTER_GENES[n].default_params)) for n in names]
+        # Drawn from the search space like every other re-rolled gene, not
+        # pinned to the documented defaults.
+        mutated.filters = [GeneChoice(n, sample_params(FILTER_GENES[n])) for n in names]
     return mutated
