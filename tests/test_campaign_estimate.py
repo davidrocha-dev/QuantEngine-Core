@@ -125,3 +125,30 @@ def test_estimate_is_a_positive_widening_range():
     for cores in (1, 2, 8, 32):
         low, high = estimate_campaign_minutes(cores)
         assert 1 <= low < high
+
+
+def test_the_estimate_learns_this_machines_pace(tmp_path):
+    """The work model matches a measured run; the seconds per unit of work
+    are the machine's. Measured here: a MEDIUM campaign on 39,734 bars and
+    4 cores took 1.3 minutes against an estimate of 4 to 8."""
+    from app.engine.campaign_estimate import load_speed_factor, record_campaign_duration
+
+    assert load_speed_factor(tmp_path) == (1.0, 0)
+    before = estimate_campaign_minutes(4, population_size=300, generations=5, bars=REAL_BARS)
+
+    for _ in range(3):
+        record_campaign_duration(tmp_path, 1.3 * 60, 4, 300, 5, REAL_BARS)
+    factor, learned_from = load_speed_factor(tmp_path)
+    after = estimate_campaign_minutes(4, population_size=300, generations=5, bars=REAL_BARS, speed_factor=factor)
+
+    assert learned_from == 3 and factor < 1.0
+    assert after[1] < before[1]
+    assert after[0] <= 1.3 <= after[1]
+
+
+def test_calibration_keeps_only_recent_campaigns(tmp_path):
+    from app.engine.campaign_estimate import CALIBRATION_HISTORY, load_speed_factor, record_campaign_duration
+
+    for _ in range(CALIBRATION_HISTORY + 5):
+        record_campaign_duration(tmp_path, 60, 4, 300, 5, REAL_BARS)
+    assert load_speed_factor(tmp_path)[1] == CALIBRATION_HISTORY

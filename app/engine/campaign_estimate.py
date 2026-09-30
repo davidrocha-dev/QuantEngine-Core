@@ -123,25 +123,14 @@ def campaign_work(
     return CampaignWork(parallel=parallel, serial=serial)
 
 
-def estimate_campaign_minutes(
+def _raw_minutes(
     cpu_cores: int,
-    population_size: int = 300,
-    generations: int = 5,
-    bars: int = 20_000,
-    phase3_children: int = 80,
-    max_breeding_population: int = DEFAULT_MAX_BREEDING_POPULATION,
-) -> tuple[int, int]:
-    """An inclusive (min, max) minute range for this configuration.
-
-    The range is the real uncertainty, not a percentage band bolted on
-    afterwards: the low end assumes screening finds a breeding pool on
-    its first draw and nothing survives robustness, the high end assumes
-    it redraws the maximum number of times and every Phase 3 child goes
-    through the full noise sampling and walk-forward.
-
-    Defaults match the MEDIUM POWER preset so a caller with no settings
-    in hand still gets a sane number.
-    """
+    population_size: int,
+    generations: int,
+    bars: int,
+    phase3_children: int,
+    max_breeding_population: int,
+) -> tuple[float, float]:
     cores = max(1, cpu_cores)
 
     def minutes(rounds: int, full_depth: bool) -> float:
@@ -151,6 +140,103 @@ def estimate_campaign_minutes(
         effective_runs = work.parallel / (cores * PARALLEL_EFFICIENCY) + work.serial
         return effective_runs * bars * SECONDS_PER_BAR / 60
 
-    low = max(1, round(minutes(1, False)))
-    high = max(low + 1, round(minutes(MAX_SCREENING_ROUNDS, True)))
-    return low, high
+    return minutes(1, False), minutes(MAX_SCREENING_ROUNDS, True)
+
+
+def estimate_campaign_minutes(
+    cpu_cores: int,
+    population_size: int = 300,
+    generations: int = 5,
+    bars: int = 20_000,
+    phase3_children: int = 80,
+    max_breeding_population: int = DEFAULT_MAX_BREEDING_POPULATION,
+    speed_factor: float = 1.0,
+) -> tuple[int, int]:
+    """An inclusive (min, max) minute range for this configuration.
+
+    The range is the real uncertainty, not a percentage band bolted on
+    afterwards: the low end assumes screening finds a breeding pool on
+    its first draw and nothing survives robustness, the high end assumes
+    it redraws the maximum number of times and every Phase 3 child goes
+    through the full noise sampling and walk-forward.
+
+    `speed_factor` is this machine's measured pace against the reference
+    one (load_speed_factor): the amount of work is the model's, the time
+    each unit of it takes is the computer's.
+
+    Defaults match the MEDIUM POWER preset so a caller with no settings
+    in hand still gets a sane number.
+    """
+    low, high = _raw_minutes(
+        cpu_cores, population_size, generations, bars, phase3_children, max_breeding_population
+    )
+    low, high = low * speed_factor, high * speed_factor
+    low_minutes = max(1, round(low))
+    return low_minutes, max(low_minutes + 1, round(high))
+
+
+# --- Learning this machine's pace --------------------------------------
+#
+# SECONDS_PER_BAR was measured on one computer. The work model is right
+# (an instrumented MEDIUM run did 1,146 full-run equivalents where it
+# predicts 1,178 to 1,892), but the seconds each unit takes are the
+# machine's: on a 4-core Linux container a MEDIUM campaign on 39,734 bars
+# took 1.3 minutes against an estimate of 4 to 8. No constant is right
+# for every computer, so every finished campaign records how long it took
+# against what the model predicted, and the estimate is scaled by the
+# median of the recent ratios.
+
+CALIBRATION_FILE = "campaign_timing.json"
+CALIBRATION_HISTORY = 10
+SPEED_FACTOR_BOUNDS = (0.05, 20.0)
+
+
+def record_campaign_duration(
+    data_dir,
+    wall_seconds: float,
+    cpu_cores: int,
+    population_size: int,
+    generations: int,
+    bars: int,
+    phase3_children: int = 80,
+) -> float | None:
+    """Stores actual / predicted for a finished campaign. Returns it."""
+    import json
+    from pathlib import Path
+
+    low, high = _raw_minutes(
+        cpu_cores, population_size, generations, bars, phase3_children, DEFAULT_MAX_BREEDING_POPULATION
+    )
+    predicted = (low * high) ** 0.5  # the middle of the range, on a log scale
+    if predicted <= 0 or wall_seconds <= 0:
+        return None
+    ratio = (wall_seconds / 60) / predicted
+    path = Path(data_dir) / CALIBRATION_FILE
+    try:
+        ratios = json.loads(path.read_text(encoding="utf-8")).get("ratios", [])
+    except (OSError, ValueError):
+        ratios = []
+    ratios = [*ratios, round(ratio, 4)][-CALIBRATION_HISTORY:]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"ratios": ratios}), encoding="utf-8")
+    except OSError:
+        return None  # an estimate that stays uncalibrated is not worth failing a campaign over
+    return ratio
+
+
+def load_speed_factor(data_dir) -> tuple[float, int]:
+    """(factor, campaigns it was learned from); (1.0, 0) with no history."""
+    import json
+    import statistics
+    from pathlib import Path
+
+    try:
+        ratios = json.loads((Path(data_dir) / CALIBRATION_FILE).read_text(encoding="utf-8")).get("ratios", [])
+        ratios = [float(r) for r in ratios if float(r) > 0]
+    except (OSError, ValueError, TypeError):
+        ratios = []
+    if not ratios:
+        return 1.0, 0
+    low, high = SPEED_FACTOR_BOUNDS
+    return min(high, max(low, statistics.median(ratios))), len(ratios)

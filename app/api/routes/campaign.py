@@ -3,6 +3,7 @@
 import json
 import os
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 
@@ -20,7 +21,7 @@ from app.engine.campaign import (
     discard_campaign,
     run_campaign,
 )
-from app.engine.campaign_estimate import estimate_campaign_minutes
+from app.engine.campaign_estimate import estimate_campaign_minutes, load_speed_factor, record_campaign_duration
 from app.engine.control import CampaignPaused
 from app.engine.notifications import notify_event
 from app.genome.gene_pool import GenePoolConfig
@@ -62,10 +63,19 @@ def _run_campaign_background(
                 row = session.get(Campaign, campaign_id)
                 as_of = row.started_at if row is not None else None
         df = _load_bars(symbol, timeframe, settings["campaign"]["history_depth_years"], as_of=as_of)
+        run_started = time.monotonic()
         with Session(engine) as session:
             outcome = run_campaign(
                 session, campaign_id, df, gene_pool, config,
                 resume=resume, on_generation=on_generation, control=_campaign_control,
+            )
+        # Teach the duration estimate this machine's pace. Only a whole run
+        # counts: a resumed one skipped work, a failed one stopped early.
+        if not outcome.fail_reason and not resume:
+            record_campaign_duration(
+                get_config().data_dir, time.monotonic() - run_started,
+                config.max_workers or os.cpu_count() or 1,
+                config.population_size, config.generations_per_tribe, len(df),
             )
         # REQ-SET-7.1/7.2/7.4 — a campaign runs for tens of minutes, so its
         # ending is announced on whichever channels are enabled. The OS
@@ -141,11 +151,13 @@ def get_campaign_estimate() -> dict:
     timeframe = next(iter(settings["target_markets"]["enabled_timeframes"]), "H1")
     bars = len(_load_bars(symbol, timeframe, campaign_settings["history_depth_years"]))
 
+    speed_factor, calibrated_from = load_speed_factor(get_config().data_dir)
     min_minutes, max_minutes = estimate_campaign_minutes(
         cpu_cores,
         population_size=preset["population_size"],
         generations=preset["generations_per_tribe"],
         bars=bars or 20_000,
+        speed_factor=speed_factor,
     )
     return {
         "cpu_cores": cpu_cores,
@@ -155,6 +167,9 @@ def get_campaign_estimate() -> dict:
         "symbol": symbol,
         "timeframe": timeframe,
         "bars": bars,
+        # How many of this machine's own finished campaigns the pace was
+        # learned from; 0 means the reference machine's pace.
+        "calibrated_from": calibrated_from,
     }
 
 

@@ -27,9 +27,12 @@ check is not.
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import os
 from urllib.parse import parse_qs
+
+from app import licensing
 
 TOKEN_ENV = "QUANTENGINE_API_TOKEN"
 TOKEN_HEADER = b"x-quantengine-token"
@@ -73,7 +76,13 @@ class LocalAccessMiddleware:
         token = configured_token()
         # A CORS preflight carries no custom headers by design; it only
         # asks permission, and CORSMiddleware answers it.
-        if token is None or (scope["type"] == "http" and scope.get("method") == "OPTIONS"):
+        if scope["type"] == "http" and scope.get("method") == "OPTIONS":
+            return await self.app(scope, receive, send)
+        if token is None:
+            # The packaged engine is only ever started by the app, which
+            # always sets a token. One running without is someone else.
+            if licensing.enforcement_active():
+                return await self._refuse(scope, send, "This engine is started by the QuantEngine app")
             return await self.app(scope, receive, send)
 
         presented = headers.get(TOKEN_HEADER, b"").decode("latin-1")
@@ -82,16 +91,21 @@ class LocalAccessMiddleware:
             presented = (query.get("token") or [""])[0]
         if not hmac.compare_digest(presented, token):
             return await self._refuse(scope, send, "Missing or wrong engine token")
+
+        # And what the licence allows (app/licensing.py).
+        reason = licensing.refusal(scope.get("path", ""))
+        if reason is not None:
+            return await self._refuse(scope, send, reason, status=402)
         return await self.app(scope, receive, send)
 
     @staticmethod
-    async def _refuse(scope, send, reason: str) -> None:
+    async def _refuse(scope, send, reason: str, status: int = 403) -> None:
         if scope["type"] == "websocket":
             await send({"type": "websocket.close", "code": 1008, "reason": reason})
             return
-        body = ('{"detail": "%s"}' % reason).encode()
+        body = json.dumps({"detail": reason}).encode()
         await send({
-            "type": "http.response.start", "status": 403,
+            "type": "http.response.start", "status": status,
             "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())],
         })
         await send({"type": "http.response.body", "body": body})

@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
+from app import licensing
 from app.api import runtime
 from app.api.security import LocalAccessMiddleware
 
@@ -196,6 +197,7 @@ async def lifespan(_: FastAPI):
     # REQ-NFR-2 — rotating local logs, so "the engine stopped" leaves
     # something diagnosable behind. Crash reporting stays opt-in.
     log_path = configure_logging(config.data_dir)
+    licensing.log_startup_state()
     settings = load_settings(config.settings_path)
     configure_crash_reporting(settings["system"]["crash_reporting_enabled"])
     logging.getLogger("quantengine").info("Engine starting — logging to %s", log_path)

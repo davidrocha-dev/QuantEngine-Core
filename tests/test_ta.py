@@ -45,6 +45,34 @@ def test_psar_stays_within_reasonable_bounds():
     assert result.notna().all()
 
 
+def test_psar_value_on_a_bar_includes_that_bar_as_mt5_draws_it():
+    """MT5's dot on bar i is computed once bar i has closed, so it is on
+    the far side of that bar's range: below the low in an uptrend, above
+    the high in a downtrend."""
+    df = make_synthetic_ohlc(400, seed=11)
+    sar = ta.psar(df)
+    below = sar <= df["low"]
+    above = sar >= df["high"]
+    assert (below | above).iloc[2:].all()
+
+
+def test_psar_flips_on_the_bar_that_pierces_it_even_if_it_closes_back():
+    """Uptrend, then a bar whose low runs through the dot and whose close
+    comes back. MT5 has reversed on that bar, so the PSAR bias - close
+    against the dot - reads bearish there, as the EA's does."""
+    import pandas as pd
+
+    rows = [(1.00 + 0.01 * i, 1.005 + 0.01 * i, 0.995 + 0.01 * i, 1.004 + 0.01 * i) for i in range(30)]
+    last_close = rows[-1][3]
+    rows.append((last_close, last_close + 0.002, last_close - 0.2, last_close))  # wick through, close unchanged
+    df = pd.DataFrame(rows, columns=["open", "high", "low", "close"])
+
+    sar = ta.psar(df)
+
+    assert sar.iloc[-2] < df["close"].iloc[-2]  # uptrend before
+    assert sar.iloc[-1] > df["close"].iloc[-1]  # reversed on the piercing bar
+
+
 def test_is_doji_detects_small_body():
     import pandas as pd
     df = pd.DataFrame({
