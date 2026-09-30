@@ -562,3 +562,31 @@ def test_a_bot_with_a_decay_warning_is_not_promoted(session):
 
     assert entry.can_promote is False
     assert entry.blocked_reason.startswith("decay warning")
+
+
+def test_a_marketplace_ea_is_summarised_by_its_magic_without_money(tmp_path, monkeypatch):
+    """A subscribed EA's strategy is not in this Vault; its deals are
+    found by magic number, and only counts and account-relative units
+    are reported back."""
+    from fastapi.testclient import TestClient
+
+    from app.api.routes import live as live_routes
+    from app.config import EngineConfig
+    from app.db import Base as ModelBase
+    from app.main import app
+    from tests.helpers import patch_api
+
+    config = EngineConfig(data_dir=tmp_path)
+    patch_api(monkeypatch, "get_config", lambda: config)
+    ModelBase.metadata.create_all(make_engine(config.vault_db_path))
+    monkeypatch.setattr(live_routes.pilot, "import_live_trades", lambda *a, **k: None)
+    with Session(make_engine(config.vault_db_path)) as session:
+        for index, profit in enumerate([30.0, -10.0, -10.0, 50.0]):
+            session.add(LiveTrade(deal_ticket=f"m-{index}", strategy_id=None, magic=123456789, symbol="EURUSD",
+                                  closed_at=datetime.now(timezone.utc), volume=0.1, profit=profit))
+        session.commit()
+
+    body = TestClient(app).get("/live/magic/123456789/summary").json()
+
+    assert body["trades"] == 4 and body["wins"] == 2
+    assert body["net_units"] == round(60.0 / 25.0, 4)

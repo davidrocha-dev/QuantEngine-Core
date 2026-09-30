@@ -151,3 +151,25 @@ def post_run_auto_deploy() -> dict:
             broker_clock=clock_from_settings(settings),
         )
     return {"actions": [action.to_dict() for action in actions]}
+
+
+@router.get("/live/magic/{magic}/summary")
+def get_live_summary_by_magic(magic: int) -> dict:
+    """What one EA - found by its magic number in the Pilot's report - has
+    done on this account. For a Marketplace EA, whose strategy is not in
+    this Vault, this is how the app reports its live results back
+    (REQ-MKT-2.1): counts and `net_units`, the net result in units of the
+    EA's own average trade on this account, so no money and no balance
+    leave the machine."""
+    settings = load_settings(get_config().settings_path)
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        pilot.import_live_trades(session, clock=clock_from_settings(settings))
+        profits = [row.profit for row in session.scalars(select(LiveTrade).where(LiveTrade.magic == magic))]
+    scale = sum(abs(p) for p in profits) / len(profits) if profits else 0.0
+    return {
+        "magic": magic,
+        "trades": len(profits),
+        "wins": sum(1 for p in profits if p > 0),
+        "net_units": round(sum(profits) / scale, 4) if scale > 0 else 0.0,
+    }

@@ -263,6 +263,7 @@ def get_system_info() -> dict:
         # anything is being sent anywhere (it is not, unless opted in).
         "log_dir": str(log_dir(config.data_dir)),
         "crash_reporting_enabled": settings["system"]["crash_reporting_enabled"],
+        "share_marketplace_results": settings["system"]["share_marketplace_results"],
     }
 
 

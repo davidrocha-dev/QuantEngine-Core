@@ -126,6 +126,12 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
     # opt-in and off by default.
     "system": {
         "crash_reporting_enabled": False,
+        # REQ-MKT-2.1 — send each paid Marketplace EA's live record (trade
+        # count, wins, result in account-relative units; never money) to
+        # the Marketplace, where subscribers' results decide whether a
+        # listing is flagged. On by default and said so on the Marketplace
+        # screen; this is where it is switched off.
+        "share_marketplace_results": True,
     },
     # AUTOMATION (Elite) — tasks.md 12.2/12.6. The scheduler in
     # app/api/scheduler.py reads these; `last_*_at` are written by it, not by the UI.
