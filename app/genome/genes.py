@@ -303,6 +303,13 @@ def _bias_donchian_mid(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: di
     return pd.Series(np.select([df["close"] > mid, df["close"] < mid], [1, -1], default=0), index=df.index)
 
 
+def _bar_duration(frame: pd.DataFrame) -> pd.Timedelta:
+    """A bar's length, read off the data: the commonest gap between opens
+    (weekend and holiday gaps are rarer than ordinary ones)."""
+    gaps = pd.DatetimeIndex(frame["timestamp"]).to_series().diff().dropna()
+    return gaps.mode().iloc[0] if not gaps.empty else pd.Timedelta(0)
+
+
 def _bias_htf(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict) -> pd.Series:
     """HTF — bullish/bearish per the higher-timeframe close vs. its SMA
     (default period=20), forward-filled onto the trading timeframe. Neutral
@@ -311,11 +318,15 @@ def _bias_htf(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict) -> pd
         return pd.Series(0, index=df.index)
     htf_sma = ta.sma(htf_df["close"], params.get("period", 20))
     htf_bias = pd.Series(np.select([htf_df["close"] > htf_sma, htf_df["close"] < htf_sma], [1, -1], default=0), index=htf_df.index)
-    # HTF timestamps are bar *open* times; a bar's close is only known once
-    # it completes, so each trading bar sees the last *completed* HTF bar.
-    htf_bias = htf_bias.shift(1)
-    htf_bias.index = pd.DatetimeIndex(htf_df["timestamp"])
-    aligned = htf_bias.reindex(pd.DatetimeIndex(df["timestamp"]), method="ffill")
+    # Each trading bar is decided at its close, and at that moment the HTF
+    # bar that has just closed is known - which is what the EA reads
+    # (HtfClose(1) at the open of the next bar). Aligning on open times
+    # with a one-bar lag instead left the last trading bar of every HTF
+    # period reading the HTF bar before: 7.6% of M15 bars on EURUSD with
+    # an H1 context disagreed with the EA.
+    htf_closes = pd.DatetimeIndex(htf_df["timestamp"]) + _bar_duration(htf_df)
+    trading_closes = pd.DatetimeIndex(df["timestamp"]) + _bar_duration(df)
+    aligned = pd.Series(htf_bias.to_numpy(), index=htf_closes).reindex(trading_closes, method="ffill")
     return aligned.set_axis(df.index).fillna(0)
 
 
