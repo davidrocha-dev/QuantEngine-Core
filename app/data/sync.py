@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 
 # Never sync the current, still-forming hour.
 SYNC_LAG = timedelta(hours=1)
+# Dukascopy publishes an hour's ticks some time after it closes, and until
+# then answers 404 - the same answer as a weekend hour with no market. An
+# empty hour this recent is therefore not taken as final: the forward pass
+# stops before it and the next sync asks again, instead of recording it as
+# done and leaving a permanent hole in the newest data.
+UNCONFIRMED_EMPTY_WINDOW = timedelta(hours=6)
 DEFAULT_TIMEFRAME = "M1"
 DEFAULT_HISTORY_YEARS = 3
 # Hours fetched concurrently. The feed 429s readily, so this stays low —
@@ -162,7 +168,9 @@ class DeltaSyncRunner:
         hours_synced = 0
         batch_start = 0
         attempts = 0
-        while batch_start < len(hours):
+        unconfirmed_after = datetime.now(timezone.utc) - UNCONFIRMED_EMPTY_WINDOW
+        reached_unpublished = False
+        while batch_start < len(hours) and not reached_unpublished:
             batch = hours[batch_start : batch_start + WRITE_BATCH_HOURS]
             results = await asyncio.gather(*(fetch(hour) for hour in batch), return_exceptions=True)
 
@@ -174,6 +182,10 @@ class DeltaSyncRunner:
                     # The manifest must stay contiguous, so a failed hour
                     # ends this batch — everything before it is still saved.
                     failure = result
+                    break
+                if (result is None or result.empty) and hour >= unconfirmed_after:
+                    # Possibly not published yet: stop here, ask again next run.
+                    reached_unpublished = True
                     break
                 if result is not None and not result.empty:
                     frames.append(result)

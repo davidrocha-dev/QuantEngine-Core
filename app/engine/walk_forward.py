@@ -33,11 +33,12 @@ measurement of an already-chosen strategy.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pandas as pd
 
-from app.engine.backtest import simulate_trades
+from app.data.provider import TIMEFRAME_MINUTES
+from app.engine.backtest import BacktestResult, simulate_trades
 from app.engine.metrics import compute_trade_stats
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genome import Genome
@@ -52,6 +53,50 @@ MIN_OOS_FOLDS = 3
 DEFAULT_FOLDS = 5
 # A test window shorter than this cannot produce enough trades to judge.
 MIN_FOLD_BARS = 500
+
+
+# History given to the indicators before a window starts: the longest
+# lookback a gene can draw is ADR EXHAUST's 28 broker days (SMA's 200
+# bars is shorter on every timeframe below H4), with a margin for Wilder
+# smoothing to settle. Never less than this many bars.
+WARMUP_DAYS = 35
+MIN_WARMUP_BARS = 300
+
+
+def warmup_bars(timeframe: str) -> int:
+    bars_per_day = 1440 // TIMEFRAME_MINUTES.get(timeframe, 60)
+    return max(MIN_WARMUP_BARS, WARMUP_DAYS * bars_per_day)
+
+
+def simulate_window(
+    df: pd.DataFrame,
+    start: int,
+    end: int,
+    genome: Genome,
+    gene_pool: GenePoolConfig,
+    timeframe: str = "H1",
+    **backtest_kwargs,
+) -> tuple[BacktestResult, pd.DataFrame]:
+    """Trades `df[start:end]` with the bars before `start` as indicator
+    history, and returns the result and the window it describes.
+
+    Slicing the window out and simulating it alone restarted every
+    indicator at its first bar. On an H1 walk-forward fold of ~900 bars a
+    200-bar SMA was blind for a fifth of the fold and a 28-day ADR for
+    most of it - trades the EA, which always has its chart behind it,
+    would have taken.
+    """
+    lo = max(0, start - warmup_bars(timeframe))
+    offset = start - lo
+    frame = df.iloc[lo:end].reset_index(drop=True)
+    result = simulate_trades(frame, genome, gene_pool, start_idx=offset, **backtest_kwargs)
+    trimmed = BacktestResult(
+        trades=[replace(t, entry_idx=t.entry_idx - offset, exit_idx=t.exit_idx - offset) for t in result.trades],
+        equity_curve=result.equity_curve[offset:],
+        final_balance=result.final_balance,
+        margin_breach=result.margin_breach,
+    )
+    return trimmed, df.iloc[start:end].reset_index(drop=True)
 
 
 @dataclass
@@ -141,8 +186,9 @@ def run_walk_forward(
 
     results: list[Fold] = []
     for start, end in [*is_ranges, *oos_ranges]:
-        window = df.iloc[start:end].reset_index(drop=True)
-        outcome = simulate_trades(window, genome, gene_pool, initial_balance=initial_balance, **backtest_kwargs)
+        outcome, window = simulate_window(
+            df, start, end, genome, gene_pool, timeframe=timeframe, initial_balance=initial_balance, **backtest_kwargs
+        )
         stats = compute_trade_stats(outcome, window, initial_balance, timeframe)
         timestamps = pd.DatetimeIndex(window["timestamp"])
         results.append(

@@ -165,3 +165,29 @@ def test_utc_hour_range():
         datetime(2024, 1, 1, 1, tzinfo=timezone.utc),
         datetime(2024, 1, 1, 2, tzinfo=timezone.utc),
     ]
+
+
+def test_a_server_error_is_retried_not_fatal(monkeypatch):
+    """A 5xx is the feed's own trouble; it used to raise on the spot and
+    fail the whole batch."""
+    import asyncio
+
+    hour_start = datetime(2024, 3, 5, 14, tzinfo=timezone.utc)
+    payload = make_bi5([(0, 108234, 108220, 1.5, 2.0)])
+    calls = {"n": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(503) if calls["n"] == 1 else httpx.Response(200, content=payload)
+
+    async def no_sleep(_seconds):
+        return None
+
+    client = DukascopyClient(request_delay_seconds=0)
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr("app.data.dukascopy_client.asyncio.sleep", no_sleep)
+
+    result = asyncio.run(client.fetch_hour("EURUSD", hour_start))
+
+    assert calls["n"] == 2
+    assert len(result.ticks) == 1

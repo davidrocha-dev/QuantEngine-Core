@@ -54,7 +54,9 @@ def test_a_gene_that_never_produced_a_strategy_is_never_excluded():
     # last month's winners stops searching.
     fitness = compute_gene_fitness(vault())
 
-    assert fitness.weight_for("signal", "ORB") == MIN_WEIGHT
+    # Neutral, not the floor: no strategy yet is no evidence yet. The
+    # floor made an untried gene rarer, so it stayed untried.
+    assert fitness.weight_for("signal", "ORB") == 1.0
     assert all(MIN_WEIGHT <= weight <= MAX_WEIGHT for weight in fitness.weights.values())
 
 
@@ -104,3 +106,26 @@ def test_uniform_sampling_when_no_weights_are_given():
     population = random_population(pool, 120)
 
     assert len({genome.signal.name for genome in population}) > 5
+
+
+def test_each_market_learns_from_its_own_strategies():
+    """On gold H1 FADE is what works; on EURUSD M15 it is BREAKOUT. One
+    pooled table let the market with the most rows set the weights for
+    every other market."""
+    gold = []
+    for i in range(20):
+        row = make_strategy(f"#GW{i}", "FADE", 90)
+        row.asset, row.timeframe = "XAUUSD", "H1"
+        gold.append(row)
+    for i in range(10):
+        row = make_strategy(f"#GL{i}", "BREAKOUT", 40)
+        row.asset, row.timeframe = "XAUUSD", "H1"
+        gold.append(row)
+
+    fitness = compute_gene_fitness(vault() + gold)
+
+    assert fitness.weights_for("XAUUSD", "H1")["signal::FADE"] > 1.0
+    assert fitness.weights_for("XAUUSD", "H1")["signal::BREAKOUT"] < 1.0
+    assert fitness.weights_for("EURUSD", "M15")["signal::BREAKOUT"] > 1.0
+    # A market with no Vault of its own gets the pooled weights.
+    assert fitness.weights_for("GBPUSD", "H4") == fitness.weights

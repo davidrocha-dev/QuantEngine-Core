@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.campaign_setup import _config_for_strategy, _load_bars, _strategy_higher_timeframe
+from app.broker import pilot
 from app.broker.mt5_install import install_ea
 from app.codegen.mql5 import GeneratedEa, UnsupportedGeneError, generate_ea
 from app.config import get_config
@@ -21,6 +22,7 @@ from app.engine.backtest import simulate_trades
 from app.engine.campaign import (
     MIN_IS_BARS,
 )
+from app.engine.health import STAGE_RISK_SHARE, STAGES, risk_shares
 from app.engine.neural_map import MIN_STRATEGIES_FOR_MAP, compute_neural_map
 from app.engine.phases import IS_FRACTION, split_is_oos
 from app.engine.purge import (
@@ -269,8 +271,12 @@ def delete_strategy(strategy_id: str) -> dict:
     return {"deleted": strategy_id, "recoverable": True}
 
 
-def _generate_ea_for(strategy_id: str) -> tuple[Strategy, "GeneratedEa"]:
-    """Loads a Vault strategy and regenerates its EA from the stored genome."""
+def _generate_ea_for(strategy_id: str, default_risk_share: float = 1.0) -> tuple[Strategy, "GeneratedEa"]:
+    """Loads a Vault strategy and regenerates its EA from the stored genome.
+
+    `default_risk_share` is the Incubation share baked into the EA for
+    when the ladder's file has no line for it: the deploy passes the
+    bot's stage, an export or a Marketplace build keeps full risk."""
     settings = load_settings(get_config().settings_path)
     engine = make_engine(get_config().vault_db_path)
     with Session(engine) as session:
@@ -301,6 +307,7 @@ def _generate_ea_for(strategy_id: str) -> tuple[Strategy, "GeneratedEa"]:
             risk_pct=settings["risk"]["per_trade_risk_pct"] / 100,
             higher_timeframe=_strategy_higher_timeframe(settings, row),
             broker_clock=clock_from_settings(settings),
+            default_risk_share=default_risk_share,
         )
     except UnsupportedGeneError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -395,7 +402,14 @@ def deploy_strategy(strategy_id: str, acknowledge_overlap: bool = False) -> dict
                 detail={"error": "correlated_with_deployed", **warning.to_dict()},
             )
 
-    row, generated = _generate_ea_for(strategy_id)
+    # REQ-PORT-3.1 - a bot going live starts in INCUBATION. One already
+    # deployed (a re-install) keeps the stage it has earned.
+    with Session(engine) as session:
+        current = session.get(Strategy, strategy_id)
+        fresh = current is None or not current.deployed
+        stage = STAGES[0] if fresh or current.incubation_stage not in STAGES else current.incubation_stage
+
+    row, generated = _generate_ea_for(strategy_id, default_risk_share=STAGE_RISK_SHARE[stage])
     result = install_ea(generated.filename, generated.source)
     if not result.installed:
         raise HTTPException(status_code=409, detail=result.detail)
@@ -404,9 +418,15 @@ def deploy_strategy(strategy_id: str, acknowledge_overlap: bool = False) -> dict
         strategy = session.get(Strategy, strategy_id)
         if strategy is not None:
             strategy.deployed = True
+            if fresh:
+                strategy.incubation_stage = None
             # active_mt5 stays false until the EA is actually attached to a
             # chart — installing a file is not the same as running it.
             session.commit()
+            # And tell every running EA now, not whenever the Incubation
+            # screen is next opened: until then this bot read "no line"
+            # and traded at full size.
+            pilot.write_risk_shares(risk_shares(session))
 
     return {
         "status": "deployed",

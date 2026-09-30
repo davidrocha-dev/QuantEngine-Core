@@ -14,7 +14,6 @@ import pandas as pd
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.engine.backtest import simulate_trades
 from app.engine.fitness import PHASE_0_MIN_TRADES
 from app.engine.metrics import TradeStats, compute_trade_stats
 from app.config import get_config
@@ -36,6 +35,7 @@ from app.engine.phases import (
     split_is_oos,
 )
 from app.engine.vault_writer import HIGHER_TF_OFF, write_vault_candidates
+from app.engine.walk_forward import simulate_window
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genome import Genome, random_population
 from app.models import Campaign
@@ -257,6 +257,7 @@ def run_campaign(
     # OOS numbers in the Vault are the best of dozens of candidates on that
     # window - the holdout is the one figure selection never saw. Only
     # taken when what remains can still hold a full campaign.
+    full_history = df
     df, holdout_df = split_search_holdout(df, MIN_IS_BARS)
 
     is_df, _ = split_is_oos(df)
@@ -400,8 +401,12 @@ def run_campaign(
     if holdout_df is not None and not holdout_df.empty:
         backtest_kwargs = {k: v for k, v in eval_kwargs.items() if k not in ("timeframe", "initial_balance")}
         for candidate in vault_candidates:
-            result = simulate_trades(
-                holdout_df, candidate.genome, gene_pool, initial_balance=config.initial_balance, **backtest_kwargs
+            # With the searched history behind it as indicator warm-up,
+            # as the EA would have: measured alone, the holdout's first
+            # weeks went to averages that had not formed yet.
+            result, _ = simulate_window(
+                full_history, len(df), len(full_history), candidate.genome, gene_pool,
+                timeframe=config.timeframe, initial_balance=config.initial_balance, **backtest_kwargs,
             )
             candidate.stats_holdout = compute_trade_stats(result, holdout_df, config.initial_balance, config.timeframe)
             candidate.holdout_start = pd.Timestamp(holdout_df["timestamp"].iloc[0]).isoformat()

@@ -121,7 +121,7 @@ def _config_for_strategy(settings: dict, strategy) -> CampaignConfig:
     return config
 
 
-def _learned_gene_weights() -> dict[str, float]:
+def _learned_gene_weights(symbol: str | None = None, timeframe: str | None = None) -> dict[str, float]:
     """Smart Mode's weights, tempered by what keeps failing screening.
 
     Two signals, and they answer different questions. Smart Mode asks
@@ -133,11 +133,14 @@ def _learned_gene_weights() -> dict[str, float]:
 
     Both live under the Smart Mode toggle. Someone who turned learning
     off meant all of it.
+
+    The Vault half is this market's own when it has enough strategies to
+    learn from (smart_mode.weights_for), the pooled weights otherwise.
     """
     from app.engine.failure_signal import load as load_gene_outcomes
     from app.engine.failure_signal import penalties
 
-    weights = dict(smart_mode.load(get_config().data_dir).weights)
+    weights = dict(smart_mode.load(get_config().data_dir).weights_for(symbol, timeframe))
     for key, penalty in penalties(load_gene_outcomes(get_config().data_dir)).items():
         weights[key] = weights.get(key, 1.0) * penalty
     return weights
@@ -216,7 +219,7 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
         data_source="bundled" if get_config().built_in_data_only else "dukascopy",
         # SMART MODE (Settings → Campaign) biases which genes get drawn,
         # using what the Vault has already shown to work.
-        gene_weights=_learned_gene_weights() if campaign_settings["smart_mode"] else {},
+        gene_weights=_learned_gene_weights(symbol, timeframe) if campaign_settings["smart_mode"] else {},
         htf_df=htf_df,
         higher_timeframe=htf_timeframe,
         news_events=news_events,

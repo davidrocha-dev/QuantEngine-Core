@@ -138,6 +138,13 @@ class DukascopyClient:
             if response.status_code == 429:
                 self._enter_cooldown(float(response.headers.get("retry-after", 0)))
                 continue
+            if response.status_code >= 500:
+                # The feed's own trouble, not a missing hour: retry like a
+                # dropped connection instead of failing the batch at once.
+                if attempt == self._max_retries - 1:
+                    raise DukascopyDownloadError(f"HTTP {response.status_code} after {self._max_retries} retries: {url}")
+                await asyncio.sleep(min(2**attempt, 30))
+                continue
 
             response.raise_for_status()
             self._relax_cooldown()

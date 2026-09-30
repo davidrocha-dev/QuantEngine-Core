@@ -141,9 +141,7 @@ def test_the_two_signals_multiply(tmp_path, monkeypatch):
     from tests.helpers import patch_api
 
     patch_api(monkeypatch, "get_config", lambda: EngineConfig(data_dir=tmp_path))
-    monkeypatch.setattr(
-        smart_mode, "load", lambda _dir: type("F", (), {"weights": {"signal::BAD": 2.0}})()
-    )
+    monkeypatch.setattr(smart_mode, "load", lambda _dir: smart_mode.GeneFitness(weights={"signal::BAD": 2.0}))
     save(
         tmp_path,
         GeneOutcomes(

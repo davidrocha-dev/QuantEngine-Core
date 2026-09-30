@@ -37,7 +37,7 @@ from app.engine.phases import (
 )
 from app.engine.scoring import compute_grade, compute_score
 from app.engine.trade_log import replace_trades
-from app.engine.walk_forward import run_walk_forward
+from app.engine.walk_forward import run_walk_forward, simulate_window
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genome import Genome
 from app.models import Strategy
@@ -121,8 +121,9 @@ def refresh_strategy(
     # The holdout moves with the data: re-measured on today's newest slice,
     # which is still history no gate decides on.
     if holdout_df is not None and not holdout_df.empty:
-        holdout_result = simulate_trades(
-            holdout_df, genome, gene_pool, initial_balance=config.initial_balance, **kwargs
+        holdout_result, _ = simulate_window(
+            df, len(search_df), len(df), genome, gene_pool,
+            timeframe=strategy.timeframe, initial_balance=config.initial_balance, **kwargs,
         )
         holdout = compute_trade_stats(holdout_result, holdout_df, config.initial_balance, strategy.timeframe)
         strategy.holdout_return_pct = holdout.net_profit_pct

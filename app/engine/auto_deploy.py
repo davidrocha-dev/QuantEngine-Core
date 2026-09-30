@@ -29,7 +29,7 @@ from sqlalchemy.orm import Session
 from app.broker.mt5_install import install_ea, uninstall_ea
 from app.data.broker_clock import DEFAULT_CLOCK, BrokerClock
 from app.codegen.mql5 import _safe_name, UnsupportedGeneError, generate_ea
-from app.engine.health import run_health_check
+from app.engine.health import STAGE_RISK_SHARE, risk_shares, run_health_check
 from app.engine.overlap import check_against_deployed
 from app.genome.genome import Genome
 from app.models import Strategy
@@ -131,6 +131,9 @@ def replace_degraded(
                 replacement.id, replacement.asset, replacement.timeframe,
                 risk_pct=risk_pct, max_spread_points=max_spread_points,
                 broker_clock=broker_clock,
+                # Starts in INCUBATION even if the ladder's file is never
+                # written - see RiskShare in the EA template.
+                default_risk_share=STAGE_RISK_SHARE["INCUBATION"],
                 **({"higher_timeframe": higher_timeframe_for(replacement)} if higher_timeframe_for else {}),
             )
         except (UnsupportedGeneError, KeyError, TypeError, ValueError) as exc:
@@ -171,4 +174,10 @@ def replace_degraded(
             )
         )
 
+    if any(action.installed_id for action in actions):
+        # Publish the ladder now, not whenever the Incubation screen is
+        # next opened, so every running EA reads the new bot's share.
+        from app.broker import pilot
+
+        pilot.write_risk_shares(risk_shares(session))
     return actions

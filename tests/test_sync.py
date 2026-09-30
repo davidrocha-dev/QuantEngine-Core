@@ -323,3 +323,28 @@ async def test_a_retried_block_does_not_count_its_hours_twice(tmp_path):
 
     assert synced == 4
     assert progress.hours_done == 4, "a retried block must not inflate the count"
+
+
+@pytest.mark.asyncio
+async def test_a_recent_empty_hour_is_asked_again_next_time(tmp_path):
+    """Dukascopy answers 404 for an hour it has not published yet, which
+    reads exactly like a weekend hour. Recorded as done, it was never
+    fetched again and the newest data kept a hole."""
+    cache = make_cache(tmp_path)
+
+    class NotYetPublished(FakeClient):
+        async def fetch_hour(self, symbol, hour_start):
+            if hour_start >= datetime.now(timezone.utc) - timedelta(hours=3):
+                self.calls.append(hour_start)
+                return TickHour(symbol, hour_start, pd.DataFrame(columns=["timestamp", "bid", "ask", "bid_volume", "ask_volume"]))
+            return await super().fetch_hour(symbol, hour_start)
+
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(hours=10)).replace(minute=0, second=0, microsecond=0)
+    cache.set_last_synced_hour("EURUSD", start)
+
+    await DeltaSyncRunner(cache=cache, client=NotYetPublished()).sync_symbol("EURUSD")
+
+    watermark = cache.get_last_synced_hour("EURUSD")
+    assert watermark < now - timedelta(hours=3)
+    assert watermark >= now - timedelta(hours=5)

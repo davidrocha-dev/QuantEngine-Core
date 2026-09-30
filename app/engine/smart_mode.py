@@ -10,6 +10,11 @@ produced one is drawn less often — but never zero, because "has not worked
 yet" is not "cannot work", and a gene pool that silently collapses onto
 last month's winners stops searching.
 
+Each market learns from its own strategies once it has enough of them: a
+gene that carries gold on M15 says little about EURUSD on H4, and one
+pooled table let the market with the most Vault rows set the weights for
+all the others. Markets with too few fall back to the pooled weights.
+
 The weights are advisory. The Gene Pool toggles (REQ-ENGINE-1.3) still
 decide what may be drawn at all; Smart Mode only changes how often.
 """
@@ -37,6 +42,9 @@ FILENAME = "gene_fitness_v2.json"
 @dataclass
 class GeneFitness:
     weights: dict[str, float] = field(default_factory=dict)  # "{layer}::{name}" -> weight
+    # "{asset}|{timeframe}" -> weights learned from that market alone,
+    # for the markets with MIN_STRATEGIES_TO_LEARN strategies of their own.
+    by_market: dict[str, dict[str, float]] = field(default_factory=dict)
     strategies_learned_from: int = 0
     computed_at: str = ""
     reason: str = ""
@@ -44,9 +52,14 @@ class GeneFitness:
     def weight_for(self, layer: str, name: str) -> float:
         return self.weights.get(f"{layer}::{name}", 1.0)
 
+    def weights_for(self, asset: str | None, timeframe: str | None) -> dict[str, float]:
+        """This market's own weights when it has them, else the pooled ones."""
+        return self.by_market.get(market_key(asset, timeframe)) or self.weights
+
     def to_dict(self) -> dict:
         return {
             "weights": self.weights,
+            "by_market": self.by_market,
             "strategies_learned_from": self.strategies_learned_from,
             "computed_at": self.computed_at,
             "reason": self.reason,
@@ -56,10 +69,18 @@ class GeneFitness:
     def from_dict(cls, data: dict) -> "GeneFitness":
         return cls(
             weights={str(k): float(v) for k, v in (data.get("weights") or {}).items()},
+            by_market={
+                str(market): {str(k): float(v) for k, v in (weights or {}).items()}
+                for market, weights in (data.get("by_market") or {}).items()
+            },
             strategies_learned_from=int(data.get("strategies_learned_from", 0)),
             computed_at=str(data.get("computed_at", "")),
             reason=str(data.get("reason", "")),
         )
+
+
+def market_key(asset: str | None, timeframe: str | None) -> str:
+    return f"{asset}|{timeframe}"
 
 
 def _genes_of(strategy: Strategy) -> list[str]:
@@ -78,6 +99,40 @@ def _genes_of(strategy: Strategy) -> list[str]:
     return keys
 
 
+def _weights_from(usable: list[Strategy]) -> dict[str, float]:
+    """Sampling weights from the scores of the strategies each gene is in."""
+    average_score = sum(s.score for s in usable) / len(usable)
+    totals: dict[str, list[float]] = {}
+    for strategy in usable:
+        for key in _genes_of(strategy):
+            totals.setdefault(key, []).append(float(strategy.score))
+
+    weights: dict[str, float] = {}
+    for (layer, name) in ALL_GENES:
+        key = f"{layer}::{name}"
+        scores = totals.get(key)
+        if not scores:
+            # Never produced a Vault strategy: no evidence either way, so
+            # neutral. It used to sit at the floor, which made it rarer,
+            # so it produced even fewer strategies and stayed there - a
+            # gene the search had barely tried was treated like one it had
+            # tried and given up on. Genes that are drawn often and keep
+            # failing screening are penalised by the failure signal
+            # (failure_signal.py), which is the evidence that tells the two
+            # apart.
+            weights[key] = 1.0
+            continue
+        # Relative to the Vault's own average, so the scale is meaningful
+        # whatever the score distribution happens to be.
+        ratio = (sum(scores) / len(scores)) / average_score if average_score else 1.0
+        # Genes seen in more strategies move further from 1.0 than genes
+        # seen once: evidence, not a single lucky draw.
+        confidence = min(1.0, len(scores) / 10)
+        weights[key] = round(max(MIN_WEIGHT, min(MAX_WEIGHT, 1.0 + (ratio - 1.0) * confidence * 2)), 3)
+
+    return weights
+
+
 def compute_gene_fitness(strategies: list[Strategy]) -> GeneFitness:
     """Sampling weights from the scores of the strategies each gene is in."""
     now = datetime.now(timezone.utc).isoformat()
@@ -94,31 +149,16 @@ def compute_gene_fitness(strategies: list[Strategy]) -> GeneFitness:
             ),
         )
 
-    average_score = sum(s.score for s in usable) / len(usable)
-    totals: dict[str, list[float]] = {}
+    by_market: dict[str, list[Strategy]] = {}
     for strategy in usable:
-        for key in _genes_of(strategy):
-            totals.setdefault(key, []).append(float(strategy.score))
+        by_market.setdefault(market_key(strategy.asset, strategy.timeframe), []).append(strategy)
 
-    weights: dict[str, float] = {}
-    for (layer, name) in ALL_GENES:
-        key = f"{layer}::{name}"
-        scores = totals.get(key)
-        if not scores:
-            # Never produced a Vault strategy: drawn less often, never
-            # excluded — the search must stay able to rediscover it.
-            weights[key] = MIN_WEIGHT
-            continue
-        # Relative to the Vault's own average, so the scale is meaningful
-        # whatever the score distribution happens to be.
-        ratio = (sum(scores) / len(scores)) / average_score if average_score else 1.0
-        # Genes seen in more strategies move further from 1.0 than genes
-        # seen once: evidence, not a single lucky draw.
-        confidence = min(1.0, len(scores) / 10)
-        weights[key] = round(max(MIN_WEIGHT, min(MAX_WEIGHT, 1.0 + (ratio - 1.0) * confidence * 2)), 3)
-
+    weights = _weights_from(usable)
     return GeneFitness(
         weights=weights,
+        by_market={
+            market: _weights_from(rows) for market, rows in by_market.items() if len(rows) >= MIN_STRATEGIES_TO_LEARN
+        },
         strategies_learned_from=len(usable),
         computed_at=now,
         reason=f"learned from {len(usable)} scored strategies",

@@ -574,6 +574,32 @@ def test_deploy_installs_the_ea_and_marks_the_strategy_deployed(tmp_path, monkey
         assert strategy.active_mt5 is False
 
 
+def test_a_fresh_deploy_trades_at_its_incubation_share(tmp_path, monkeypatch):
+    """The EA read its Incubation share from a file only the Incubation
+    screen wrote, and read "no line" as full risk - so a new bot traded at
+    four times its intended size until someone opened that screen."""
+    from app.broker import pilot
+    from app.broker.mt5_install import InstallResult
+
+    fake_config = _FakeConfig(tmp_path)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
+    _seed_deployable_strategy(fake_config, _simple_genome())
+    captured = {}
+    published = []
+
+    def fake_install(filename, source, compile_after_install=True):
+        captured["source"] = source
+        return InstallResult(installed_paths=["C:/fake/QE_DEP001.mq5"], detail="ok")
+
+    patch_api(monkeypatch, "install_ea", fake_install)
+    monkeypatch.setattr(pilot, "write_risk_shares", lambda shares: published.append(shares))
+
+    assert client.post("/deploy/%23DEP001").status_code == 200
+
+    assert "#define QE_DEFAULT_RISK_SHARE 0.25" in captured["source"]
+    assert published == [{"#DEP001": 0.25}]
+
+
 def test_deploy_reports_a_conflict_when_no_terminal_is_installed(tmp_path, monkeypatch):
     from app.broker.mt5_install import InstallResult
 

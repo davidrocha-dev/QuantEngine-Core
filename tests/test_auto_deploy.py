@@ -87,7 +87,11 @@ def test_a_degraded_bot_is_replaced_by_the_best_candidate_for_the_same_market(se
     assert session.get(Strategy, "#BETTER").deployed is True
 
 
-def test_the_replacement_starts_in_incubation_like_any_new_deploy(session):
+def test_the_replacement_starts_in_incubation_like_any_new_deploy(session, fake_terminal, monkeypatch):
+    from app.broker import pilot
+
+    published = []
+    monkeypatch.setattr(pilot, "write_risk_shares", lambda shares: published.append(shares))
     degraded = make_strategy(session, "#OLD", score=60, deployed=True, incubation_stage="FULL RISK")
     make_strategy(session, "#NEW", score=80)
     make_degraded(session, degraded)
@@ -95,6 +99,12 @@ def test_the_replacement_starts_in_incubation_like_any_new_deploy(session):
     replace_degraded(session)
 
     assert session.get(Strategy, "#NEW").incubation_stage is None
+    # In the EA itself, and published for every running EA at once: the
+    # message has always said "a quarter of target risk", and until the
+    # Incubation screen was opened the EA traded at full size.
+    source = (fake_terminal / mt5_install.EXPERTS_SUBDIR / "QE_NEW.mq5").read_text(encoding="utf-8")
+    assert "#define QE_DEFAULT_RISK_SHARE 0.25" in source
+    assert published == [{"#NEW": 0.25}]
 
 
 def test_a_healthy_bot_is_never_replaced(session):

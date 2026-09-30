@@ -479,3 +479,86 @@ def test_the_broker_clock_round_trips():
     for stamp in ("2026-01-15 22:00", "2026-07-15 21:00"):
         utc = pd.Timestamp(stamp, tz="UTC")
         assert DEFAULT_CLOCK.to_utc(DEFAULT_CLOCK.local([utc])[0]) == utc
+
+
+# --- Degraded means unlikely, not merely negative -------------------------
+
+
+def _with_trade_log(session: Session, strategy_id: str, pnls: list[float]) -> None:
+    for index, pnl in enumerate(pnls):
+        session.add(
+            StrategyTrade(
+                strategy_id=strategy_id, sequence=index, direction=1,
+                entry_price=1.0, exit_price=1.0, stop_price=0.9, target_price=1.1,
+                r_multiple=pnl / 100, pnl=pnl, exit_reason="target" if pnl > 0 else "stop",
+            )
+        )
+    session.commit()
+
+
+def test_an_ordinary_losing_start_is_not_called_degraded(session):
+    """45% winners at 1.8R is a real edge, and it is behind after twelve
+    trades about a quarter of the time. The sign of those twelve used to
+    be the verdict, and auto-deploy retired the bot on it."""
+    strategy = make_strategy(session)
+    strategy.win_rate_pct = 45.0
+    session.commit()
+    _with_trade_log(session, strategy.id, [180.0] * 18 + [-100.0] * 22)
+    add_live_trades(session, strategy.id, [180.0] * 4 + [-100.0] * 8)
+
+    verdict = check_strategy(session, strategy)
+
+    assert verdict.live_profit < 0
+    assert verdict.status == "healthy", verdict.detail
+
+
+def test_a_live_record_the_backtest_would_almost_never_produce_is_degraded(session):
+    strategy = make_strategy(session)
+    strategy.win_rate_pct = 45.0
+    session.commit()
+    _with_trade_log(session, strategy.id, [180.0] * 18 + [-100.0] * 22)
+    add_live_trades(session, strategy.id, [180.0] + [-100.0] * 14)
+
+    verdict = check_strategy(session, strategy)
+
+    assert verdict.status == "degraded"
+    assert "of the time" in verdict.detail
+
+
+# --- Time can qualify a bot, but never past a blocker ---------------------
+
+
+def test_six_weeks_of_near_silence_is_not_evidence(session):
+    """Six weeks live qualifies a bot for FULL RISK on time alone. A bot
+    that placed four trades in that time, where its backtest traded about
+    once a day, has shown nothing - the guide calls that a warning."""
+    import json
+
+    strategy = make_strategy(session)
+    strategy.trades = 100
+    strategy.equity_oos = json.dumps([
+        {"t": "2024-01-01T00:00:00+00:00", "equity": 10_000},
+        {"t": "2024-04-10T00:00:00+00:00", "equity": 11_000},
+    ])  # 100 trades in 100 days
+    session.commit()
+    add_live_trades(session, strategy.id, [5.0] * 4, start=datetime.now(timezone.utc) - timedelta(days=45))
+
+    entry = ladder(session)[0]
+
+    assert entry.eligible_stage == "FULL RISK"
+    assert entry.can_promote is False
+    assert "trading far less than its backtest" in entry.blocked_reason
+
+
+def test_a_bot_with_a_decay_warning_is_not_promoted(session):
+    strategy = make_strategy(session)
+    strategy.win_rate_pct = 70.0
+    session.commit()
+    # Net positive, enough trades for PROVING, but a win rate its backtest
+    # would almost never produce.
+    add_live_trades(session, strategy.id, [100.0, 100.0] + [-10.0] * 10)
+
+    entry = ladder(session)[0]
+
+    assert entry.can_promote is False
+    assert entry.blocked_reason.startswith("decay warning")

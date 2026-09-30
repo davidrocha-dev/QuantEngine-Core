@@ -129,3 +129,31 @@ def test_without_train_bars_nothing_is_out_of_sample():
     assert result is not None
     assert all(fold.in_sample for fold in result.folds)
     assert result.persistence_pct is None
+
+
+def test_a_window_is_traded_with_the_history_before_it_as_warm_up():
+    """Simulated alone, a window restarted every indicator at its first
+    bar: a 60-bar breakout could not fire for the first 60 bars of every
+    fold. The EA always has its chart behind it."""
+    from app.engine.backtest import simulate_trades
+    from app.engine.walk_forward import simulate_window
+    from app.genome.genome import Genome
+    from app.genome.genes import ALL_GENES
+
+    df = make_synthetic_ohlc(3_000, seed=5, drift=0.0006, volatility=0.002)
+    genome = Genome.from_dict({
+        "signal": {"name": "BREAKOUT", "params": {**ALL_GENES[("signal", "BREAKOUT")].default_params, "period": 60}},
+        "bias": None, "filters": [],
+        "execution": {"name": "MARKET2", "params": {"confirm_bars": 2}},
+        "management": None, "stop_atr_mult": 1.5, "target_atr_mult": 3.0,
+    })
+    start, end = 1_500, 2_500
+
+    alone = simulate_trades(df.iloc[start:end].reset_index(drop=True), genome, GenePoolConfig())
+    warmed, window = simulate_window(df, start, end, genome, GenePoolConfig(), timeframe="H1")
+
+    assert len(window) == end - start
+    assert len(warmed.equity_curve) == end - start
+    assert not any(trade.entry_idx < 60 for trade in alone.trades)
+    assert any(trade.entry_idx < 60 for trade in warmed.trades)
+    assert all(0 <= trade.entry_idx < end - start for trade in warmed.trades)

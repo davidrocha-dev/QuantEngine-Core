@@ -68,8 +68,13 @@ def build_context(
     genome: Genome, hash_id: str, symbol: str, timeframe: str, risk_pct: float, max_spread_points: float,
     higher_timeframe: str | None = AUTO_HIGHER_TIMEFRAME,
     broker_clock: BrokerClock = DEFAULT_CLOCK,
+    default_risk_share: float = 1.0,
 ) -> dict:
-    """`higher_timeframe` is the context the strategy was measured with:
+    """`default_risk_share` is the Incubation ladder share the EA uses
+    when the ladder's file has no line for it (see RiskShare in the
+    template): 0.25 for a bot being deployed fresh, 1.0 for an export.
+
+    `higher_timeframe` is the context the strategy was measured with:
     a timeframe, None when HIGHER TF was off, or AUTO_HIGHER_TIMEFRAME
     when nobody knows. With HIGHER TF off the backtest's HTF bias is
     neutral on every bar, so the EA's is too - it used to read a real
@@ -135,6 +140,7 @@ def build_context(
         "server_time_mode": broker_clock.mode,
         "server_offset_hours": float(broker_clock.offset_hours),
         "server_time_description": broker_clock.describe(),
+        "default_risk_share": round(min(1.0, max(0.01, float(default_risk_share))), 4),
     }
 
 
@@ -159,10 +165,14 @@ def generate_ea(
     max_spread_points: float = 0.0,
     higher_timeframe: str | None = AUTO_HIGHER_TIMEFRAME,
     broker_clock: BrokerClock = DEFAULT_CLOCK,
+    default_risk_share: float = 1.0,
 ) -> GeneratedEa:
     environment = Environment(
         loader=FileSystemLoader(TEMPLATE_DIR), undefined=StrictUndefined, trim_blocks=False, lstrip_blocks=False
     )
     template = environment.get_template("strategy_ea.mq5.j2")
-    context = build_context(genome, hash_id, symbol, timeframe, risk_pct, max_spread_points, higher_timeframe, broker_clock)
+    context = build_context(
+        genome, hash_id, symbol, timeframe, risk_pct, max_spread_points, higher_timeframe, broker_clock,
+        default_risk_share=default_risk_share,
+    )
     return GeneratedEa(filename=f"{_safe_name(hash_id)}.mq5", source=template.render(**context))

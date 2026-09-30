@@ -198,8 +198,14 @@ def simulate_trades(
     lot_step: float = 0.0,
     min_lot: float = 0.0,
     max_lot: float = 0.0,
+    start_idx: int = 0,
 ) -> BacktestResult:
     """Runs one genome against one OHLC series end to end.
+
+    `start_idx` is where trading may begin. The bars before it are only
+    history for the indicators to warm up on - the way a live EA always
+    has the chart behind it - so a window measured on its own does not
+    lose its first weeks to a 200-bar average that has not formed yet.
 
     Trading costs (Settings → Costs) are charged on every trade, in every
     phase — not only in Phase 4's noise injection. `cost_points` is the
@@ -271,7 +277,7 @@ def simulate_trades(
     trades: list[Trade] = []
     margin_breach = False
 
-    i = 0
+    i = max(0, start_idx)
     while i < n - 1:
         direction = signal_arr[i]
         if direction == 0 or veto_arr[i] or np.isnan(atr_series[i]) or atr_series[i] <= 0:

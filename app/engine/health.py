@@ -10,16 +10,21 @@ is only called degraded once it has enough trades for the answer to mean
 something, and until then it is reported as too early rather than healthy.
 
 The Incubation ladder (REQ-PORT-3) starts every deployed bot at a quarter
-of its target risk and raises it on live evidence, not on time alone. A
-bot that is underwater, or trading far less than its backtest predicted,
-does not advance — the ladder exists precisely to stop a bad deploy from
+of its target risk and raises it on live evidence. Enough time live can
+qualify a bot as well as enough trades, but it never overrides the
+blockers: a bot that is underwater, flagged degraded, or trading far less
+than its backtest predicted does not advance — the ladder exists precisely to stop a bad deploy from
 reaching full size.
 """
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+
+import numpy as np
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -28,30 +33,20 @@ from app.models import LiveTrade, Strategy, StrategyTrade
 
 # Below this many live trades, live numbers say more about luck than edge.
 MIN_TRADES_FOR_VERDICT = 10
-# A live win rate this far below the backtest's is degradation.
-#
-# Win rate rather than profit: live results are money and the Vault stores
-# percentages, and converting between them needs an account balance this
-# server never sees. A ratio is comparable on both sides without inventing
-# a conversion.
-#
-# 50% is kept as the floor for strategies whose trade log is gone, but it
-# is not the test that does the work, and on its own it did none. Measured
-# across this Vault, the win rate at which a 50% relative shortfall fires
-# sits 11 to 27 points BELOW the win rate at which the strategy stops
-# making money - so by the time it triggers, live profit per trade has
-# long been negative and the sign check above has already called the bot
-# degraded. A magnitude test that only fires after the cheaper test has
-# fired is not a second opinion.
-DEGRADATION_THRESHOLD_PCT = 50.0
-
-# The real magnitude test: the win rate below which this strategy's own
-# geometry stops paying. A strategy risking 1R to make 0.38R needs to win
-# 72% of the time to break even, and one risking 1R to make 2R needs 33%;
-# a single relative shortfall cannot serve both. Falling below it is worth
-# saying *before* the cumulative P&L turns, which is the only thing an
-# early warning is for.
+# Fewest backtest trades worth resampling, or reading a breakeven win
+# rate from (average loss / (average win + average loss)).
 MIN_TRADES_FOR_BREAKEVEN = 20
+
+# A live record is called degraded only when it would be unlikely from
+# the strategy the backtest describes - below this probability. Losing
+# money over the first ten trades is not that: a strategy winning 45% of
+# the time at 1.8R does it in roughly one run in four by chance alone,
+# and each of those was retired by auto-deploy as if its edge had died.
+DEGRADATION_P_VALUE = 0.05
+BOOTSTRAP_SAMPLES = 4000
+# With no trade log to resample, a live mean this many standard errors
+# below zero is the fallback (one-sided p of about 4% at ten trades).
+LOSING_T_STAT = -2.0
 
 # REQ-PORT-3.1-3.3 — stages, and what it takes to leave each one.
 STAGES = ("INCUBATION", "PROVING", "FULL RISK")
@@ -60,6 +55,10 @@ PROVING_TRADES = 10
 FULL_RISK_TRADES = 30
 PROVING_DAYS = 14
 FULL_RISK_DAYS = 42
+# A bot this unlikely to be trading so rarely, given its backtest's pace,
+# is not promoted (guide_incubation.md: "low activity is not silence -
+# it is a warning signal"). Judged only after this many days live.
+LOW_ACTIVITY_MIN_DAYS = 14
 # REQ-PORT-3.5 — an unusually strong opening run can skip the wait.
 HOT_START_TRADES = 8
 HOT_START_WIN_RATE = 0.8
@@ -121,6 +120,52 @@ def _expected_profit_per_trade(strategy: Strategy, live_profit_total: float, liv
     return strategy.return_pct / strategy.trades
 
 
+def _backtest_pnls(session: Session, strategy_id: str) -> list[float]:
+    return list(session.scalars(select(StrategyTrade.pnl).where(StrategyTrade.strategy_id == strategy_id)))
+
+
+def _probability_of_so_little(live_pnls: list[float], backtest_pnls: list[float]) -> float | None:
+    """How often the backtest's own trades, drawn at random, add up to a
+    result as poor as the live one.
+
+    Both sides are in money, on accounts of different sizes, so each is
+    measured in units of its own average trade size (mean |P&L|): what is
+    compared is the shape - how often it wins, by how much against how
+    much it loses - which is what an edge is. None without a trade log
+    long enough to resample.
+    """
+    if len(backtest_pnls) < MIN_TRADES_FOR_BREAKEVEN or not live_pnls:
+        return None
+    backtest = np.asarray(backtest_pnls, dtype=float)
+    live = np.asarray(live_pnls, dtype=float)
+    backtest_scale, live_scale = np.abs(backtest).mean(), np.abs(live).mean()
+    if backtest_scale <= 0 or live_scale <= 0:
+        return None
+    observed = live.sum() / live_scale
+    # Fixed seed: the same record gets the same verdict on every read.
+    draws = np.random.default_rng(0).choice(backtest / backtest_scale, size=(BOOTSTRAP_SAMPLES, live.size))
+    return float((draws.sum(axis=1) <= observed).mean())
+
+
+def _significantly_losing(live_pnls: list[float]) -> bool:
+    """Without a backtest trade log: is the live mean clearly below zero,
+    rather than a losing streak a profitable strategy would also have?"""
+    n = len(live_pnls)
+    mean = sum(live_pnls) / n
+    if mean >= 0:
+        return False
+    spread = math.sqrt(sum((x - mean) ** 2 for x in live_pnls) / (n - 1)) if n > 1 else 0.0
+    if spread == 0:
+        return True  # every trade lost the same amount
+    return mean / (spread / math.sqrt(n)) <= LOSING_T_STAT
+
+
+def _probability_of_so_few_wins(wins: int, trades: int, expected_win_rate_pct: float) -> float:
+    """P(at most `wins` winners in `trades`) for the backtest's win rate."""
+    p = min(max(expected_win_rate_pct / 100, 0.0), 1.0)
+    return sum(math.comb(trades, k) * p**k * (1 - p) ** (trades - k) for k in range(wins + 1))
+
+
 def breakeven_win_rate_pct(session: Session, strategy_id: str) -> float | None:
     """The win rate at which this strategy's backtested trades break even.
 
@@ -130,11 +175,7 @@ def breakeven_win_rate_pct(session: Session, strategy_id: str) -> float | None:
     two averages to mean anything, in which case the caller falls back to
     the fixed relative shortfall.
     """
-    rows = list(
-        session.scalars(
-            select(StrategyTrade.pnl).where(StrategyTrade.strategy_id == strategy_id)
-        )
-    )
+    rows = _backtest_pnls(session, strategy_id)
     if len(rows) < MIN_TRADES_FOR_BREAKEVEN:
         return None
     wins = [pnl for pnl in rows if pnl > 0]
@@ -168,54 +209,56 @@ def check_strategy(session: Session, strategy: Strategy) -> HealthVerdict:
             detail=f"{len(trades)} live trades — needs {MIN_TRADES_FOR_VERDICT} before the comparison means anything.",
         )
 
-    # Sign agreement is the robust part of the comparison: a backtest that
-    # made money and a live run that loses it is the signal that matters,
-    # long before the size of the gap is measurable.
-    expected_sign = 1 if (strategy.return_pct or 0) > 0 else -1
-    live_sign = 1 if per_trade > 0 else -1
-
-    if expected_sign > 0 and live_sign < 0:
-        return HealthVerdict(
-            strategy_id=strategy.id, live_trades=len(trades), live_profit=round(live_profit, 2),
-            live_profit_per_trade=round(per_trade, 2),
-            expected_profit_per_trade=_expected_profit_per_trade(strategy, live_profit, len(trades)),
-            deviation_pct=100.0, status="degraded",
-            detail=f"Losing live ({round(live_profit, 2)}) on a strategy whose backtest was profitable.",
-        )
-
-    live_win_rate_pct = sum(1 for trade in trades if trade.profit > 0) / len(trades) * 100
-
-    # The magnitude check. A bot can be net positive and still be a shadow
-    # of the thing that was approved, and the point where that stops being
-    # survivable is set by its own geometry, not by a fixed percentage.
+    live_pnls = [trade.profit for trade in trades]
+    backtest_pnls = _backtest_pnls(session, strategy.id)
+    wins = sum(1 for profit in live_pnls if profit > 0)
+    live_win_rate_pct = wins / len(trades) * 100
     expected_win_rate_pct = strategy.win_rate_pct
-    breakeven_pct = breakeven_win_rate_pct(session, strategy.id)
-    if expected_win_rate_pct and breakeven_pct is not None and live_win_rate_pct < breakeven_pct:
-        shortfall_pct = (expected_win_rate_pct - live_win_rate_pct) / expected_win_rate_pct * 100
+
+    def degraded(detail: str, deviation_pct: float | None) -> HealthVerdict:
         return HealthVerdict(
             strategy_id=strategy.id, live_trades=len(trades), live_profit=round(live_profit, 2),
             live_profit_per_trade=round(per_trade, 2),
             expected_profit_per_trade=_expected_profit_per_trade(strategy, live_profit, len(trades)),
-            deviation_pct=round(shortfall_pct, 1), status="degraded",
-            detail=(
-                f"Winning {round(live_win_rate_pct)}% of live trades. This strategy needs "
-                f"{round(breakeven_pct)}% to break even on its own win/loss sizes, and its "
-                f"backtest won {round(expected_win_rate_pct)}%."
-            ),
+            deviation_pct=deviation_pct, status="degraded", detail=detail,
         )
 
+    # Every test below asks the same question: would the strategy the
+    # backtest describes produce a live record this poor by chance? Only
+    # when that is unlikely is the bot degraded. The old rules fired on
+    # the sign of ten trades, or on any win rate under breakeven, and a
+    # profitable strategy trips those routinely before its edge shows.
+
+    # Money: resample the backtest's own trades.
+    if (strategy.return_pct or 0) > 0:
+        chance = _probability_of_so_little(live_pnls, backtest_pnls)
+        if chance is not None and chance < DEGRADATION_P_VALUE:
+            return degraded(
+                f"{round(live_profit, 2)} over {len(trades)} live trades. The backtest's own trades, drawn at "
+                f"random, do this badly {chance * 100:.1f}% of the time - its edge is not showing live.",
+                100.0 if live_profit < 0 else None,
+            )
+        if chance is None and _significantly_losing(live_pnls):
+            return degraded(
+                f"Losing live ({round(live_profit, 2)} over {len(trades)} trades) on a strategy whose backtest "
+                "was profitable - more consistently than a losing streak would.",
+                100.0,
+            )
+
+    # Win rate: how often the backtest's win rate yields this few winners.
     if expected_win_rate_pct:
-        shortfall_pct = (expected_win_rate_pct - live_win_rate_pct) / expected_win_rate_pct * 100
-        if shortfall_pct >= DEGRADATION_THRESHOLD_PCT:
-            return HealthVerdict(
-                strategy_id=strategy.id, live_trades=len(trades), live_profit=round(live_profit, 2),
-                live_profit_per_trade=round(per_trade, 2),
-                expected_profit_per_trade=_expected_profit_per_trade(strategy, live_profit, len(trades)),
-                deviation_pct=round(shortfall_pct, 1), status="degraded",
-                detail=(
-                    f"Winning {round(live_win_rate_pct)}% of live trades against "
-                    f"{round(expected_win_rate_pct)}% in the backtest - {round(shortfall_pct)}% below it."
-                ),
+        chance = _probability_of_so_few_wins(wins, len(trades), expected_win_rate_pct)
+        if chance < DEGRADATION_P_VALUE:
+            shortfall_pct = (expected_win_rate_pct - live_win_rate_pct) / expected_win_rate_pct * 100
+            breakeven_pct = breakeven_win_rate_pct(session, strategy.id)
+            needs = (
+                f" It needs {round(breakeven_pct)}% to break even on its own win/loss sizes."
+                if breakeven_pct is not None else ""
+            )
+            return degraded(
+                f"Winning {round(live_win_rate_pct)}% of live trades against {round(expected_win_rate_pct)}% in "
+                f"the backtest - that few winners happens {chance * 100:.1f}% of the time by chance.{needs}",
+                round(shortfall_pct, 1),
             )
 
     # A strategy bred before the win rate was recorded has nothing to
@@ -313,6 +356,29 @@ def check_all_brokers(session: Session) -> list[BrokerVerdict]:
     return [check_across_brokers(session, strategy) for strategy in deployed]
 
 
+def _expected_trades_per_day(strategy: Strategy) -> float | None:
+    """The backtest's pace: out-of-sample trades over the out-of-sample
+    span, read from the stored OOS equity curve's first and last point."""
+    if not strategy.trades or not strategy.equity_oos:
+        return None
+    try:
+        points = json.loads(strategy.equity_oos)
+        span = datetime.fromisoformat(points[-1]["t"]) - datetime.fromisoformat(points[0]["t"])
+    except (ValueError, KeyError, IndexError, TypeError):
+        return None
+    days = span.total_seconds() / 86_400
+    return strategy.trades / days if days >= 1 else None
+
+
+def _probability_of_so_few_trades(observed: int, expected: float) -> float:
+    """P(at most `observed` trades) when `expected` were due (Poisson)."""
+    term = total = math.exp(-expected)
+    for k in range(1, observed + 1):
+        term *= expected / k
+        total += term
+    return min(total, 1.0)
+
+
 def ladder_entry(session: Session, strategy: Strategy, now: datetime | None = None) -> LadderEntry:
     """REQ-PORT-3 — where this bot stands, and what is holding it back."""
     now = now or datetime.now(timezone.utc)
@@ -341,11 +407,28 @@ def ladder_entry(session: Session, strategy: Strategy, now: datetime | None = No
     next_stage = STAGES[STAGES.index(stage) + 1] if stage != "FULL RISK" else None
 
     # REQ-PORT-3.4 — evidence can qualify a bot and still not earn it.
+    # Time alone can qualify one (guide_incubation.md), which is only safe
+    # because every one of these still has to be clear: a quiet bot that
+    # has placed three trades in six weeks has not proven anything by
+    # having been switched on for six weeks.
     blocked_reason = None
+    per_day = _expected_trades_per_day(strategy)
+    expected = per_day * days_live if per_day is not None else None
     if not trades:
         blocked_reason = "no live trades reported yet"
     elif net < 0:
         blocked_reason = f"underwater ({round(net, 2)}) — promotion is blocked until it recovers"
+    elif (verdict := check_strategy(session, strategy)).status == "degraded":
+        blocked_reason = f"decay warning: {verdict.detail}"
+    elif (
+        expected is not None
+        and days_live >= LOW_ACTIVITY_MIN_DAYS
+        and _probability_of_so_few_trades(len(trades), expected) < DEGRADATION_P_VALUE
+    ):
+        blocked_reason = (
+            f"trading far less than its backtest: {len(trades)} trades in {days_live} days, "
+            f"about {round(expected)} expected"
+        )
     elif next_stage is not None and STAGES.index(eligible_stage) <= STAGES.index(stage):
         blocked_reason = f"not enough live evidence for {next_stage} yet"
 

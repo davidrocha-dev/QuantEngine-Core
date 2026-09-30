@@ -44,6 +44,9 @@ datetime LastBarTime = 0;
 // time: some brokers refuse ORDER_TIME_SPECIFIED, and a clock expiry
 // counts weekend hours the backtest never sees.
 #define PENDING_BARS {{ pending_bars }}
+// The Incubation share this EA was installed at, used whenever the
+// ladder's file has no line for it (REQ-PORT-3.1).
+#define QE_DEFAULT_RISK_SHARE {{ default_risk_share }}
 {% if execution == "MARKET2" %}
 int    PendingDirection      = 0;   // a MARKET2 signal waiting out confirm_bars
 int    BarsUntilEntry        = 0;
@@ -314,15 +317,18 @@ bool HasPendingOrder()
 //| entry time only, so a promotion applies to NEW trades and never   |
 //| touches a position already open (REQ-PORT-3.7).                   |
 //|                                                                   |
-//| A missing or unreadable file means full target risk: the EA must  |
-//| not stop trading because the app is closed.                       |
+//| A missing file, or no line for this EA, means the share it was    |
+//| installed at (QE_DEFAULT_RISK_SHARE): a quarter for a fresh       |
+//| deploy. It used to mean full risk, so a new bot traded four times |
+//| its Incubation size until the app happened to write the file.     |
+//| The EA never stops trading because the app is closed.             |
 //+------------------------------------------------------------------+
 double RiskShare()
 {
    int handle = FileOpen(RiskOverrideFile, FILE_READ | FILE_CSV | FILE_ANSI | FILE_COMMON, ',');
-   if(handle == INVALID_HANDLE) return 1.0;
+   if(handle == INVALID_HANDLE) return QE_DEFAULT_RISK_SHARE;
 
-   double share = 1.0;
+   double share = QE_DEFAULT_RISK_SHARE;
    while(!FileIsEnding(handle))
    {
       long magic = StringToInteger(FileReadString(handle));
