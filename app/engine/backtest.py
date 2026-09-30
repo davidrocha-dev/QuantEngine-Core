@@ -366,7 +366,16 @@ def simulate_trades(
         management_hit = _apply_management_exit(
             genome, bar_hours, bar_weekdays, closes, entry_idx, baseline_exit_idx, int(direction), effective_entry
         )
-        if management_hit is not None and management_hit[0] <= baseline_exit_idx:
+        # Strictly earlier only. A stop or target is an order in the book
+        # and fills inside the bar; the management gene acts on the bar's
+        # close. On the same bar the order has already filled by then -
+        # letting the close win reported a stopped-out trade at the close
+        # instead, a smaller loss or, under FRIDAY PROFIT, a profit that
+        # MetaTrader never booked.
+        if management_hit is not None and (
+            management_hit[0] < baseline_exit_idx
+            or (management_hit[0] == baseline_exit_idx and exit_code == EXIT_MAX_HOLD)
+        ):
             exit_idx, exit_reason = management_hit
             exit_price = closes[exit_idx]
 
@@ -389,8 +398,23 @@ def simulate_trades(
                 lots = min(lots, max_lot)
             traded_risk = lots * loss_per_lot
 
+        # The share PARTIAL TP can actually close is a whole number of
+        # volume steps, and nothing below the broker's minimum. The EA
+        # floors it the same way, and when that leaves nothing - a 0.01
+        # lot position, common on a small account or at Incubation size -
+        # it closes nothing and still moves the stop to breakeven.
+        partial_fraction = None
+        if partial_r is not None and lot_step > 0.0 and lots > 0.0:
+            wanted = lots * genome.management.params.get("close_fraction", 0.5)
+            partial_lots = math.floor(wanted / lot_step + 1e-9) * lot_step
+            if partial_lots < min_lot:
+                partial_lots = 0.0
+            partial_fraction = partial_lots / lots
+            partial_closed = partial_lots > 0.0
+
         gross_pnl, r_multiple = _blend_partial_tp(
-            genome, direction, effective_entry, stop_price, exit_price, traded_risk, partial_r
+            genome, direction, effective_entry, stop_price, exit_price, traded_risk, partial_r,
+            fraction=partial_fraction,
         )
         commission = commission_per_lot * lots
         pnl_amount = gross_pnl - commission
@@ -581,15 +605,17 @@ def _run_partial_tp(
 
 def _blend_partial_tp(
     genome: Genome, direction: int, entry_price: float, stop_price: float, exit_price: float,
-    risk_amount: float, partial_r: float | None,
+    risk_amount: float, partial_r: float | None, fraction: float | None = None,
 ) -> tuple[float, float]:
     """Weighted-average R across both PARTIAL TP legs: `close_fraction` at
-    the banked `partial_r`, the remainder at the final exit."""
+    the banked `partial_r`, the remainder at the final exit. `fraction`,
+    when given, is the share the volume ladder actually let it close."""
     stop_distance = abs(entry_price - stop_price)
     full_r = (exit_price - entry_price) * direction / stop_distance if stop_distance > 0 else 0.0
     if partial_r is None:
         return risk_amount * full_r, full_r
 
-    fraction = genome.management.params.get("close_fraction", 0.5)
+    if fraction is None:
+        fraction = genome.management.params.get("close_fraction", 0.5)
     blended_r = fraction * partial_r + (1 - fraction) * full_r
     return risk_amount * blended_r, blended_r

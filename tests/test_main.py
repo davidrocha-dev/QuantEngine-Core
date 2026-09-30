@@ -600,6 +600,35 @@ def test_a_fresh_deploy_trades_at_its_incubation_share(tmp_path, monkeypatch):
     assert published == [{"#DEP001": 0.25}]
 
 
+def test_start_in_incubation_unchecked_deploys_at_full_risk(tmp_path, monkeypatch):
+    """REQ-PORT-4.8 - the opt-out the requirements and the guide describe."""
+    from sqlalchemy.orm import Session
+
+    from app.broker import pilot
+    from app.broker.mt5_install import InstallResult
+    from app.db import make_engine
+    from app.models import Strategy
+
+    fake_config = _FakeConfig(tmp_path)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
+    _seed_deployable_strategy(fake_config, _simple_genome())
+    captured, published = {}, []
+
+    def fake_install(filename, source, compile_after_install=True):
+        captured["source"] = source
+        return InstallResult(installed_paths=["C:/fake/QE_DEP001.mq5"], detail="ok")
+
+    patch_api(monkeypatch, "install_ea", fake_install)
+    monkeypatch.setattr(pilot, "write_risk_shares", lambda shares: published.append(shares))
+
+    assert client.post("/deploy/%23DEP001?start_in_incubation=false").status_code == 200
+
+    assert "#define QE_DEFAULT_RISK_SHARE 1.0" in captured["source"]
+    assert published == [{"#DEP001": 1.0}]
+    with Session(make_engine(fake_config.vault_db_path)) as session:
+        assert session.get(Strategy, "#DEP001").incubation_stage == "FULL RISK"
+
+
 def test_deploy_reports_a_conflict_when_no_terminal_is_installed(tmp_path, monkeypatch):
     from app.broker.mt5_install import InstallResult
 
@@ -1344,3 +1373,24 @@ def test_gene_pool_reports_the_genes_a_campaign_leaves_out(tmp_path, monkeypatch
     unavailable = client.get("/settings/gene-pool").json()["unavailable"]
 
     assert set(unavailable) == {"filter::CONSEC", "filter::EVENT", "bias::HTF"}
+
+
+def test_a_resumed_campaign_keeps_the_history_it_started_on(monkeypatch):
+    """After a restart the startup sync adds bars; the resumed campaign
+    used to reload "now" and every window moved under a population
+    measured on the old ones."""
+    import pandas as pd
+
+    from app.api import campaign_setup
+
+    stamps = pd.date_range("2024-01-01", periods=24 * 60, freq="1h", tz="UTC")
+    bars = pd.DataFrame({"timestamp": stamps, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0, "volume": 1.0})
+    monkeypatch.setattr(campaign_setup, "get_historical_bars", lambda symbol, timeframe: bars)
+
+    launched = pd.Timestamp("2024-02-10T00:00:00")  # stored naive, UTC
+    pinned = campaign_setup._load_bars("EURUSD", "H1", 0, as_of=launched)
+    now = campaign_setup._load_bars("EURUSD", "H1", 0)
+
+    assert pd.Timestamp(pinned["timestamp"].iloc[-1]) < launched.tz_localize("UTC")
+    assert len(now) == len(bars)
+    assert len(pinned) < len(now)

@@ -51,7 +51,17 @@ def _run_campaign_background(
     engine = make_engine(get_config().vault_db_path)
     try:
         settings = load_settings(get_config().settings_path)
-        df = _load_bars(symbol, timeframe, settings["campaign"]["history_depth_years"])
+        # A resumed campaign carries on with the history it started on.
+        # Reloading "now" after a restart handed it the bars the startup
+        # sync had just added: every window moved - in-sample, out-of-
+        # sample and holdout - under a population whose fitness had been
+        # measured on the old ones.
+        as_of = None
+        if resume:
+            with Session(engine) as session:
+                row = session.get(Campaign, campaign_id)
+                as_of = row.started_at if row is not None else None
+        df = _load_bars(symbol, timeframe, settings["campaign"]["history_depth_years"], as_of=as_of)
         with Session(engine) as session:
             outcome = run_campaign(
                 session, campaign_id, df, gene_pool, config,

@@ -19,12 +19,13 @@ amount of bar data can:
 Two price conventions meet here, and the difference is not a bug:
 
 The cached bars are **mid** prices (dukascopy_client.resample_ticks_to_ohlc
-averages bid and ask), and the bar backtester charges the spread once per
-trade as a cost. The ticks are real **bid and ask**, and a long is stopped
-out on the bid - which is below the mid, so a stop can be hit on ticks in
-a bar whose mid low never reached it. That is not the backtester being
-wrong; it is the resolution it works at. Tick mode is where you find out
-how much it costs you.
+averages bid and ask). The bar backtester pays the spread by moving the
+entry: a long is filled a full spread above the mid, and its stop and
+target are measured from there, which in mid space is where a bid-
+triggered stop and target sit. The ticks are real **bid and ask**, so a
+stop can still be touched on ticks inside a bar whose mid range did not
+quite reach it. That is the resolution the bars work at, and tick mode
+is where you find out how much it costs you.
 
 The same modelled cost is still subtracted from the tick result, so the
 two numbers are compared on equal terms. That double-charges the exit

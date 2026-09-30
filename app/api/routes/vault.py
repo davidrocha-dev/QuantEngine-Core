@@ -376,7 +376,7 @@ def post_export_mql5(strategy_id: str, body: ExportEaRequest) -> dict:
 
 
 @router.post("/deploy/{strategy_id}")
-def deploy_strategy(strategy_id: str, acknowledge_overlap: bool = False) -> dict:
+def deploy_strategy(strategy_id: str, acknowledge_overlap: bool = False, start_in_incubation: bool = True) -> dict:
     """REQ-VAULT-2.1 — generate the EA from the stored genome, install it
     into every MT5 terminal on this machine and compile it. Tier gating is
     the renderer's job (REQ-TIER-1.5); this endpoint does the work.
@@ -402,12 +402,18 @@ def deploy_strategy(strategy_id: str, acknowledge_overlap: bool = False) -> dict
                 detail={"error": "correlated_with_deployed", **warning.to_dict()},
             )
 
-    # REQ-PORT-3.1 - a bot going live starts in INCUBATION. One already
-    # deployed (a re-install) keeps the stage it has earned.
+    # REQ-PORT-4.1 - a bot going live starts in INCUBATION. One already
+    # deployed (a re-install) keeps the stage it has earned. REQ-PORT-4.8 -
+    # START IN INCUBATION unchecked deploys it at full target risk.
     with Session(engine) as session:
         current = session.get(Strategy, strategy_id)
         fresh = current is None or not current.deployed
-        stage = STAGES[0] if fresh or current.incubation_stage not in STAGES else current.incubation_stage
+        if not start_in_incubation:
+            stage = STAGES[-1]
+        elif fresh or current.incubation_stage not in STAGES:
+            stage = STAGES[0]
+        else:
+            stage = current.incubation_stage
 
     row, generated = _generate_ea_for(strategy_id, default_risk_share=STAGE_RISK_SHARE[stage])
     result = install_ea(generated.filename, generated.source)
@@ -418,7 +424,9 @@ def deploy_strategy(strategy_id: str, acknowledge_overlap: bool = False) -> dict
         strategy = session.get(Strategy, strategy_id)
         if strategy is not None:
             strategy.deployed = True
-            if fresh:
+            if not start_in_incubation:
+                strategy.incubation_stage = STAGES[-1]
+            elif fresh:
                 strategy.incubation_stage = None
             # active_mt5 stays false until the EA is actually attached to a
             # chart — installing a file is not the same as running it.

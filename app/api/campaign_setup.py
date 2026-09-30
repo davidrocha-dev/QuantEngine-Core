@@ -226,12 +226,24 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
     )
 
 
-def _load_bars(symbol: str, timeframe: str, history_depth_years: int):
+def _load_bars(symbol: str, timeframe: str, history_depth_years: int, as_of=None):
     """Historical bars trimmed to the configured HISTORY DEPTH — breeding on
-    more history than the user asked for silently multiplies campaign time."""
+    more history than the user asked for silently multiplies campaign time.
+
+    `as_of` pins the history to what existed at that moment: the depth is
+    counted back from it and nothing after it is returned. A resumed
+    campaign passes its launch time, so it continues on the bars it
+    started on rather than on whatever the startup sync has added since.
+    """
     bars = get_historical_bars(symbol, timeframe)
-    if bars.empty or not history_depth_years:
+    if bars.empty:
         return bars
-    cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=365 * history_depth_years)
-    trimmed = bars[pd.DatetimeIndex(bars["timestamp"]) >= cutoff]
+    stamps = pd.DatetimeIndex(bars["timestamp"])
+    end = pd.Timestamp.now(tz="UTC") if as_of is None else pd.Timestamp(as_of)
+    if end.tzinfo is None:
+        end = end.tz_localize("UTC")
+    keep = stamps < end if as_of is not None else stamps == stamps
+    if history_depth_years:
+        keep = keep & (stamps >= end - pd.Timedelta(days=365 * history_depth_years))
+    trimmed = bars[keep]
     return trimmed.reset_index(drop=True) if not trimmed.empty else bars

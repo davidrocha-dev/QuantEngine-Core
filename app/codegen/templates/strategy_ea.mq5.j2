@@ -377,10 +377,24 @@ bool StopsAllowed(double stopDistance, double targetDistance)
 
 //--- Risk sizing: a full stop-out costs exactly RiskPercent of equity,
 //--- scaled by whatever stage the Incubation ladder has this bot at.
+bool MinimumLotWarned = false;
+
+void WarnMinimumLot(double wanted, double actual)
+{
+   if(MinimumLotWarned) return;
+   MinimumLotWarned = true;
+   PrintFormat("QuantEngine: the minimum lot risks %.2f per trade where %.2f was asked for (risk %.2f%% x share %.2f). "
+               "On this account the Incubation share and the risk setting cannot make positions any smaller.",
+               actual, wanted, RiskPercent, RiskShare());
+}
+
 double LotsForRisk(double stopDistance)
 {
    if(stopDistance <= 0.0) return 0.0;
-   double riskAmount = AccountInfoDouble(ACCOUNT_EQUITY) * RiskPercent * RiskShare() / 100.0;
+   // Balance, as the backtester sizes it. Equity also carries the open
+   // profit and loss of every other bot on this account, so one bot's
+   // size moved with another's floating trade.
+   double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent * RiskShare() / 100.0;
    double tickValue  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
    double tickSize   = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
    if(tickValue <= 0.0 || tickSize <= 0.0) return 0.0;
@@ -394,6 +408,10 @@ double LotsForRisk(double stopDistance)
    double maxLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
    if(step <= 0.0) step = minLot;
    lots = MathFloor(lots / step + 1e-9) * step;
+   if(lots < minLot)
+      // The broker's minimum costs more than the risk setting allows, and
+      // the Incubation share cannot shrink it further: say so, once.
+      WarnMinimumLot(riskAmount, minLot * lossPerLot);
    lots = MathMax(minLot, MathMin(maxLot, lots));
    return NormalizeDouble(lots, VolumeDigits());
 }
