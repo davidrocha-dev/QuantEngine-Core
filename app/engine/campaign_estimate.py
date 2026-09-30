@@ -18,9 +18,14 @@ on one core. What that measurement corrected:
     write happen one candidate at a time in the parent. Dividing the
     whole campaign by the core count was the largest single error for a
     machine with many cores.
-  * **Windows differ per phase.** Phases 0 to 3 run on the in-sample
-    slice, Phase 4's baseline and noise runs on the out-of-sample
-    remainder, walk-forward across the whole series.
+  * **Windows differ per phase.** A final holdout (`HOLDOUT_FRACTION`)
+    is kept back from the search entirely. Of what remains, Phases 0 to 3
+    run on the in-sample slice, Phase 4's baseline and noise runs on the
+    out-of-sample remainder, walk-forward across the searched history;
+    the holdout is run once per approved candidate.
+  * **Phase 4 sees more than the hybrids.** The tribes' own elites
+    (`PHASE_4_ELITES_PER_TRIBE` each) go to robustness alongside the Phase
+    3 children that clear screening.
 
 Work is counted in "full runs": one backtest over the whole series. A
 Phase 0 evaluation is therefore 0.7 of a full run, and the totals below
@@ -41,7 +46,12 @@ from dataclasses import dataclass
 
 from app.engine.campaign import MAX_SCREENING_ROUNDS
 from app.engine.monte_carlo import NOISE_SAMPLES
-from app.engine.phases import DEFAULT_MAX_BREEDING_POPULATION, IS_FRACTION
+from app.engine.phases import (
+    DEFAULT_MAX_BREEDING_POPULATION,
+    HOLDOUT_FRACTION,
+    IS_FRACTION,
+    PHASE_4_ELITES_PER_TRIBE,
+)
 
 # Seconds per bar of every full-run-equivalent, at campaign level.
 # Calibrated against an ECO campaign on this machine: 39,734 XAUUSD M15
@@ -88,22 +98,27 @@ def campaign_work(
     """
     breeding_population = min(population_size, max_breeding_population)
     children = max(1, int(breeding_population * CHILD_FRACTION))
-    oos_fraction = 1 - IS_FRACTION
+    searched = 1 - HOLDOUT_FRACTION
+    is_fraction = searched * IS_FRACTION
+    oos_fraction = searched * (1 - IS_FRACTION)
 
     parallel = (
-        screening_rounds * population_size * IS_FRACTION  # Phase 0, redrawn each round
-        + TRIBES * generations * children * IS_FRACTION  # Phases 1 and 2
-        + phase3_children * IS_FRACTION  # Phase 3
+        screening_rounds * population_size * is_fraction  # Phase 0, redrawn each round
+        + TRIBES * generations * children * is_fraction  # Phases 1 and 2
+        + phase3_children * is_fraction  # Phase 3
     )
 
     # Phase 4, per candidate: the out-of-sample baseline always, then the
-    # noise re-simulations and the walk-forward windows only for those
-    # that clear robustness. The walk-forward windows partition the whole
-    # series, so together they are one full run.
+    # noise re-simulations, the walk-forward windows and the holdout only
+    # for those that clear robustness. The walk-forward windows partition
+    # the searched history, so together they are one pass over it.
+    # Candidates: the screened hybrids (at most every child) plus each
+    # tribe's elites.
+    candidates = phase3_children + TRIBES * PHASE_4_ELITES_PER_TRIBE
     per_candidate = oos_fraction
     if phase4_full_depth:
-        per_candidate += oos_fraction * NOISE_SAMPLES + 1.0
-    serial = phase3_children * per_candidate
+        per_candidate += oos_fraction * NOISE_SAMPLES + searched + HOLDOUT_FRACTION
+    serial = candidates * per_candidate
 
     return CampaignWork(parallel=parallel, serial=serial)
 

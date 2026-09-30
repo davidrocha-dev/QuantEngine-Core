@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api import runtime
+from app.api.campaign_setup import unavailable_genes
 from app.api.routes.campaign import _serialize_campaign
 from app.api.runtime import _mt5_bridge, _ws_clients
 from app.broker.terminal_watch import terminal_is_running
@@ -147,6 +148,9 @@ def _gene_pool_response(config: GenePoolConfig) -> dict:
     return {
         "genes": {f"{layer}::{name}": config.is_enabled(layer, name) for (layer, name) in ALL_GENES},
         "layer_counts": config.layer_counts(),
+        # Enabled or not, a campaign leaves these out; the screen says so
+        # instead of offering a toggle that changes nothing.
+        "unavailable": unavailable_genes(load_settings(get_config().settings_path)),
     }
 
 

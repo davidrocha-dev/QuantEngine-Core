@@ -104,3 +104,26 @@ def test_a_portfolio_with_no_usable_history_returns_an_empty_simulation(config):
     assert result.trades_taken == 0
     assert result.final_balance == config.initial_balance
     assert result.return_pct == 0.0
+
+
+def test_each_member_is_charged_its_own_market_costs(bars, config, monkeypatch):
+    """A portfolio mixes markets. Every member used to be re-simulated on
+    the first member's config, so a GBPUSD member paid EURUSD's spread in
+    EURUSD's points - on gold vs a major that is thousands of times off."""
+    from app.engine import true_sim
+
+    seen: list[tuple[float, float]] = []
+    real = true_sim.simulate_trades
+
+    def spy(df, genome, gene_pool, **kwargs):
+        seen.append((kwargs["point_size"], kwargs["cost_points"]))
+        return real(df, genome, gene_pool, **kwargs)
+
+    monkeypatch.setattr(true_sim, "simulate_trades", spy)
+    gbp = CampaignConfig(timeframe="H1", risk_pct=0.01, point_size=1e-3, cost_points=30.0, commission_per_lot=0.0)
+    members = [make_strategy("#A", asset="EURUSD"), make_strategy("#B", asset="GBPUSD", signal="ATR RUN")]
+
+    run_true_sim(members, bars, GenePoolConfig(), config, member_configs={"#B": gbp})
+
+    # #A has no entry of its own, so it falls back to the account config.
+    assert seen == [(1e-5, 12.0), (1e-3, 30.0)]

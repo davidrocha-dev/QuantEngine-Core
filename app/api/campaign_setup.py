@@ -72,6 +72,24 @@ def _gene_pool_for_campaign(config: CampaignConfig) -> GenePoolConfig:
     return gene_pool
 
 
+# Genes a campaign never draws, whatever the Gene Pool says, and why. The
+# Settings screen shows these greyed out rather than as live toggles.
+CONSEC_UNAVAILABLE = "Not modelled by the backtester yet, so campaigns never draw it."
+EVENT_UNAVAILABLE = "No economic calendar is loaded, so campaigns skip it."
+HTF_UNAVAILABLE = "HIGHER TF is off in Campaign settings, so campaigns skip it."
+
+
+def unavailable_genes(settings: dict) -> dict[str, str]:
+    """`{layer}::{name}` -> why `_gene_pool_for_campaign` will leave it out."""
+    unavailable = {"filter::CONSEC": CONSEC_UNAVAILABLE}
+    calendar = load_calendar(get_config().data_dir / "calendar.json", get_config().data_dir / "calendar.csv")
+    if not calendar:
+        unavailable["filter::EVENT"] = EVENT_UNAVAILABLE
+    if not settings["campaign"]["higher_tf_enabled"]:
+        unavailable["bias::HTF"] = HTF_UNAVAILABLE
+    return unavailable
+
+
 def _strategy_higher_timeframe(settings: dict, strategy) -> str | None:
     """The HIGHER TF context a Vault strategy is traded and re-checked with.
 

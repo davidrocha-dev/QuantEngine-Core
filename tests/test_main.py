@@ -1306,3 +1306,15 @@ def test_without_metaeditor_a_package_says_publishing_needs_metatrader(tmp_path,
     response = client.post("/vault/%23DEP001/marketplace-package")
     assert response.status_code == 409
     assert "MetaTrader 5" in response.json()["detail"]
+
+
+def test_gene_pool_reports_the_genes_a_campaign_leaves_out(tmp_path, monkeypatch):
+    """CONSEC is never drawn, EVENT needs a calendar and HTF needs HIGHER
+    TF. The toggles looked live; the screen now says why they are not."""
+    fake_config = _FakeConfig(tmp_path)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
+    client.post("/settings/campaign", json={"higher_tf_enabled": False})
+
+    unavailable = client.get("/settings/gene-pool").json()["unavailable"]
+
+    assert set(unavailable) == {"filter::CONSEC", "filter::EVENT", "bias::HTF"}

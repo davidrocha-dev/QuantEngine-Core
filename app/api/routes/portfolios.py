@@ -8,7 +8,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.campaign_setup import _load_bars, build_campaign_config
+from app.api.campaign_setup import _config_for_strategy, _load_bars, build_campaign_config
 from app.api.routes.vault import _serialize_strategy
 from app.config import get_config
 from app.db import make_engine
@@ -132,9 +132,12 @@ def post_true_sim(portfolio_id: str, body: TrueSimRequest) -> dict:
     if not bars_by_market:
         raise HTTPException(status_code=409, detail="No cached history for these members' markets.")
 
-    # Every member is re-simulated on the same cost and risk settings, so
-    # the account they share is internally consistent.
+    # One account (balance, risk per trade) shared by every member, and
+    # each member re-simulated on its own market: its point size, spread,
+    # contract size, currency conversion, swap and HIGHER TF context - the
+    # same config REASSESS and the EA export use for it.
     config = build_campaign_config(settings, members[0].asset, members[0].timeframe)
+    member_configs = {member.id: _config_for_strategy(settings, member) for member in members}
     result = run_true_sim(
         members,
         bars_by_market,
@@ -142,6 +145,7 @@ def post_true_sim(portfolio_id: str, body: TrueSimRequest) -> dict:
         config,
         sizing=body.sizing,
         max_aggregate_risk_pct=body.max_aggregate_risk_pct,
+        member_configs=member_configs,
     )
     return result.to_dict()
 

@@ -23,7 +23,7 @@ from app.engine.campaign_estimate import (
     estimate_campaign_minutes,
 )
 from app.engine.monte_carlo import NOISE_SAMPLES
-from app.engine.phases import IS_FRACTION
+from app.engine.phases import HOLDOUT_FRACTION, IS_FRACTION, PHASE_4_ELITES_PER_TRIBE
 
 REAL_BARS = 39_734
 REAL_CORES = 12
@@ -99,12 +99,18 @@ def test_the_range_is_the_screening_uncertainty_not_a_percentage_band():
 
 def test_noise_sampling_is_counted():
     """Phase 4 re-simulates each surviving candidate NOISE_SAMPLES times.
-    The old model counted one Phase 4 backtest per survivor."""
+    The old model counted one Phase 4 backtest per survivor. Candidates
+    are the Phase 3 children plus both tribes' elites, and every window
+    is a share of the history left after the final holdout."""
     deep = campaign_work(300, 5, 80, screening_rounds=1, phase4_full_depth=True)
     shallow = campaign_work(300, 5, 80, screening_rounds=1, phase4_full_depth=False)
 
-    oos = 1 - IS_FRACTION
-    assert deep.serial - shallow.serial == pytest.approx(80 * (oos * NOISE_SAMPLES + 1.0))
+    searched = 1 - HOLDOUT_FRACTION
+    oos = searched * (1 - IS_FRACTION)
+    candidates = 80 + 2 * PHASE_4_ELITES_PER_TRIBE
+    assert deep.serial - shallow.serial == pytest.approx(
+        candidates * (oos * NOISE_SAMPLES + searched + HOLDOUT_FRACTION)
+    )
 
 
 def test_more_cores_and_lighter_presets_shorten_the_estimate():

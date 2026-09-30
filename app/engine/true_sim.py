@@ -81,22 +81,35 @@ class _Candidate:
     unrealised: pd.Series  # per-bar R while the trade is open, indexed by time
 
 
-def _member_candidates(strategy: Strategy, df: pd.DataFrame, gene_pool: GenePoolConfig, config) -> list[_Candidate]:
-    """Every trade this member would have taken, with the R path it followed."""
+def _member_candidates(
+    strategy: Strategy, df: pd.DataFrame, gene_pool: GenePoolConfig, account, market
+) -> list[_Candidate]:
+    """Every trade this member would have taken, with the R path it followed.
+
+    `account` is the shared account (balance and risk per trade); `market`
+    is this member's own market - its point size, spread, contract size,
+    currency conversion, swap and HIGHER TF context. A portfolio mixes
+    markets, and charging every member the first member's spread in the
+    first member's points made the cost of a gold trade a fraction of a
+    pip or the cost of a EURUSD trade thousands of them.
+    """
     genome = Genome.from_dict(__import__("json").loads(strategy.genome_json))
     result = simulate_trades(
         df, genome, gene_pool,
-        initial_balance=config.initial_balance,
-        risk_pct=config.risk_pct,
-        point_size=config.point_size,
-        cost_points=config.cost_points,
-        commission_per_lot=config.commission_per_lot,
-        contract_size=config.contract_size,
-        lot_step=getattr(config, "lot_step", 0.0),
-        min_lot=getattr(config, "min_lot", 0.0),
-        max_lot=getattr(config, "max_lot", 0.0),
-        quote_to_account=getattr(config, "quote_to_account", None),
-        swap=getattr(config, "swap", None),
+        htf_df=getattr(market, "htf_df", None),
+        news_events=getattr(market, "news_events", None),
+        news_mode=getattr(market, "news_mode", "FTMO"),
+        initial_balance=account.initial_balance,
+        risk_pct=account.risk_pct,
+        point_size=market.point_size,
+        cost_points=market.cost_points,
+        commission_per_lot=market.commission_per_lot,
+        contract_size=market.contract_size,
+        lot_step=getattr(market, "lot_step", 0.0),
+        min_lot=getattr(market, "min_lot", 0.0),
+        max_lot=getattr(market, "max_lot", 0.0),
+        quote_to_account=getattr(market, "quote_to_account", None),
+        swap=getattr(market, "swap", None),
     )
 
     timestamps = pd.DatetimeIndex(df["timestamp"])
@@ -129,15 +142,21 @@ def run_true_sim(
     config,
     sizing: str = COMPOUNDING,
     max_aggregate_risk_pct: float = 5.0,
+    member_configs: dict | None = None,
 ) -> TrueSimResult:
     """Replays every member onto one account. `bars_by_market` maps
-    (symbol, timeframe) to the bars that market was bred on."""
+    (symbol, timeframe) to the bars that market was bred on;
+    `member_configs` maps a strategy id to the config of its own market
+    (costs, swap, HIGHER TF), falling back to `config` for any not given.
+    `config` is the shared account: balance and risk per trade."""
+    member_configs = member_configs or {}
     candidates: list[_Candidate] = []
     for strategy in strategies:
         df = bars_by_market.get((strategy.asset, strategy.timeframe))
         if df is None or df.empty:
             continue
-        candidates.extend(_member_candidates(strategy, df, gene_pool, config))
+        market = member_configs.get(strategy.id, config)
+        candidates.extend(_member_candidates(strategy, df, gene_pool, config, market))
 
     now = datetime.now().astimezone().isoformat()
     if not candidates:
