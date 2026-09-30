@@ -225,7 +225,9 @@ def _signal_three_soldiers(df: pd.DataFrame, htf_df: pd.DataFrame | None, params
 
 
 def _signal_vwap(df: pd.DataFrame, htf_df: pd.DataFrame | None, params: dict) -> pd.Series:
-    """VWAP — close crosses above the session VWAP fires long; crosses below fires short."""
+    """VWAP — close crosses above the session average price fires long;
+    crosses below fires short. The session average is equal-weighted, not
+    volume-weighted (see ta.vwap for why)."""
     values = ta.vwap(df)
     crossed_up = (df["close"] > values) & (df["close"].shift(1) <= values.shift(1))
     crossed_down = (df["close"] < values) & (df["close"].shift(1) >= values.shift(1))

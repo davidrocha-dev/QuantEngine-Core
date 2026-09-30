@@ -89,3 +89,22 @@ def test_rsi_with_no_losses_reads_100_not_50():
 
     rising = pd.Series(np.arange(1.0, 40.0))
     assert ta.rsi(rising).iloc[-1] == pytest.approx(100.0)
+
+
+def test_the_session_average_is_equal_weighted_and_resets_each_broker_day():
+    """No volume both sides share, so none is used: the EA's SessionVwap
+    averages the same typical prices over the same bars."""
+    import pandas as pd
+
+    stamps = pd.date_range("2024-01-15 22:00", periods=6, freq="h", tz="UTC")  # 00:00-05:00 on the server, winter
+    df = pd.DataFrame({
+        "timestamp": stamps,
+        "broker_time": pd.date_range("2024-01-16 00:00", periods=6, freq="h"),
+        "high": [3.0, 6.0, 9.0, 3.0, 6.0, 9.0], "low": [3.0, 6.0, 9.0, 3.0, 6.0, 9.0],
+        "close": [3.0, 6.0, 9.0, 3.0, 6.0, 9.0], "volume": [1.0, 1000.0, 1.0, 1.0, 1.0, 1.0],
+    })
+    np.testing.assert_allclose(ta.vwap(df).to_numpy(), [3.0, 4.5, 6.0, 5.25, 5.4, 6.0])
+
+    # Straddling the server's midnight (22:00-03:00): the third bar opens a new day.
+    straddling = df.assign(broker_time=pd.date_range("2024-01-16 22:00", periods=6, freq="h"))
+    np.testing.assert_allclose(ta.vwap(straddling).to_numpy(), [3.0, 4.5, 9.0, 6.0, 6.0, 6.75])

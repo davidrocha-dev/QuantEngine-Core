@@ -175,19 +175,18 @@ double AverageDailyRange(int period)
    return total / period;
 }
 
+// The session's average typical price since the server's midnight,
+// equal-weighted - the same arithmetic as the backtest's ta.vwap. Tick
+// volume is deliberately not used: the backtest's history has no tick
+// volume, and weighting the two sides by different volumes drew two
+// different lines.
 double SessionVwap(int shift)
 {
    int barIndex = BarOfDay(shift);
-   double cumulativePv = 0.0, cumulativeVolume = 0.0;
+   double total = 0.0;
    for(int i = shift; i <= shift + barIndex; i++)
-   {
-      double typical = (Hi(i) + Lo(i) + Cl(i)) / 3.0;
-      double volume  = (double)iTickVolume(_Symbol, PERIOD_CURRENT, i);
-      cumulativePv += typical * volume;
-      cumulativeVolume += volume;
-   }
-   if(cumulativeVolume <= 0.0) return Cl(shift);
-   return cumulativePv / cumulativeVolume;
+      total += (Hi(i) + Lo(i) + Cl(i)) / 3.0;
+   return total / (barIndex + 1);
 }
 
 bool AtrDeclining(int handle, int lookback)

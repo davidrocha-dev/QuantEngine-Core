@@ -182,14 +182,19 @@ def keltner(df: pd.DataFrame, period: int = 20, atr_mult: float = 2.0) -> tuple[
 
 
 def vwap(df: pd.DataFrame) -> pd.Series:
-    """Session-anchored VWAP, reset at the broker's midnight - the day
-    boundary MetaTrader's own bars use."""
+    """Session-anchored average price: the running mean of the typical
+    price (high + low + close) / 3 since the broker's midnight - the day
+    boundary MetaTrader's own bars use.
+
+    Deliberately not volume-weighted, though the gene keeps its VWAP name.
+    There is no volume both sides share: this history carries Dukascopy's
+    traded liquidity, the EA sees its broker's tick count, and weighting
+    by two different things drew two different lines. An equal-weighted
+    session mean is the same arithmetic on both, bar for bar (the EA's
+    SessionVwap computes exactly this).
+    """
     typical_price = (df["high"] + df["low"] + df["close"]) / 3
-    pv = typical_price * df["volume"]
-    day = broker_dates(df)
-    cum_pv = pv.groupby(day).cumsum()
-    cum_vol = df["volume"].groupby(day).cumsum()
-    return cum_pv / cum_vol.replace(0, np.nan)
+    return typical_price.groupby(broker_dates(df)).transform(lambda day: day.expanding().mean())
 
 
 def psar(df: pd.DataFrame, step: float = 0.02, max_step: float = 0.2) -> pd.Series:
