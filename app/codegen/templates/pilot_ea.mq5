@@ -15,7 +15,7 @@
 #property strict
 
 input int    PollSeconds   = 30;                       // how often to check for new deals
-input string OutputFile    = "quantengine_live.csv";   // written to the COMMON Files folder
+input string OutputFile    = "quantengine_live_v2.csv";   // written to the COMMON Files folder
 input int    LookbackDays  = 30;                       // how far back to scan on first run
 
 // Only deals from QuantEngine EAs are recorded. Generated strategy EAs use
@@ -47,15 +47,28 @@ void WriteHeaderIfMissing()
    if(handle == INVALID_HANDLE) return;
    // `broker` is what makes REQ-AUTO-3 possible: the same strategy losing
    // on every broker is alpha decay, losing on one is a broker problem.
-   FileWrite(handle, "deal_ticket", "closed_at", "magic", "symbol", "volume", "profit", "entry_price", "exit_price", "broker");
+   // `gmt_offset_seconds` turns closed_at (server clock) into UTC.
+   FileWrite(handle, "deal_ticket", "closed_at", "magic", "symbol", "volume", "profit", "entry_price", "exit_price",
+             "broker", "gmt_offset_seconds", "position_id");
    FileClose(handle);
 }
 
-//+------------------------------------------------------------------+
-//| Appends every closed QuantEngine deal newer than the last one we  |
-//| reported. Appending (never rewriting) means a restart cannot lose |
-//| history, and the engine deduplicates on deal_ticket anyway.       |
-//+------------------------------------------------------------------+
+// True when `ticket` is the last closing deal of its position in the
+// selected history - a PARTIAL TP closes a position in two deals, and it
+// is one trade.
+bool IsFinalExit(ulong ticket, long positionId, int total)
+{
+   for(int j = 0; j < total; j++)
+   {
+      ulong other = HistoryDealGetTicket(j);
+      if(other <= ticket) continue;
+      if(HistoryDealGetInteger(other, DEAL_POSITION_ID) != positionId) continue;
+      long entry = HistoryDealGetInteger(other, DEAL_ENTRY);
+      if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_OUT_BY) return false;
+   }
+   return true;
+}
+
 void ScanHistory()
 {
    datetime from = TimeCurrent() - (datetime)LookbackDays * 86400;
@@ -65,6 +78,7 @@ void ScanHistory()
    if(handle == INVALID_HANDLE) return;
    FileSeek(handle, 0, SEEK_END);
 
+   int gmtOffset = (int)(TimeTradeServer() - TimeGMT());
    int total = HistoryDealsTotal();
    for(int i = 0; i < total; i++)
    {
@@ -74,7 +88,32 @@ void ScanHistory()
 
       long magic = HistoryDealGetInteger(ticket, DEAL_MAGIC);
       if(magic < QE_MAGIC_MIN || magic > QE_MAGIC_MAX) continue;           // not ours
-      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;  // closes only
+      long entryKind = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+      if(entryKind != DEAL_ENTRY_OUT && entryKind != DEAL_ENTRY_OUT_BY) continue;  // closes only
+
+      // One row per position, written when it is fully closed. Each
+      // partial close used to be its own "trade", which doubled the trade
+      // count of every PARTIAL TP strategy and inflated its win rate.
+      long positionId = HistoryDealGetInteger(ticket, DEAL_POSITION_ID);
+      if(PositionSelectByTicket((ulong)positionId)) continue;   // still open: a partial close
+      if(!IsFinalExit(ticket, positionId, total)) continue;
+
+      // Net of commission and swap, on every deal of the position - what
+      // the account actually made. DEAL_PROFIT alone left both out, so a
+      // live run looked better than the account statement.
+      double net = 0.0, entryPrice = 0.0, volume = 0.0;
+      for(int j = 0; j < total; j++)
+      {
+         ulong deal = HistoryDealGetTicket(j);
+         if(HistoryDealGetInteger(deal, DEAL_POSITION_ID) != positionId) continue;
+         net += HistoryDealGetDouble(deal, DEAL_PROFIT) + HistoryDealGetDouble(deal, DEAL_COMMISSION)
+              + HistoryDealGetDouble(deal, DEAL_SWAP);
+         if(HistoryDealGetInteger(deal, DEAL_ENTRY) == DEAL_ENTRY_IN)
+         {
+            entryPrice = HistoryDealGetDouble(deal, DEAL_PRICE);
+            volume = HistoryDealGetDouble(deal, DEAL_VOLUME);
+         }
+      }
 
       FileWrite(
          handle,
@@ -82,11 +121,13 @@ void ScanHistory()
          TimeToString((datetime)HistoryDealGetInteger(ticket, DEAL_TIME), TIME_DATE | TIME_SECONDS),
          (string)magic,
          HistoryDealGetString(ticket, DEAL_SYMBOL),
-         DoubleToString(HistoryDealGetDouble(ticket, DEAL_VOLUME), 2),
-         DoubleToString(HistoryDealGetDouble(ticket, DEAL_PROFIT), 2),
-         DoubleToString(0.0, 5),                                           // entry price: see note below
+         DoubleToString(volume, 2),
+         DoubleToString(net, 2),
+         DoubleToString(entryPrice, 5),
          DoubleToString(HistoryDealGetDouble(ticket, DEAL_PRICE), 5),
-         AccountInfoString(ACCOUNT_SERVER)
+         AccountInfoString(ACCOUNT_SERVER),
+         (string)gmtOffset,
+         (string)positionId
       );
 
       if((long)ticket > LastReportedDeal) LastReportedDeal = (long)ticket;
@@ -94,7 +135,3 @@ void ScanHistory()
 
    FileClose(handle);
 }
-// Note on entry price: a closing deal knows its own price, not the price
-// the position opened at. QuantEngine compares realised profit per trade,
-// which the closing deal does carry, so the field is written as 0 rather
-// than guessed from an unrelated deal.

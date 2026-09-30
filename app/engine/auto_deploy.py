@@ -30,6 +30,7 @@ from app.broker.mt5_install import install_ea, uninstall_ea
 from app.data.broker_clock import DEFAULT_CLOCK, BrokerClock
 from app.codegen.mql5 import _safe_name, UnsupportedGeneError, generate_ea
 from app.engine.health import run_health_check
+from app.engine.overlap import check_against_deployed
 from app.genome.genome import Genome
 from app.models import Strategy
 
@@ -64,7 +65,17 @@ def _ea_filename(strategy_id: str) -> str:
 
 
 def find_replacement(session: Session, degraded: Strategy) -> Strategy | None:
-    """Best undeployed candidate for the same market."""
+    """Best undeployed candidate for the same market that the deploy button
+    would also accept without a warning.
+
+    Score alone let through two kinds of candidate a person deploying by
+    hand would have been stopped on: one graded WEAK (a score of 57+ can
+    still lose money - the grade is where that is caught), and one that
+    moves in step with a bot already running, which the manual deploy
+    path refuses with a 409. Unattended, neither check is less needed.
+    The bot being retired is left out of the correlation check: the
+    replacement trades the same market by design.
+    """
     candidates = session.scalars(
         select(Strategy)
         .where(Strategy.deleted_at.is_(None))
@@ -72,9 +83,13 @@ def find_replacement(session: Session, degraded: Strategy) -> Strategy | None:
         .where(Strategy.asset == degraded.asset)
         .where(Strategy.timeframe == degraded.timeframe)
         .where(Strategy.score >= MIN_REPLACEMENT_SCORE)
+        .where(Strategy.grade == "GOOD")
         .order_by(Strategy.score.desc())
     ).all()
-    return candidates[0] if candidates else None
+    for candidate in candidates:
+        if check_against_deployed(session, candidate, ignore_ids=(degraded.id,)) is None:
+            return candidate
+    return None
 
 
 def replace_degraded(

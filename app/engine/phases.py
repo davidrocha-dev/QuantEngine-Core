@@ -132,6 +132,17 @@ def split_holdout(df: pd.DataFrame, holdout_fraction: float = HOLDOUT_FRACTION) 
     return df.iloc[:cut].reset_index(drop=True), df.iloc[cut:].reset_index(drop=True)
 
 
+def split_search_holdout(df: pd.DataFrame, min_is_bars: int) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """The history a campaign searches, and its final holdout - or no
+    holdout when keeping one back would leave the search too few
+    in-sample bars. One rule, used by campaigns and by REASSESS alike, so
+    a re-check measures the same windows the strategy was approved on."""
+    search_df, holdout_df = split_holdout(df)
+    if len(split_is_oos(search_df)[0]) < min_is_bars:
+        return df, None
+    return search_df, holdout_df
+
+
 def split_is_oos(df: pd.DataFrame, is_fraction: float = IS_FRACTION) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Chronological split — time series data must never be split randomly."""
     split_idx = int(len(df) * is_fraction)

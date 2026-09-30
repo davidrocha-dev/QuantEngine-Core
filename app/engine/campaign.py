@@ -32,7 +32,7 @@ from app.engine.phases import (
     run_phase_2_expansion,
     run_phase_3_hybridization,
     run_phase_4_robustness,
-    split_holdout,
+    split_search_holdout,
     split_is_oos,
 )
 from app.engine.vault_writer import HIGHER_TF_OFF, write_vault_candidates
@@ -257,11 +257,7 @@ def run_campaign(
     # OOS numbers in the Vault are the best of dozens of candidates on that
     # window - the holdout is the one figure selection never saw. Only
     # taken when what remains can still hold a full campaign.
-    full_df = df
-    search_df, holdout_df = split_holdout(full_df)
-    if len(split_is_oos(search_df)[0]) < MIN_IS_BARS:
-        search_df, holdout_df = full_df, None
-    df = search_df
+    df, holdout_df = split_search_holdout(df, MIN_IS_BARS)
 
     is_df, _ = split_is_oos(df)
     span_days = _history_span_days(df)

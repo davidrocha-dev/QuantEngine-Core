@@ -22,18 +22,25 @@ import csv
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pandas as pd
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.broker.mt5_install import install_ea
+from app.data.broker_clock import DEFAULT_CLOCK, BrokerClock, clock_from_settings
 from app.codegen.mql5 import _magic_number
 from app.models import LiveTrade, Strategy
 
 PILOT_FILENAME = "QuantEngine_Pilot.mq5"
-REPORT_FILENAME = "quantengine_live.csv"
+REPORT_FILENAME = "quantengine_live_v2.csv"
+# What Pilot builds before v2 wrote: one row per closing deal (partial
+# closes counted separately), DEAL_PROFIT only, server time. Still read
+# until the new Pilot has been installed and has written its own file.
+LEGACY_REPORT_FILENAME = "quantengine_live.csv"
 PILOT_SOURCE = Path(__file__).resolve().parent.parent / "codegen" / "templates" / "pilot_ea.mq5"
 
 
@@ -64,8 +71,11 @@ def report_path() -> Path | None:
     directory = common_files_dir()
     if directory is None:
         return None
-    path = directory / REPORT_FILENAME
-    return path if path.exists() else None
+    for name in (REPORT_FILENAME, LEGACY_REPORT_FILENAME):
+        path = directory / name
+        if path.exists():
+            return path
+    return None
 
 
 RISK_FILENAME = "quantengine_risk.csv"
@@ -104,19 +114,39 @@ def _magic_to_strategy(session: Session) -> dict[int, str]:
     }
 
 
-def _parse_closed_at(value: str) -> datetime | None:
-    # MQL5's TimeToString writes "YYYY.MM.DD HH:MM:SS".
+def _parse_closed_at(value: str, gmt_offset_seconds: str | None = None, clock: BrokerClock | None = None) -> datetime | None:
+    """The deal's close time in UTC.
+
+    MQL5's TimeToString writes "YYYY.MM.DD HH:MM:SS" on the *server's*
+    clock. This used to be stored as if it were UTC, two or three hours
+    off on almost every broker. The v2 Pilot writes the server's offset
+    beside it; older rows are converted with the clock in Settings.
+    """
     for fmt in ("%Y.%m.%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
         try:
-            return datetime.strptime(value.strip(), fmt).replace(tzinfo=timezone.utc)
+            server_time = datetime.strptime(value.strip(), fmt)
         except ValueError:
             continue
+        if gmt_offset_seconds not in (None, ""):
+            try:
+                return (server_time - timedelta(seconds=int(gmt_offset_seconds))).replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        return (clock or DEFAULT_CLOCK).to_utc(pd.Timestamp(server_time)).to_pydatetime()
     return None
 
 
-def import_live_trades(session: Session, path: Path | None = None) -> ImportResult:
+def import_live_trades(session: Session, path: Path | None = None, clock: BrokerClock | None = None) -> ImportResult:
     """Imports the Pilot's report. Safe to call repeatedly."""
     path = path or report_path()
+    if clock is None:
+        try:
+            from app.config import get_config
+            from app.settings_store import load_settings
+
+            clock = clock_from_settings(load_settings(get_config().settings_path))
+        except Exception:
+            clock = DEFAULT_CLOCK
     if path is None or not path.exists():
         return ImportResult(
             imported=0, skipped_existing=0, unattributed=0, report_path=None,
@@ -136,7 +166,7 @@ def import_live_trades(session: Session, path: Path | None = None) -> ImportResu
                 skipped += 1
                 continue
 
-            closed_at = _parse_closed_at(row.get("closed_at", ""))
+            closed_at = _parse_closed_at(row.get("closed_at", ""), row.get("gmt_offset_seconds"), clock)
             if closed_at is None:
                 continue
 

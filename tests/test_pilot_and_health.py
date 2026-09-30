@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.broker.pilot import import_live_trades
@@ -439,3 +440,42 @@ def test_breakeven_is_unknown_on_too_few_recorded_trades():
         session.commit()
 
         assert breakeven_win_rate_pct(session, "#THIN") is None
+
+
+# --- server time, turned into UTC -------------------------------------------
+
+
+def test_a_v2_row_is_converted_with_the_offset_the_pilot_wrote(session, tmp_path):
+    from app.models import LiveTrade
+
+    strategy = make_strategy(session)
+    report = tmp_path / "live_v2.csv"
+    report.write_text(
+        "deal_ticket,closed_at,magic,symbol,volume,profit,entry_price,exit_price,broker,gmt_offset_seconds,position_id\n"
+        f"7,2026.01.05 12:00:00,{_magic_number(strategy.id)},EURUSD,0.10,-3.10,1.1,1.09,Demo,7200,70\n"
+    )
+    import_live_trades(session, report)
+    trade = session.scalars(select(LiveTrade)).one()
+    assert trade.closed_at.replace(tzinfo=None) == datetime(2026, 1, 5, 10, 0)  # server 12:00 at UTC+2
+    assert trade.profit == pytest.approx(-3.10)
+
+
+def test_a_legacy_row_is_converted_with_the_configured_clock(session, tmp_path):
+    from app.data.broker_clock import DEFAULT_CLOCK
+    from app.models import LiveTrade
+
+    strategy = make_strategy(session)
+    report = write_report(tmp_path / "live.csv", [("8", "2026.07.06 12:00:00", _magic_number(strategy.id), 1.0)])
+    import_live_trades(session, report, clock=DEFAULT_CLOCK)
+    trade = session.scalars(select(LiveTrade)).one()
+    assert trade.closed_at.replace(tzinfo=None) == datetime(2026, 7, 6, 9, 0)  # New York close is UTC+3 in July
+
+
+def test_the_broker_clock_round_trips():
+    import pandas as pd
+
+    from app.data.broker_clock import DEFAULT_CLOCK
+
+    for stamp in ("2026-01-15 22:00", "2026-07-15 21:00"):
+        utc = pd.Timestamp(stamp, tz="UTC")
+        assert DEFAULT_CLOCK.to_utc(DEFAULT_CLOCK.local([utc])[0]) == utc

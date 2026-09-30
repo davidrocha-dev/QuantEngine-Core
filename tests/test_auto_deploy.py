@@ -219,3 +219,31 @@ def test_the_uninstall_filename_comes_from_the_generator():
 
     for strategy_id in ("#C8B8C5", "#abc123", "#0E6C97"):
         assert _ea_filename(strategy_id) == f"{_safe_name(strategy_id)}.mq5"
+
+
+def test_a_candidate_graded_weak_is_never_a_replacement(session):
+    """A score of 57+ can still lose money; the grade is where that shows."""
+    degraded = make_strategy(session, "#OLD", deployed=True)
+    make_degraded(session, degraded)
+    make_strategy(session, "#LOSER", score=80, grade="WEAK")
+    assert find_replacement(session, degraded) is None
+
+
+def test_a_candidate_that_moves_with_a_running_bot_is_skipped(session, monkeypatch):
+    """The manual deploy path refuses this with a 409; unattended, it must too."""
+    from app.engine import auto_deploy
+    from app.engine.overlap import OverlapWarning
+
+    degraded = make_strategy(session, "#OLD", deployed=True)
+    make_strategy(session, "#OTHER", deployed=True, asset="GBPUSD")
+    make_strategy(session, "#TWIN", score=90)
+    make_strategy(session, "#FRESH", score=75)
+
+    def overlap(session_, candidate, ignore_ids=()):
+        assert "#OLD" in ignore_ids  # the bot being retired is not held against its successor
+        if candidate.id == "#TWIN":
+            return OverlapWarning("#TWIN", "#OTHER", 0.93, False, "same bet")
+        return None
+
+    monkeypatch.setattr(auto_deploy, "check_against_deployed", overlap)
+    assert find_replacement(session, degraded).id == "#FRESH"

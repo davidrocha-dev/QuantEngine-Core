@@ -105,3 +105,24 @@ def test_refresh_is_deterministic_too(bars):
 
     assert first.score == second.score
     assert first.return_pct == second.return_pct
+
+
+def test_refresh_measures_the_campaigns_windows_and_its_holdout():
+    """REASSESS used to split the whole history 70/30, so its out-of-sample
+    window swallowed the final holdout and part of the search's own
+    in-sample period."""
+    from app.engine.campaign import MIN_IS_BARS
+    from app.engine.phases import split_is_oos, split_search_holdout
+
+    df = make_synthetic_ohlc(6000, seed=4, drift=0.0003, volatility=0.002)
+    strategy = make_strategy(trading_genome())
+    refresh_strategy(strategy, df, GenePoolConfig(), make_config())
+
+    search_df, holdout_df = split_search_holdout(df, MIN_IS_BARS)
+    _, oos_df = split_is_oos(search_df)
+    assert holdout_df is not None
+    assert strategy.holdout_start == holdout_df["timestamp"].iloc[0].isoformat()
+    assert strategy.holdout_trades is not None
+    # The out-of-sample curve ends where the holdout begins.
+    last_oos_point = json.loads(strategy.equity_oos)[-1]["t"]
+    assert last_oos_point == oos_df["timestamp"].iloc[-1].isoformat()

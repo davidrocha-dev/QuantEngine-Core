@@ -49,6 +49,16 @@ class BrokerClock:
             return utc.tz_convert("America/New_York").tz_localize(None) + _NY_CLOSE_SHIFT
         return utc.tz_localize(None) + pd.Timedelta(hours=self.offset_hours)
 
+    def to_utc(self, local: pd.Timestamp) -> pd.Timestamp:
+        """The UTC instant of a broker wall-clock time (inverse of `local`)."""
+        local = pd.Timestamp(local).tz_localize(None) if pd.Timestamp(local).tzinfo else pd.Timestamp(local)
+        if self.mode == NY_CLOSE:
+            new_york = (local - _NY_CLOSE_SHIFT).tz_localize(
+                "America/New_York", ambiguous=True, nonexistent="shift_forward"
+            )
+            return new_york.tz_convert("UTC")
+        return (local - pd.Timedelta(hours=self.offset_hours)).tz_localize("UTC")
+
     def describe(self) -> str:
         if self.mode == NY_CLOSE:
             return "New York close (UTC+2 / UTC+3 with US daylight saving)"

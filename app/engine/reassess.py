@@ -33,6 +33,7 @@ from app.engine.phases import (
     MIN_PERSISTENCE_PCT,
     serialize_equity_curve,
     split_is_oos,
+    split_search_holdout,
 )
 from app.engine.scoring import compute_grade, compute_score
 from app.engine.trade_log import replace_trades
@@ -96,7 +97,8 @@ def refresh_strategy(
 ) -> ReassessResult:
     """Re-runs the stored genome over `df` and updates the row's stats."""
     genome = Genome.from_dict(_genome_dict(strategy))
-    is_df, oos_df = split_is_oos(df, IS_FRACTION)
+    search_df, holdout_df = _windows(df)
+    is_df, oos_df = split_is_oos(search_df, IS_FRACTION)
     kwargs = _backtest_kwargs(config)
 
     oos_result = simulate_trades(
@@ -116,6 +118,18 @@ def refresh_strategy(
     strategy.avg_hold_hours = oos_stats.avg_hold_hours
     strategy.equity_is = _json(serialize_equity_curve(is_df, is_result.equity_curve))
     strategy.equity_oos = _json(serialize_equity_curve(oos_df, oos_result.equity_curve))
+    # The holdout moves with the data: re-measured on today's newest slice,
+    # which is still history no gate decides on.
+    if holdout_df is not None and not holdout_df.empty:
+        holdout_result = simulate_trades(
+            holdout_df, genome, gene_pool, initial_balance=config.initial_balance, **kwargs
+        )
+        holdout = compute_trade_stats(holdout_result, holdout_df, config.initial_balance, strategy.timeframe)
+        strategy.holdout_return_pct = holdout.net_profit_pct
+        strategy.holdout_trades = holdout.trade_count
+        strategy.holdout_profit_factor = min(holdout.profit_factor, 10.0)
+        strategy.holdout_max_dd_pct = holdout.max_dd_pct
+        strategy.holdout_start = pd.Timestamp(holdout_df["timestamp"].iloc[0]).isoformat()
     # A REFRESH re-runs the same genome over newer data, so the stored
     # trades are replaced rather than added to: keeping both runs would
     # leave a history that belongs to no single backtest.
@@ -139,6 +153,7 @@ def reassess_strategy(
     """REFRESH plus the Phase 4 gates, re-scored against current data."""
     result = refresh_strategy(strategy, df, gene_pool, config)
     genome = Genome.from_dict(_genome_dict(strategy))
+    df, _ = _windows(df)
     is_df, oos_df = split_is_oos(df, IS_FRACTION)
     kwargs = _backtest_kwargs(config)
 
@@ -212,6 +227,16 @@ def reassess_strategy(
         result.still_passes = True
 
     return result
+
+
+def _windows(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """The windows a campaign would use on this history. REASSESS used to
+    split all of it 70/30, so its "out-of-sample" window took in the final
+    holdout and part of the search's own in-sample period, and the Vault's
+    figures changed meaning after every re-check."""
+    from app.engine.campaign import MIN_IS_BARS
+
+    return split_search_holdout(df, MIN_IS_BARS)
 
 
 def _genome_dict(strategy: Strategy) -> dict:

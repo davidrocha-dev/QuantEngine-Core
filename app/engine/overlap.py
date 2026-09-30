@@ -43,7 +43,9 @@ class OverlapWarning:
         return {k: v for k, v in vars(self).items()}
 
 
-def check_against_deployed(session: Session, strategy: Strategy) -> OverlapWarning | None:
+def check_against_deployed(
+    session: Session, strategy: Strategy, ignore_ids: tuple[str, ...] = ()
+) -> OverlapWarning | None:
     """The strongest overlap with anything already deployed, if any.
 
     Returns the worst offender rather than a list: the question at the
@@ -56,6 +58,7 @@ def check_against_deployed(session: Session, strategy: Strategy) -> OverlapWarni
                 Strategy.deployed.is_(True),
                 Strategy.deleted_at.is_(None),
                 Strategy.id != strategy.id,
+                Strategy.id.not_in(ignore_ids) if ignore_ids else True,
             )
         )
     )
