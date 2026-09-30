@@ -26,6 +26,9 @@ from app.config import get_config, set_auto_backup_before_updates, set_built_in_
 from app.data.provider import TIMEFRAME_MINUTES, get_historical_bars
 from app.data.broker_clock import clock_from_settings
 from app.data.conversion import quote_to_account_series
+from app.engine.swap import MONEY as SWAP_MONEY
+from app.engine.swap import PRICE as SWAP_PRICE
+from app.engine.swap import SwapSpec
 from app.data.sync import DeltaSyncRunner, SyncState
 from app.data.symbols import BUNDLED_SYMBOLS, INSTRUMENTS, TIMEFRAMES, get_instrument
 from app.db import make_engine
@@ -265,6 +268,50 @@ def _spread_points(costs: dict, symbol: str, instrument) -> float:
     return live
 
 
+# MetaTrader's SYMBOL_SWAP_MODE values this engine can price.
+_MT5_SWAP_POINTS = 1
+_MT5_SWAP_CURRENCY_DEPOSIT = 4
+
+
+def _swap_spec(costs: dict, symbol: str, instrument) -> SwapSpec | None:
+    """Overnight financing for `symbol`, by Settings -> Costs -> Swap mode.
+
+    AUTO reads it from MetaTrader, which must be open - as with spread,
+    there is no quiet fallback. MANUAL takes per-symbol long/short figures
+    in the instrument's points (negative is a charge). OFF charges none.
+    """
+    mode = costs.get("swap_mode", "AUTO")
+    if mode == "OFF":
+        return None
+    if mode != "AUTO":
+        manual = (costs.get("manual_swap_by_symbol") or {}).get(symbol)
+        if not manual:
+            return None
+        point = 1 / instrument.point_divisor
+        return SwapSpec(float(manual.get("long", 0.0)) * point, float(manual.get("short", 0.0)) * point, SWAP_PRICE)
+
+    if not _mt5_bridge.is_connected():
+        _mt5_bridge.connect()
+    quote = _mt5_bridge.get_swap(symbol) if _mt5_bridge.is_connected() else None
+    if quote is None:
+        raise SpreadUnavailable(
+            f"Swap mode is AUTO, which reads {symbol}'s swap from MetaTrader 5, and no terminal answered. "
+            "Open MetaTrader 5, or switch Settings -> Costs -> Swap mode to MANUAL or OFF."
+        )
+    triple_day = (quote["rollover3days"] - 1) % 7  # MT5 counts from Sunday, SwapSpec from Monday
+    if quote["mode"] == _MT5_SWAP_POINTS:
+        return SwapSpec(quote["long"] * quote["point"], quote["short"] * quote["point"], SWAP_PRICE, triple_day)
+    if quote["mode"] == _MT5_SWAP_CURRENCY_DEPOSIT:
+        return SwapSpec(quote["long"], quote["short"], SWAP_MONEY, triple_day)
+    if quote["mode"] == 0:  # swaps disabled on this symbol
+        return None
+    logging.getLogger("quantengine").warning(
+        "%s swap is quoted in MetaTrader mode %d, which this engine does not price yet; no swap is charged.",
+        symbol, quote["mode"],
+    )
+    return None
+
+
 def _gene_pool_for_campaign(config: CampaignConfig) -> GenePoolConfig:
     """The enabled genes, minus any the campaign cannot actually use.
 
@@ -414,6 +461,7 @@ def build_campaign_config(settings: dict, symbol: str, timeframe: str) -> Campai
         min_lot=float(caps.get("min_lot_size", 0.0)),
         max_lot=float(caps.get("max_lot_size", 0.0)),
         quote_to_account=quote_to_account_series(instrument, get_historical_bars),
+        swap=_swap_spec(costs, symbol, instrument),
         max_workers=campaign_settings["cores"] or None,  # 0 = auto
         data_source="bundled" if get_config().built_in_data_only else "dukascopy",
         # SMART MODE (Settings → Campaign) biases which genes get drawn,
@@ -1445,6 +1493,70 @@ TICK_VERIFY_MAX_TRADES = 60
 TICK_VERIFY_MAX_HOURS = 400
 
 
+class CompareMt5Request(BaseModel):
+    report_path: str
+
+
+@app.post("/vault/{strategy_id}/compare-mt5")
+def compare_with_mt5_report(strategy_id: str, body: CompareMt5Request) -> dict:
+    """Trade-by-trade: this strategy's backtest against a Strategy Tester
+    report of its exported EA, over the report's own period.
+
+    The backtest runs over the whole cached history (so every indicator
+    is warmed up exactly as it is in MetaTrader) and only the trades that
+    fall inside the report's span are compared.
+    """
+    from app.engine.mt5_report import ReportUnreadable, read_report
+    from app.engine.trade_parity import compare_trades
+
+    try:
+        mt5_trades = read_report(body.report_path)
+    except ReportUnreadable as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    settings = load_settings(get_config().settings_path)
+    engine = make_engine(get_config().vault_db_path)
+    with Session(engine) as session:
+        strategy = session.get(Strategy, strategy_id)
+        if strategy is None or strategy.deleted_at is not None:
+            raise HTTPException(status_code=404, detail=f"Unknown strategy: {strategy_id}")
+        session.expunge(strategy)
+
+    try:
+        config = _config_for_strategy(settings, strategy)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    df = get_historical_bars(strategy.asset, strategy.timeframe)
+    if df.empty:
+        raise HTTPException(status_code=409, detail=f"No {strategy.timeframe} history cached for {strategy.asset}.")
+
+    genome = Genome.from_dict(json.loads(strategy.genome_json))
+    result = simulate_trades(
+        df, genome, GenePoolConfig(),
+        initial_balance=config.initial_balance, risk_pct=config.risk_pct,
+        point_size=config.point_size, cost_points=config.cost_points,
+        commission_per_lot=config.commission_per_lot, contract_size=config.contract_size,
+        lot_step=config.lot_step, min_lot=config.min_lot, max_lot=config.max_lot,
+        quote_to_account=config.quote_to_account, swap=config.swap, htf_df=config.htf_df,
+    )
+    report = compare_trades(
+        result.trades, df, mt5_trades,
+        bar_minutes=TIMEFRAME_MINUTES.get(strategy.timeframe, 60), point_size=config.point_size,
+    )
+    reported_symbols = {deal.symbol for trade in mt5_trades for deal in trade.deals if deal.symbol}
+    foreign = sorted(sym for sym in reported_symbols if not sym.upper().startswith(strategy.asset.upper()))
+    return {
+        "status": "ok",
+        "strategy_id": strategy_id,
+        "report_symbols": sorted(reported_symbols),
+        "symbol_warning": (
+            f"The report trades {', '.join(foreign)}, not {strategy.asset}." if foreign else None
+        ),
+        **report.to_dict(),
+    }
+
+
 @app.post("/vault/{strategy_id}/tick-verify")
 async def tick_verify_strategy(strategy_id: str, max_trades: int = TICK_VERIFY_MAX_TRADES) -> dict:
     """Re-resolves a strategy's exits against raw ticks.
@@ -1494,7 +1606,7 @@ async def tick_verify_strategy(strategy_id: str, max_trades: int = TICK_VERIFY_M
         lot_step=config.lot_step,
         min_lot=config.min_lot,
         max_lot=config.max_lot,
-        quote_to_account=config.quote_to_account,
+        quote_to_account=config.quote_to_account, swap=config.swap,
         htf_df=config.htf_df,
     )
     trades = result.trades[-max(1, min(max_trades, TICK_VERIFY_MAX_TRADES)):]

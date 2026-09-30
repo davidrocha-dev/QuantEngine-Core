@@ -595,7 +595,7 @@ def run_phase_4_robustness(
                 k: v
                 for k, v in eval_kwargs.items()
                 if k in ("cost_points", "commission_per_lot", "contract_size", "risk_pct",
-                         "lot_step", "min_lot", "max_lot", "quote_to_account", "htf_df", "news_events", "news_mode")
+                         "lot_step", "min_lot", "max_lot", "quote_to_account", "swap", "htf_df", "news_events", "news_mode")
             },
         )
         persistence = walk_forward.persistence_pct if walk_forward else None

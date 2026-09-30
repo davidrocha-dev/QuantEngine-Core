@@ -505,11 +505,14 @@ EXECUTION_GENES: dict[str, GeneSpec] = {
     # LIMIT — enter on a pullback: place a limit order `offset_atr` ATRs
     # behind the signal price, filled only if price retraces to it.
     "LIMIT": GeneSpec("LIMIT", "execution", {"offset_atr": 0.5}, None, {"offset_atr": ("float", 0.1, 1.2)}),
-    # LIMIT2 — two-tier scaled limit entry at 0.5x and 1.0x ATR pullback,
-    # position split evenly between the two fills.
+    # LIMIT2 — one limit order at the average of two ATR pullbacks
+    # (offset_atr_1, offset_atr_2). Named for a two-tier scaled entry, but
+    # both the backtester and the EA place a single order at the midpoint;
+    # `split` is carried for stored genomes and not read.
     "LIMIT2": GeneSpec("LIMIT2", "execution", {"offset_atr_1": 0.5, "offset_atr_2": 1.0, "split": 0.5}, None, {"offset_atr_1": ("float", 0.1, 1.0), "offset_atr_2": ("float", 0.6, 2.0)}),
-    # MARKET2 — market entry, but only if the signal is still active
-    # `confirm_bars` bars later (avoids single-bar noise).
+    # MARKET2 — market entry at the open `confirm_bars` bars after the
+    # signal bar, whatever the signal does meanwhile (the backtester and the
+    # EA both latch it; nothing is re-tested while it waits).
     "MARKET2": GeneSpec("MARKET2", "execution", {"confirm_bars": 2}, None, {"confirm_bars": ("int", 1, 5)}),
     # STOP — breakout-style stop entry `offset_atr` ATRs beyond the signal price.
     "STOP": GeneSpec("STOP", "execution", {"offset_atr": 0.3}, None, {"offset_atr": ("float", 0.05, 1.0)}),

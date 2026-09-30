@@ -92,6 +92,8 @@ class CampaignConfig:
     # Account currency per unit of the instrument's quote currency, by
     # timestamp (app/data/conversion.py). None when they are the same.
     quote_to_account: pd.Series | None = None
+    # Overnight financing per lot per night (app/engine/swap.py); None = none charged.
+    swap: object | None = None
     data_source: str = "dukascopy"
     # Smart Mode sampling weights (app/engine/smart_mode.py). Empty means
     # uniform sampling, which is what every campaign did before Smart Mode.
@@ -299,6 +301,7 @@ def run_campaign(
         "min_lot": config.min_lot,
         "max_lot": config.max_lot,
         "quote_to_account": config.quote_to_account,
+        "swap": config.swap,
         "htf_df": config.htf_df,
         "news_events": config.news_events or None,
         "news_mode": config.news_mode,

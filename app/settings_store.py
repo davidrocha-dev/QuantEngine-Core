@@ -57,6 +57,12 @@ DEFAULT_APP_SETTINGS: dict[str, Any] = {
         # to `manual_spread_points`.
         "manual_spread_by_symbol": {},
         "commission_per_lot": 7.0,
+        # Overnight financing. AUTO reads each symbol's swap from MT5 (open
+        # terminal required, like AUTO spread); MANUAL uses
+        # manual_swap_by_symbol {"XAUUSD": {"long": -45, "short": 20}}, in
+        # the instrument's points per lot per night, negative a charge.
+        "swap_mode": "AUTO",  # AUTO | MANUAL | OFF
+        "manual_swap_by_symbol": {},
         "slippage_points": 2.0,
     },
     "broker_caps": {

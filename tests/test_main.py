@@ -26,6 +26,10 @@ def _a_terminal_quoting_a_spread(monkeypatch):
         bridge, "get_live_quote", lambda symbol: LiveQuote(symbol, 1.0, 1.0002, 0.0002)
     )
     monkeypatch.setattr(bridge, "get_server_info", lambda: None)
+    monkeypatch.setattr(
+        bridge, "get_swap",
+        lambda symbol: {"symbol": symbol, "mode": 1, "long": -5.0, "short": 1.0, "rollover3days": 3, "point": 0.00001},
+    )
 
 
 def test_status():

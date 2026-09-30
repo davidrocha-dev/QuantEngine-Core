@@ -99,6 +99,24 @@ class MT5Bridge:
             spread_points=(tick.ask - tick.bid),
         )
 
+    def get_swap(self, symbol: str) -> dict | None:
+        """The symbol's swap as the broker quotes it: mode, long, short,
+        the triple-swap weekday (MT5: 0 = Sunday) and the point size."""
+        if mt5 is None or not self._connected:
+            return None
+        name = self.resolve_symbol(symbol)
+        info = mt5.symbol_info(name) if name else None
+        if info is None:
+            return None
+        return {
+            "symbol": name,
+            "mode": int(info.swap_mode),
+            "long": float(info.swap_long),
+            "short": float(info.swap_short),
+            "rollover3days": int(info.swap_rollover3days),
+            "point": float(info.point),
+        }
+
     def server_gmt_offset_hours(self) -> int | None:
         """The server clock's offset from UTC right now, read off the most
         recent tick in Market Watch - or None when nothing has ticked in

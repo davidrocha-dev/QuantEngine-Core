@@ -25,6 +25,8 @@ import numpy as np
 import pandas as pd
 
 from app.data.broker_clock import bar_clock
+from app.engine.swap import PRICE as SWAP_PRICE
+from app.engine.swap import SwapSpec, nights_held
 from app.engine.news_filter import EconomicEvent, NewsMode, apply_news_filter
 from app.genome.gene_pool import GenePoolConfig
 from app.genome.genes import ALL_GENES
@@ -190,6 +192,7 @@ def simulate_trades(
     commission_per_lot: float = 0.0,
     contract_size: float = 100_000.0,
     quote_to_account: pd.Series | None = None,
+    swap: SwapSpec | None = None,
     entry_delay_bars: int = 0,
     max_leverage_breach_balance: float = 0.0,
     lot_step: float = 0.0,
@@ -224,7 +227,12 @@ def simulate_trades(
     quote currency, and sizing without converting it made a USDJPY lot
     look about 150 times bigger than it is - the broker ladder then
     rounded a real 0.5 lot to the 0.01 minimum and commission all but
-    vanished."""
+    vanished.
+
+    `swap` is the symbol's overnight financing (app/engine/swap.py),
+    charged per rollover the position is held through, on the broker's
+    clock, and folded into both the P&L and the trade's R so every
+    downstream measure - Monte Carlo included - sees it."""
     _validate_genome_against_pool(genome, gene_pool)
 
     signal_spec = ALL_GENES[("signal", genome.signal.name)]
@@ -253,6 +261,7 @@ def simulate_trades(
         bar_hours = bar_weekdays = np.empty(0, dtype=np.int64)
     signal_arr, bias_arr, veto_arr = signal.to_numpy(), bias.to_numpy(), veto.to_numpy()
     conversion = _conversion_per_bar(df, quote_to_account)
+    bar_days = bar_clock(df).to_numpy().astype("datetime64[D]") if swap is not None else None
     pending_entry = genome.execution.name in PENDING_EXECUTION_GENES
 
     n = len(df)
@@ -379,6 +388,16 @@ def simulate_trades(
         )
         commission = commission_per_lot * lots
         pnl_amount = gross_pnl - commission
+        if swap is not None and exit_idx > entry_idx:
+            nights = nights_held(bar_days[entry_idx], bar_days[exit_idx], swap.triple_day)
+            if nights:
+                per_night = swap.per_lot_night(int(direction))
+                if swap.kind == SWAP_PRICE:
+                    per_night *= contract_size * conversion[entry_idx]
+                financing = lots * nights * per_night
+                pnl_amount += financing
+                if traded_risk > 0:
+                    r_multiple += financing / traded_risk
 
         # Mark-to-market between entry and exit, so Max DD reflects the
         # drawdown actually lived through, not only closed-trade equity.
