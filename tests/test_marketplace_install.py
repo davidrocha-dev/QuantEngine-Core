@@ -91,3 +91,14 @@ def test_the_endpoint_rejects_a_payload_that_is_not_base64(fake_terminals):
     assert bad.status_code == 422
     assert good.status_code == 200
     assert len(good.json()["installed_paths"]) == 2
+
+
+def test_a_name_that_climbs_out_of_the_experts_folder_is_refused(tmp_path, monkeypatch):
+    """The file name comes from whoever published the listing."""
+    from app.broker import mt5_install
+
+    monkeypatch.setattr(mt5_install, "terminal_data_dirs", lambda: [tmp_path / "terminal"])
+    for name in ("..\\..\\Startup\\evil.ex5", "../evil.ex5", str(tmp_path / "abs.ex5"), "sub/evil.ex5"):
+        result = install_compiled_ea(name, COMPILED)
+        assert not result.installed_paths, name
+    assert not (tmp_path / "abs.ex5").exists()

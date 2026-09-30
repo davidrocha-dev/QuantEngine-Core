@@ -19,7 +19,9 @@ class MarketplaceInstallRequest(BaseModel):
 
     filename: str
     content_base64: str
-    sha256: str | None = None
+    # Required: the bytes are about to be allowed to trade, and the shell
+    # always has the licence server's checksum to send.
+    sha256: str
 
 
 @router.post("/marketplace/install")

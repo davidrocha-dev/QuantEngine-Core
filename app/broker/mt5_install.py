@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -137,6 +138,9 @@ def install_ea(filename: str, source: str, compile_after_install: bool = True) -
     return result
 
 
+_SAFE_EA_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{0,100}\.ex5$", re.IGNORECASE)
+
+
 def install_compiled_ea(filename: str, content: bytes, expected_sha256: str | None = None) -> InstallResult:
     """Installs an already-compiled `.ex5` — REQ-MKT-1.3.
 
@@ -148,6 +152,11 @@ def install_compiled_ea(filename: str, content: bytes, expected_sha256: str | No
     """
     if not filename.lower().endswith(".ex5"):
         return InstallResult(detail="Only compiled .ex5 files can be installed this way.")
+    # The name came over the network from whoever published the listing.
+    # Joined onto the Experts folder as given, "..\\..\\x.ex5" or an
+    # absolute path wrote the file anywhere on the disk.
+    if not _SAFE_EA_NAME.match(filename) or ".." in filename:
+        return InstallResult(detail=f"Refusing to install an EA under the name {filename!r}.")
     if expected_sha256:
         actual = hashlib.sha256(content).hexdigest()
         if actual != expected_sha256:
