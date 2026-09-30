@@ -1270,3 +1270,39 @@ def test_an_exported_ea_uses_the_htf_context_its_strategy_was_bred_with():
     assert main_module._strategy_higher_timeframe(settings, legacy) == "H1"
     settings["campaign"]["higher_tf_enabled"] = False
     assert main_module._strategy_higher_timeframe(settings, legacy) is None
+
+
+def test_a_marketplace_package_is_the_strategys_own_figures_and_its_compiled_ea(tmp_path, monkeypatch):
+    import base64
+    import hashlib
+
+    from app.broker import mt5_install
+
+    fake_config = _FakeConfig(tmp_path)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
+    _seed_deployable_strategy(fake_config, _simple_genome())
+
+    def fake_compile(source_path):
+        source_path.with_suffix(".ex5").write_bytes(b"EX5")
+        return True, ""
+
+    monkeypatch.setattr(mt5_install, "compile_ea", fake_compile)
+    body = client.post("/vault/%23DEP001/marketplace-package").json()
+
+    assert body["filename"].endswith(".ex5")
+    assert base64.b64decode(body["content_base64"]) == b"EX5"
+    assert body["sha256"] == hashlib.sha256(b"EX5").hexdigest()
+    assert body["symbol"] and body["timeframe"]
+
+
+def test_without_metaeditor_a_package_says_publishing_needs_metatrader(tmp_path, monkeypatch):
+    from app.broker import mt5_install
+
+    fake_config = _FakeConfig(tmp_path)
+    patch_api(monkeypatch, "get_config", lambda: fake_config)
+    _seed_deployable_strategy(fake_config, _simple_genome())
+    monkeypatch.setattr(mt5_install, "compile_ea", lambda path: (False, "MetaEditor was not found on this machine."))
+
+    response = client.post("/vault/%23DEP001/marketplace-package")
+    assert response.status_code == 409
+    assert "MetaTrader 5" in response.json()["detail"]

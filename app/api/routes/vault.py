@@ -311,6 +311,51 @@ class ExportEaRequest(BaseModel):
     destination_dir: str
 
 
+@router.post("/vault/{strategy_id}/marketplace-package")
+def marketplace_package(strategy_id: str) -> dict:
+    """What a Marketplace listing is made of: the strategy's own figures,
+    read from the Vault rather than typed into a form, and its EA compiled
+    to .ex5 - subscribers only ever receive the compiled file, never the
+    source (REQ-MKT-1.3).
+
+    Compiling needs MetaEditor, which MetaTrader 5 installs; without it
+    this answers 409 and says so.
+    """
+    import base64
+    import hashlib
+    import tempfile
+
+    from app.broker.mt5_install import compile_ea
+
+    row, generated = _generate_ea_for(strategy_id)
+    with tempfile.TemporaryDirectory(prefix="qe-publish-") as work:
+        source_path = Path(work) / generated.filename
+        source_path.write_text(generated.source, encoding="utf-8")
+        compiled, log = compile_ea(source_path)
+        if not compiled:
+            raise HTTPException(
+                status_code=409,
+                detail="The EA could not be compiled: " + (log.strip().splitlines()[-1] if log.strip() else "MetaEditor not found")
+                + ". Publishing needs MetaTrader 5 (with MetaEditor) installed on this machine.",
+            )
+        content = source_path.with_suffix(".ex5").read_bytes()
+
+    return {
+        "strategy_id": row.id,
+        "symbol": row.asset,
+        "timeframe": row.timeframe,
+        "score": row.score,
+        "robustness_pct": row.robust_pct,
+        "trades": row.trades,
+        "return_pct": row.return_pct,
+        "max_dd_pct": row.max_dd_pct,
+        "grade": row.grade,
+        "filename": source_path.with_suffix(".ex5").name,
+        "content_base64": base64.b64encode(content).decode(),
+        "sha256": hashlib.sha256(content).hexdigest(),
+    }
+
+
 @router.post("/vault/{strategy_id}/export-mql5")
 def post_export_mql5(strategy_id: str, body: ExportEaRequest) -> dict:
     """REQ-TIER-1.3 (MQL5 export) — writes the EA source to a folder of the
