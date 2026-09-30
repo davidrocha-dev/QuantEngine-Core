@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from app.api import runtime
+from app.api.security import LocalAccessMiddleware
 
 # Re-exported: tests and older callers import these from app.main.
 from app.api.campaign_setup import (  # noqa: F401
@@ -253,6 +254,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Added after CORS so it runs first: every request must come from the
+# desktop app's own renderer or shell (app/api/security.py).
+app.add_middleware(LocalAccessMiddleware)
 
 
 # Routers, in the order the endpoints were declared before the split -
