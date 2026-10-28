@@ -10,6 +10,8 @@ import copy
 
 import numpy as np
 import pandas as pd
+from pathlib import Path
+
 import pytest
 
 from app.codegen.genes_mql5 import emit
@@ -30,7 +32,10 @@ GENES = [
 
 @pytest.fixture(scope="module")
 def bars():
-    m1 = pd.read_parquet("app/data/bundled/XAUUSD_M1.parquet")
+    path = Path("app/data/bundled/XAUUSD_M1.parquet")
+    if not path.exists():
+        pytest.skip("market data not downloaded: run python -m app.data.build_bundled_subset")
+    m1 = pd.read_parquet(path)
     m15 = resample_bars(m1, "M15", DEFAULT_CLOCK).reset_index(drop=True)
     h1 = resample_bars(m1, "H1", DEFAULT_CLOCK).reset_index(drop=True)
     return m15, h1
