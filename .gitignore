@@ -1,7 +1,12 @@
+.env
+.env.*
+!.env.example
 .venv/
 __pycache__/
 *.pyc
-dist/
 build/
+dist/
 *.db
+*.log
+app/data/bundled/*.parquet
 .pytest_cache/

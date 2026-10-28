@@ -25,25 +25,6 @@ from app.settings_store import load_settings, update_section
 
 router = APIRouter()
 
-class LicenseClaimRequest(BaseModel):
-    claim: str
-
-
-@router.post("/license/claim")
-def post_license_claim(body: LicenseClaimRequest) -> dict:
-    """The signed claim the licence server issued, handed over by the app
-    once the licence has been validated (app/licensing.py)."""
-    from app import licensing
-
-    if not licensing.TRUSTED_PUBLIC_KEYS:
-        return {"enforced": False}
-    try:
-        claim = licensing.set_claim(body.claim)
-    except licensing.InvalidClaim as exc:
-        raise HTTPException(status_code=400, detail=f"Licence claim refused: {exc}") from exc
-    return {"enforced": licensing.enforcement_active(), **claim.to_dict()}
-
-
 @router.get("/status")
 def get_status() -> dict:
     engine = make_engine(get_config().vault_db_path)

@@ -32,7 +32,6 @@ import logging
 import os
 from urllib.parse import parse_qs
 
-from app import licensing
 
 TOKEN_ENV = "QUANTENGINE_API_TOKEN"
 TOKEN_HEADER = b"x-quantengine-token"
@@ -81,8 +80,6 @@ class LocalAccessMiddleware:
         if token is None:
             # The packaged engine is only ever started by the app, which
             # always sets a token. One running without is someone else.
-            if licensing.enforcement_active():
-                return await self._refuse(scope, send, "This engine is started by the QuantEngine app")
             return await self.app(scope, receive, send)
 
         presented = headers.get(TOKEN_HEADER, b"").decode("latin-1")
@@ -91,11 +88,6 @@ class LocalAccessMiddleware:
             presented = (query.get("token") or [""])[0]
         if not hmac.compare_digest(presented, token):
             return await self._refuse(scope, send, "Missing or wrong engine token")
-
-        # And what the licence allows (app/licensing.py).
-        reason = licensing.refusal(scope.get("path", ""))
-        if reason is not None:
-            return await self._refuse(scope, send, reason, status=402)
         return await self.app(scope, receive, send)
 
     @staticmethod
